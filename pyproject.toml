@@ -1,0 +1,49 @@
+[project]
+name = "idlecua"
+version = "0.1.0"
+description = "IdleCUA — policy-gated idle-time computer-use agent (walking skeleton)"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "IdleCUA" }]
+keywords = ["automation", "agent", "computer-use"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13",
+  "httpx>=0.27",
+  "keyring>=25",
+]
+
+[project.scripts]
+idle-cua = "idlecua.cli:app"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/idlecua"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src/idlecua/tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.9",
+]
