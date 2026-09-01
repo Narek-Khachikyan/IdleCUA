@@ -54,6 +54,25 @@ uv run idle-cua models test            # verifies connectivity + vision capabili
 uv run idle-cua models test --name opencode-go --json
 uv run idle-cua models remove my-openai
 ```
+### Profile onboarding (required before autonomous runs)
+
+```bash
+# Scripted questionnaire — works with no LLM configured, saves only after explicit confirmation
+uv run idle-cua profile interview
+uv run idle-cua profile interview --yes  # non-interactive defaults (for tests)
+
+# View / edit / validate
+uv run idle-cua profile show
+uv run idle-cua profile show --json
+uv run idle-cua profile edit --field autonomy_boundaries.allowed_sites="x.com, reddit.com"
+uv run idle-cua profile validate   # rejects invalid allowlist / limits / schedule
+uv run idle-cua profile check-permissions  # macOS Accessibility + Screen Recording with remediation
+uv run idle-cua doctor  # permission checks + profile validate
+```
+
+The interview covers user characteristics (occupation, projects, goals, interests, technologies, material types/depth, languages, unwanted topics), computer usage (schedule, idle periods, overnight/screen-lock habits, monitors, common apps/sites, return signals, idle threshold), and autonomy boundaries (allowed sites/apps, action classes, results location, session duration, daily limits, allowed hours). The summary clearly separates **confirmed facts** (you provided) from **assumptions** (defaults), and `profile.json` is only written after explicit `y` confirmation. Machine-readable `profile.json` and human rendering (`profile show`) are the same data — no duplication. Autonomous `run-once` is hard-gated while the profile is unconfirmed.
+
+
 
 Python API (same planner, no CLI):
 

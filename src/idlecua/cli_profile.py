@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.prompt import Confirm, Prompt
+
+from .config import IdleCuaConfig
+
+from .profile.interview import QUESTIONS, run_interview, save_confirmed_profile
+from .profile.models import Profile
+from .profile.permissions import check_permissions, permissions_report_text
+from .profile.render import render_human_readable
+from .profile.store import load_profile, save_profile
+from .profile.validate import validate_profile
+
+profile_app = typer.Typer(help="Profile interview and management", no_args_is_help=True)
+console = Console()
+
+
+def _resolve_data_dir(explicit: str | None, ctx: typer.Context | None = None) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    if ctx is not None and ctx.obj is not None and isinstance(ctx.obj, dict):
+        # typer's ctx.obj may hold data_dir from parent callback
+        d = ctx.obj.get("data_dir")
+        if d:
+            return Path(d).expanduser()
+    # check env vars - support both naming conventions
+    env = os.environ.get("IDLECUA_DATA_DIR") or os.environ.get("IDLE_CUA_DATA_DIR")
+    if env:
+        return Path(env).expanduser()
+    # fallback to IdleCuaConfig default
+    return IdleCuaConfig().data_dir
+
+
+def _profile_path(data_dir: Path) -> Path:
+    return data_dir / "profile.json"
+
+
+@profile_app.command("interview")
+def interview(
+    ctx: typer.Context,
+    yes: bool = typer.Option(False, "--yes", help="Non-interactive: answer defaults and auto-confirm (for testing)"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Scripted questionnaire (works with no LLM). Saves only after explicit confirmation."""
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    if yes:
+        def input_func(q):  # type: ignore
+            return ""
+
+        def confirm_func(_):  # type: ignore
+            return True
+
+        profile, facts, assumptions = run_interview(console=console, input_func=input_func, confirm_func=confirm_func)
+    else:
+        profile, facts, assumptions = run_interview(console=console)
+
+    if save_confirmed_profile(profile, ppath, console=console):
+        console.print("\n" + render_human_readable(profile))
+        raise typer.Exit(0)
+    else:
+        raise typer.Exit(1)
+
+
+@profile_app.command("show")
+def show(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Show profile — human-readable rendering of the same machine-readable file."""
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
+        raise typer.Exit(1)
+    if json_output:
+        console.print_json(json.dumps(profile.to_dict(), indent=2))
+    else:
+        console.print(render_human_readable(profile))
+
+
+@profile_app.command("edit")
+def edit(
+    ctx: typer.Context,
+    field: list[str] = typer.Option(None, "--field", help="Field to set as dotted.path=value (repeatable)"),
+    editor: bool = typer.Option(False, "--editor", help="Open in $EDITOR"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Edit profile. Without args, interactively edit starting from stored values."""
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
+        raise typer.Exit(1)
+
+    if editor:
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8")
+        tmp.write(json.dumps(profile.to_dict(), indent=2, ensure_ascii=False))
+        tmp.close()
+        ed = os.environ.get("EDITOR", "nano")
+        subprocess.run([ed, tmp.name])
+        try:
+            data = json.loads(Path(tmp.name).read_text(encoding="utf-8"))
+            new_profile = Profile.from_dict(data)
+            new_profile.touch()
+            save_profile(new_profile, ppath)
+            console.print(f"[green]Profile updated via editor -> {ppath}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to save edited profile: {e}[/red]")
+            raise typer.Exit(1)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+        return
+
+    if field:
+        data = profile.to_dict()
+        for f in field:
+            if "=" not in f:
+                console.print(f"[red]Invalid --field '{f}' expected dotted.path=value[/red]")
+                raise typer.Exit(1)
+            dotted, value = f.split("=", 1)
+            parts = dotted.split(".")
+            cur = data
+            for p in parts[:-1]:
+                if p not in cur:
+                    console.print(f"[red]Unknown field path '{dotted}'[/red]")
+                    raise typer.Exit(1)
+                cur = cur[p]
+            leaf = parts[-1]
+            if leaf not in cur:
+                console.print(f"[red]Unknown field '{dotted}'[/red]")
+                raise typer.Exit(1)
+            old = cur[leaf]
+            if isinstance(old, list):
+                new_val = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
+            elif isinstance(old, int):
+                try:
+                    new_val = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif isinstance(old, bool):
+                new_val = value.lower() in ("true", "1", "yes", "y")
+            else:
+                new_val = value
+            cur[leaf] = new_val
+        try:
+            new_profile = Profile.from_dict(data)
+            new_profile.touch()
+            save_profile(new_profile, ppath)
+            console.print(f"[green]Profile updated ({len(field)} field(s)) -> {ppath}[/green]")
+        except Exception as e:
+            console.print(f"[red]Validation failed: {e}[/red]")
+            raise typer.Exit(1)
+        return
+
+    console.print("[bold]Edit profile (leave empty to keep current value)[/bold]\n")
+    data = profile.to_dict()
+    for q in QUESTIONS:
+        parts = q.key.split(".")
+        cur = data
+        for p in parts[:-1]:
+            cur = cur[p]
+        cur_val = cur[parts[-1]]
+        if isinstance(cur_val, list):
+            cur_str = ", ".join(cur_val)
+        else:
+            cur_str = str(cur_val)
+        prompt_text = f"{q.prompt}"
+        help_suffix = f" [dim]({q.help_text})[/dim]" if q.help_text else ""
+        raw = Prompt.ask(f"{prompt_text}{help_suffix}", default=cur_str, console=console, show_default=True)
+        if raw == cur_str:
+            continue
+        if q.is_list:
+            parsed = [s.strip() for s in raw.split(",") if s.strip()] if raw.strip() else []
+        elif q.is_int:
+            try:
+                parsed = int(raw) if raw.strip() else cur_val  # type: ignore
+            except ValueError:
+                console.print(f"[yellow]Invalid integer '{raw}', keeping {cur_val}[/yellow]")
+                continue
+        else:
+            parsed = raw
+        cur[parts[-1]] = parsed
+
+    console.print("\n[bold]Updated profile preview:[/bold]")
+    try:
+        new_profile = Profile.from_dict(data)
+    except Exception as e:
+        console.print(f"[red]Invalid profile data: {e}[/red]")
+        raise typer.Exit(1)
+    console.print(render_human_readable(new_profile))
+    if not Confirm.ask("Save edited profile?", console=console, default=False):
+        console.print("[yellow]Edit cancelled — not saved.[/yellow]")
+        raise typer.Exit(1)
+    new_profile.touch()
+    save_profile(new_profile, ppath)
+    console.print(f"[green]Profile saved to {ppath}[/green]")
+
+
+@profile_app.command("validate")
+def validate(
+    ctx: typer.Context,
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Validate allowlist, limits, schedule sanity."""
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}[/red]")
+        raise typer.Exit(1)
+    errors = validate_profile(profile)
+    if errors:
+        console.print("[red]Profile validation failed:[/red]")
+        for e in errors:
+            console.print(f"  - {e}")
+        raise typer.Exit(1)
+    console.print("[green]Profile is valid.[/green]")
+    console.print(f"Confirmed: {profile.confirmed}")
+    console.print(f"Allowlist: {', '.join(profile.autonomy_boundaries.allowed_sites)}")
+    console.print(f"Session: {profile.autonomy_boundaries.session_duration_minutes} min, {profile.computer_usage.idle_threshold_minutes} min idle threshold")
+    console.print(f"Allowed hours: {profile.autonomy_boundaries.allowed_hours}")
+
+
+@profile_app.command("check-permissions")
+def check_permissions_cmd(
+    ctx: typer.Context,
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Report missing macOS grants (Accessibility, Screen Recording) with remediation."""
+    statuses = check_permissions()
+    text = permissions_report_text(statuses)
+    console.print(text)
+    if any(s.granted is False for s in statuses):
+        raise typer.Exit(1)
+    if any(s.granted is None for s in statuses):
+        console.print("[yellow]Could not definitively verify permissions — please verify manually via System Settings.[/yellow]")

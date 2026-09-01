@@ -10,6 +10,8 @@ Single-context glossary for the IdleCUA domain. Use these terms verbatim in code
 - **Plan**: bounded, inspectable structure produced by the Planner before any execution. Fields: `goal`, `target`, `expected_actions`, `max_duration_minutes`, `max_actions`, `risk_level`, `requires_confirmation`. Deterministic in the walking skeleton; LLM-backed later.
 - **Action**: a single typed computer operation (e.g., `navigate`, `search`, `scroll`, `open_link`, `read_extract`, `save_note`, `open_app`, `close_tab`). Vocabulary is closed and grows only on demonstrated need.
 - **AgentState**: lifecycle of a task: `disabled`, `waiting_for_idle`, `planning`, `running`, `paused_by_user`, `paused_for_approval`, `completed`, `failed`, `stopped`. Validated transitions; illegal transitions are rejected.
+- **Profile**: confirmed user configuration covering characteristics, computer usage, and autonomy boundaries. Machine-readable JSON (`profile.json`) plus derived human-readable rendering (no duplication). Must be confirmed before any autonomous action; unconfirmed blocks execution.
+- **Confirmed / Unconfirmed**: profile state gate. No autonomous action while unconfirmed. Summary separates confirmed facts (user-provided) from assumptions (defaults).
 - **PolicyEngine**: layer that checks every planned action in order: closed site allowlist → deny-zones inside allowed sites → action class (`auto_allowed` / `confirmation_required` / `forbidden`). Only the owner can mutate policy; the agent never self-expands it.
 - **ComputerDriver**: minimal seam over Cua on the real host (screenshots, accessibility tree, mouse/keyboard, browser via CDP with semantic refs, window/app control). Real implementation uses the owner's main Chrome profile; tests use `FakeComputerDriver`.
 - **ModelProvider**: OpenAI-compatible chat+vision adapter (OpenRouter `https://openrouter.ai/api/v1`, OpenCode Go gateway `https://opencode.ai/zen/go/v1`, or any compatible endpoint — strict `model`+`messages` payload, no non-standard fields). Tests use `FakeModelProvider`. API keys live in the credential store or env, never in logs/reports/repo.
@@ -20,6 +22,7 @@ Single-context glossary for the IdleCUA domain. Use these terms verbatim in code
 - **Allowlist**: closed set of sites the agent may visit. Preseeded with `x.com`, `reddit.com`, `youtube.com`, `github.com`, `news.ycombinator.com`, `arxiv.org`, `facebook.com`, `instagram.com`, `linkedin.com`, `tiktok.com`, `bsky.app`, `threads.net`, `mastodon.social`, `google.com`; extendable only by the owner.
 - **Anti-repeat**: 7-day window that suppresses exact duplicate normalized queries, processed URLs, and plan fingerprints.
 - **Session / Report**: one bounded run (≤45 min, ≤200 actions, ≤150 LLM calls/day) that ends with a persisted Markdown report and rows in local SQLite.
+- **Permissions**: macOS Accessibility and Screen Recording grants checked via `profile check-permissions` / `doctor` with remediation steps.
 
 ## States
 

@@ -12,6 +12,10 @@ from .planner import StubPlanner
 from .policy import PolicyEngine, PolicyResult, PolicyVerdict, TypedAction
 
 
+
+class ProfileNotConfirmedError(RuntimeError):
+    """Raised when autonomous action is attempted while profile is unconfirmed/invalid."""
+
 class IdleCua:
     """Public Application API.
 
@@ -172,6 +176,34 @@ class IdleCua:
     async def adry_run(self, task_description: str) -> Plan:
         return self.dry_run(task_description)
 
+    def ensure_profile_confirmed(self) -> None:
+        """Hard gate: no autonomous action while profile is unconfirmed/invalid."""
+        from .profile.store import load_profile
+        from .profile.validate import validate_profile
+
+        ppath = self.config.data_dir / "profile.json"
+        profile = load_profile(ppath)
+        if profile is None:
+            raise ProfileNotConfirmedError(
+                f"No profile found at {ppath}. Run `idle-cua profile interview` and confirm."
+            )
+        if not profile.confirmed:
+            raise ProfileNotConfirmedError(
+                f"Profile at {ppath} is unconfirmed. Complete `idle-cua profile interview` and confirm, or `idle-cua profile show` to inspect. Autonomous runs are blocked until the profile is confirmed."
+            )
+        errs = validate_profile(profile)
+        if errs:
+            raise ProfileNotConfirmedError(
+                f"Profile at {ppath} is confirmed but invalid: {'; '.join(errs)}. Run `idle-cua profile validate`."
+            )
+
+    def check_profile_confirmed(self) -> tuple[bool, str]:
+        try:
+            self.ensure_profile_confirmed()
+            return True, "Profile is confirmed and valid."
+        except ProfileNotConfirmedError as e:
+            return False, str(e)
+
     def get_plan_verdicts(self, plan: Plan) -> list[dict]:
         """Return per-action policy verdicts for a plan (for dry-run labeling).
 
@@ -186,8 +218,6 @@ class IdleCua:
             if kind in local_kinds:
                 action = TypedAction(kind=kind)
             else:
-                # Site-targeted actions use the plan's target domain
-                # Preserve full URL form for deny-zone detection
                 url = f"https://{plan.target}"
                 action = TypedAction(kind=kind, target_url=url)
             result = self.check_action(action)
@@ -211,6 +241,8 @@ class IdleCua:
     def run_once(self, task_description: str, *, dry_run: bool = False) -> Plan:
         if dry_run:
             return self.dry_run(task_description)
+        # Hard gate before any autonomous work
+        self.ensure_profile_confirmed()
         # Real execution not yet implemented in the walking skeleton.
         raise NotImplementedError(
             "Non-dry-run execution is not implemented in the walking skeleton. Use dry_run=True."
@@ -219,6 +251,7 @@ class IdleCua:
     async def arun_once(self, task_description: str, *, dry_run: bool = False) -> Plan:
         if dry_run:
             return self.dry_run(task_description)
+        self.ensure_profile_confirmed()
         raise NotImplementedError(
             "Non-dry-run execution is not implemented in the walking skeleton. Use dry_run=True."
         )

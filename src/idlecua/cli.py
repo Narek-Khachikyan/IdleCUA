@@ -10,6 +10,7 @@ from rich.table import Table
 
 from .app import IdleCua
 from .cli_models import models_app
+from .cli_profile import profile_app
 from .config import IdleCuaConfig
 
 app = typer.Typer(
@@ -21,6 +22,7 @@ app = typer.Typer(
 console = Console()
 
 app.add_typer(models_app, name="models")
+app.add_typer(profile_app, name="profile")
 
 def _config_for_cli(data_dir: Optional[str]) -> IdleCuaConfig:
     if data_dir is not None:
@@ -114,13 +116,125 @@ def run_once(
     if not task or not task.strip():
         console.print("[red]Task description must be non-empty[/red]")
         raise typer.Exit(code=2)
+    # Hard gate: no autonomous action while profile is unconfirmed (except dry-run)
     if not dry_run:
+        # Use same data_dir resolution as profile
+        from pathlib import Path as _Path
+
+        import os as _os
+
+        from .profile.store import load_profile as _load_profile
+        from .profile.validate import validate_profile as _validate_profile
+
+        # resolve data_dir like profile does
+        _resolved = _Path(data_dir).expanduser() if data_dir is not None else None
+        if _resolved is None:
+            _env = _os.environ.get("IDLECUA_DATA_DIR") or _os.environ.get("IDLE_CUA_DATA_DIR")
+            if _env:
+                _resolved = _Path(_env).expanduser()
+            else:
+                _resolved = IdleCuaConfig().data_dir
+        _ppath = _resolved / "profile.json"
+        _profile = _load_profile(_ppath)
+        if _profile is None:
+            console.print(f"[red]Refused: No profile found at {_ppath}. Run `idle-cua profile interview` and confirm.[/red]")
+            console.print("[dim]Hint: run `idle-cua profile interview` and confirm, or `idle-cua profile show` / `validate` to fix.[/dim]")
+            raise typer.Exit(1)
+        if not _profile.confirmed:
+            console.print(f"[red]Refused: Profile at {_ppath} is unconfirmed. Complete `idle-cua profile interview` and confirm, or `idle-cua profile show` to inspect. Autonomous runs are blocked until the profile is confirmed.[/red]")
+            raise typer.Exit(1)
+        _errs = _validate_profile(_profile)
+        if _errs:
+            console.print(f"[red]Refused: Profile at {_ppath} is confirmed but invalid: {'; '.join(_errs)}. Run `idle-cua profile validate`.[/red]")
+            raise typer.Exit(1)
         console.print("[red]Non-dry-run execution is not implemented in the walking skeleton. Use --dry-run.[/red]")
         raise typer.Exit(code=2)
+    # Reuse plan logic (dry-run)
     config = _config_for_cli(data_dir)
     idle = IdleCua(config=config)
     p = idle.dry_run(task)
     _print_plan(idle, p, "IdleCUA run-once --dry-run (no actions executed)", json_output)
+
+
+@app.command()
+def doctor(
+    data_dir: Annotated[
+        Optional[str],
+        typer.Option("--data-dir", help="Data directory"),
+    ] = None,
+) -> None:
+    """Run permission checks + profile validate for quick diagnostics."""
+    from .profile.permissions import check_permissions as _check_perms
+    from .profile.permissions import permissions_report_text as _perm_text
+    from .profile.store import load_profile as _load_profile
+    from .profile.validate import validate_profile as _validate
+
+    console.print(_perm_text(_check_perms()))
+    # also validate profile if exists
+    # resolve data_dir
+    import os as _os
+    from pathlib import Path as _Path
+
+    _resolved = _Path(data_dir).expanduser() if data_dir is not None else None
+    if _resolved is None:
+        _env = _os.environ.get("IDLECUA_DATA_DIR") or _os.environ.get("IDLE_CUA_DATA_DIR")
+        if _env:
+            _resolved = _Path(_env).expanduser()
+        else:
+            _resolved = IdleCuaConfig().data_dir
+    _ppath = _resolved / "profile.json"
+    _profile = _load_profile(_ppath)
+    if _profile is None:
+        console.print(f"[yellow]No profile at {_ppath} — run `idle-cua profile interview`[/yellow]")
+    else:
+        _errs = _validate(_profile)
+        if _errs:
+            console.print("[red]Profile validation errors:[/red]")
+            for e in _errs:
+                console.print(f"  - {e}")
+        else:
+            console.print("[green]Profile validation: OK[/green]")
+
+
+@app.command()
+def status(
+    data_dir: Annotated[
+        Optional[str],
+        typer.Option("--data-dir", help="Data directory"),
+    ] = None,
+) -> None:
+    """Show status (stub)."""
+    from .profile.store import load_profile as _load_profile
+
+    # resolve data_dir
+    import os as _os
+    from pathlib import Path as _Path
+
+    _resolved = _Path(data_dir).expanduser() if data_dir is not None else None
+    if _resolved is None:
+        _env = _os.environ.get("IDLECUA_DATA_DIR") or _os.environ.get("IDLE_CUA_DATA_DIR")
+        if _env:
+            _resolved = _Path(_env).expanduser()
+        else:
+            _resolved = IdleCuaConfig().data_dir
+    _ppath = _resolved / "profile.json"
+    _profile = _load_profile(_ppath)
+    if _profile is None:
+        console.print(f"[yellow]No profile at {_ppath}[/yellow]")
+        console.print("Profile: missing — run `idle-cua profile interview`")
+    elif not _profile.confirmed:
+        console.print(f"[yellow]Profile at {_ppath} is unconfirmed[/yellow]")
+        console.print("Profile: unconfirmed — autonomous runs blocked")
+    else:
+        from .profile.validate import validate_profile as _validate
+
+        _errs = _validate(_profile)
+        if _errs:
+            console.print(f"[red]Profile at {_ppath} invalid: {'; '.join(_errs)}[/red]")
+        else:
+            console.print(f"[green]Profile at {_ppath} is confirmed and valid[/green]")
+    console.print(f"Data dir: {_resolved}")
+    console.print("State: disabled (stub)")
 
 # For `python -m idlecua` convenience
 def main() -> None:

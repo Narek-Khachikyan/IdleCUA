@@ -17,7 +17,7 @@ class IdleCuaConfig:
     """
 
     data_dir: Path = field(default_factory=lambda: Path(
-        os.environ.get("IDLECUA_DATA_DIR", str(DEFAULT_DATA_DIR))
+        os.environ.get("IDLECUA_DATA_DIR") or os.environ.get("IDLE_CUA_DATA_DIR") or str(DEFAULT_DATA_DIR)
     ).expanduser())
     readonly: bool = True
     require_idle: bool = True
@@ -93,7 +93,7 @@ class IdleCuaConfig:
     @classmethod
     def load(cls, data_dir: Path | str | None = None) -> IdleCuaConfig:
         base = Path(data_dir).expanduser() if data_dir is not None else Path(
-            os.environ.get("IDLECUA_DATA_DIR", str(DEFAULT_DATA_DIR))
+            os.environ.get("IDLECUA_DATA_DIR") or os.environ.get("IDLE_CUA_DATA_DIR") or str(DEFAULT_DATA_DIR)
         ).expanduser()
         p = base / DEFAULT_CONFIG_NAME
         if not p.exists():

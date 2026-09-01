@@ -1,7 +1,7 @@
 [project]
 name = "idlecua"
 version = "0.1.0"
-description = "IdleCUA — policy-gated idle-time computer-use agent (walking skeleton)"
+description = "IdleCUA — policy-gated idle-time computer-use agent"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -16,6 +16,7 @@ dependencies = [
   "rich>=13",
   "httpx>=0.27",
   "keyring>=25",
+  "pydantic>=2",
 ]
 
 [project.scripts]
