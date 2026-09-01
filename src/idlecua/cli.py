@@ -27,6 +27,35 @@ def _config_for_cli(data_dir: Optional[str]) -> IdleCuaConfig:
         return IdleCuaConfig(data_dir=Path(data_dir).expanduser())
     return IdleCuaConfig()
 
+def _print_plan(idle: IdleCua, p, title: str, json_output: bool) -> None:
+    if json_output:
+        console.print_json(json.dumps(idle.plan_to_dict(p)))
+        return
+    table = Table(title=title, show_header=True)
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("goal", p.goal)
+    table.add_row("target", p.target)
+    table.add_row("expected_actions", ", ".join(p.expected_actions))
+    table.add_row("expected_result", p.expected_result)
+    table.add_row("max_duration_minutes", str(p.max_duration_minutes))
+    table.add_row("max_actions", str(p.max_actions))
+    table.add_row("risk_level", p.risk_level.value)
+    table.add_row("requires_confirmation", str(p.requires_confirmation))
+    console.print(table)
+    # Policy verdicts per plan item — layered: allowlist → deny-zone → action class
+    verdicts = idle.get_plan_verdicts(p)
+    vtable = Table(title="Policy verdicts (allowlist → deny-zone → action class)", show_header=True)
+    vtable.add_column("Action", style="bold")
+    vtable.add_column("Verdict")
+    vtable.add_column("Reason")
+    for v in verdicts:
+        verdict = v["verdict"]
+        style = "green" if verdict == "allowed" else "yellow" if verdict == "needs-confirmation" else "red"
+        vtable.add_row(v["action"], f"[{style}]{verdict}[/{style}]", v["reason"])
+    console.print(vtable)
+
+
 @app.command()
 def init(
     data_dir: Annotated[
@@ -63,23 +92,7 @@ def plan(
     config = _config_for_cli(data_dir)
     idle = IdleCua(config=config)
     p = idle.dry_run(task)
-
-    if json_output:
-        console.print_json(json.dumps(idle.plan_to_dict(p)))
-        return
-
-    table = Table(title="IdleCUA Plan (dry-run — no actions executed)", show_header=True)
-    table.add_column("Field", style="bold")
-    table.add_column("Value")
-    table.add_row("goal", p.goal)
-    table.add_row("target", p.target)
-    table.add_row("expected_actions", ", ".join(p.expected_actions))
-    table.add_row("expected_result", p.expected_result)
-    table.add_row("max_duration_minutes", str(p.max_duration_minutes))
-    table.add_row("max_actions", str(p.max_actions))
-    table.add_row("risk_level", p.risk_level.value)
-    table.add_row("requires_confirmation", str(p.requires_confirmation))
-    console.print(table)
+    _print_plan(idle, p, "IdleCUA Plan (dry-run — no actions executed)", json_output)
 
 @app.command(name="run-once")
 def run_once(
@@ -104,27 +117,10 @@ def run_once(
     if not dry_run:
         console.print("[red]Non-dry-run execution is not implemented in the walking skeleton. Use --dry-run.[/red]")
         raise typer.Exit(code=2)
-    # Reuse plan logic
     config = _config_for_cli(data_dir)
     idle = IdleCua(config=config)
     p = idle.dry_run(task)
-
-    if json_output:
-        console.print_json(json.dumps(idle.plan_to_dict(p)))
-        return
-
-    table = Table(title="IdleCUA run-once --dry-run (no actions executed)", show_header=True)
-    table.add_column("Field", style="bold")
-    table.add_column("Value")
-    table.add_row("goal", p.goal)
-    table.add_row("target", p.target)
-    table.add_row("expected_actions", ", ".join(p.expected_actions))
-    table.add_row("expected_result", p.expected_result)
-    table.add_row("max_duration_minutes", str(p.max_duration_minutes))
-    table.add_row("max_actions", str(p.max_actions))
-    table.add_row("risk_level", p.risk_level.value)
-    table.add_row("requires_confirmation", str(p.requires_confirmation))
-    console.print(table)
+    _print_plan(idle, p, "IdleCUA run-once --dry-run (no actions executed)", json_output)
 
 # For `python -m idlecua` convenience
 def main() -> None:

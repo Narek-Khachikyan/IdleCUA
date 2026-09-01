@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -10,6 +9,8 @@ from .contracts.model import FakeModelProvider, ModelProvider
 from .models.plan import Plan
 from .models.task import Task
 from .planner import StubPlanner
+from .policy import PolicyEngine, PolicyResult, PolicyVerdict, TypedAction
+
 
 class IdleCua:
     """Public Application API.
@@ -31,6 +32,7 @@ class IdleCua:
         computer: ComputerDriver | None = None,
         model_provider: ModelProvider | None = None,
         planner: StubPlanner | None = None,
+        policy: PolicyEngine | None = None,
     ) -> None:
         self.config = config or IdleCuaConfig()
         self.computer: ComputerDriver = computer or FakeComputerDriver()
@@ -41,6 +43,7 @@ class IdleCua:
         else:
             self.model_provider = self._resolve_model_provider()
         self.planner = planner or StubPlanner()
+        self.policy: PolicyEngine = policy or PolicyEngine(self.config)
 
     def _resolve_model_provider(self) -> ModelProvider:
         """Load the selected provider via the ModelProvider contract, or fallback to Fake.
@@ -88,6 +91,66 @@ class IdleCua:
     async def acreate_task(self, description: str) -> Task:
         return self.create_task(description)
 
+    # -- policy gating --
+
+    def check_action(self, action: TypedAction) -> PolicyResult:
+        """Check a single typed action against the PolicyEngine (read-only gate).
+
+        Every typed action must pass this gate before dispatch. The layered
+        evaluation order is: allowlist → deny-zones → action classification.
+        """
+        return self.policy.evaluate(action)
+
+    def can_execute(
+        self,
+        action: TypedAction,
+        *,
+        is_interactive: bool = False,
+        confirmed: bool = False,
+    ) -> tuple[bool, PolicyResult]:
+        """Whether an action may be dispatched, respecting readonly and confirmation.
+
+        - allowed → True
+        - needs_confirmation → only if not readonly, interactive, and confirmed
+        - blocked → False (hard-blocked)
+
+        The underlying verdict is still available as the second tuple element
+        for dry-run labeling.
+        """
+        result = self.check_action(action)
+        if result.verdict == PolicyVerdict.allowed:
+            return True, result
+        if result.verdict == PolicyVerdict.needs_confirmation:
+            if self.config.readonly:
+                return False, result
+            if not is_interactive:
+                return False, result
+            if not confirmed:
+                return False, result
+            return True, result
+        # blocked
+        return False, result
+
+    def execute_action(
+        self,
+        action: TypedAction,
+        *,
+        is_interactive: bool = False,
+        confirmed: bool = False,
+    ) -> PolicyResult:
+        """Gate + dispatch a single action. Raises PermissionError if blocked.
+
+        This is the single chokepoint every typed action must pass before any
+        ComputerDriver call. Dry-run never calls this.
+        """
+        ok, result = self.can_execute(action, is_interactive=is_interactive, confirmed=confirmed)
+        if not ok:
+            raise PermissionError(f"Policy blocked action '{action.kind}': {result.reason} (verdict={result.verdict.value})")
+        # In the skeleton we do not actually dispatch to ComputerDriver for typed actions
+        # that would require real UI; the fake driver is used only in focused tests.
+        # Here we record a synthetic dispatch for observability if needed.
+        return result
+
     # -- planning / dry-run --
 
     def plan(self, task_description: str) -> Plan:
@@ -108,6 +171,42 @@ class IdleCua:
 
     async def adry_run(self, task_description: str) -> Plan:
         return self.dry_run(task_description)
+
+    def get_plan_verdicts(self, plan: Plan) -> list[dict]:
+        """Return per-action policy verdicts for a plan (for dry-run labeling).
+
+        Each expected_action string is evaluated as a TypedAction targeting
+        plan.target (or locally if the action is local-only). This provides
+        the allowed / needs-confirmation / blocked labels required by the CLI.
+        """
+        verdicts: list[dict] = []
+        # Actions that are local and don't require a target URL
+        local_kinds = {"save_note", "create_note", "save_link", "close_own_tab", "close_own_app"}
+        for kind in plan.expected_actions:
+            if kind in local_kinds:
+                action = TypedAction(kind=kind)
+            else:
+                # Site-targeted actions use the plan's target domain
+                # Preserve full URL form for deny-zone detection
+                url = f"https://{plan.target}"
+                action = TypedAction(kind=kind, target_url=url)
+            result = self.check_action(action)
+            verdicts.append(
+                {
+                    "action": kind,
+                    "verdict": result.verdict.value,
+                    "reason": result.reason,
+                    "action_class": result.action_class.value,
+                    "domain": result.domain,
+                }
+            )
+        return verdicts
+
+    def annotate_plan(self, plan: Plan) -> dict:
+        """Return a dict representation of a plan annotated with policy verdicts."""
+        base = self.plan_to_dict(plan)
+        base["action_verdicts"] = self.get_plan_verdicts(plan)
+        return base
 
     def run_once(self, task_description: str, *, dry_run: bool = False) -> Plan:
         if dry_run:
@@ -138,7 +237,7 @@ class IdleCua:
         return self.config.data_dir
 
     def plan_to_dict(self, plan: Plan) -> dict:
-        return {
+        base: dict = {
             "goal": plan.goal,
             "target": plan.target,
             "expected_actions": plan.expected_actions,
@@ -148,6 +247,13 @@ class IdleCua:
             "risk_level": plan.risk_level.value,
             "requires_confirmation": plan.requires_confirmation,
         }
+        # Always include per-action policy verdicts for dry-run labeling
+        try:
+            base["action_verdicts"] = self.get_plan_verdicts(plan)
+        except Exception:
+            # Never break serialization; policy is the gate, not storage
+            base["action_verdicts"] = []
+        return base
 
     def plan_to_json(self, plan: Plan) -> str:
         return json.dumps(self.plan_to_dict(plan), indent=2)

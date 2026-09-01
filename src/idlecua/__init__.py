@@ -4,6 +4,14 @@ from .app import IdleCua
 from .config import IdleCuaConfig
 from .contracts import ComputerDriver, FakeComputerDriver, FakeModelProvider, ModelProvider
 from .models import AgentState, Plan, RiskLevel, Task, is_valid_transition, validate_transition
+from .policy import (
+    PRESEEDED_ALLOWLIST,
+    ActionClass,
+    PolicyEngine,
+    PolicyResult,
+    PolicyVerdict,
+    TypedAction,
+)
 from .providers.config import ProviderConfig, ProviderStore
 
 try:
@@ -13,20 +21,26 @@ except Exception:  # pragma: no cover
     VisionTestStatus = None  # type: ignore
 
 __all__ = [
-    "IdleCua",
-    "IdleCuaConfig",
+    "PRESEEDED_ALLOWLIST",
+    "ActionClass",
+    "AgentState",
     "ComputerDriver",
     "FakeComputerDriver",
-    "ModelProvider",
     "FakeModelProvider",
-    "AgentState",
+    "IdleCua",
+    "IdleCuaConfig",
+    "ModelProvider",
+    "OpenAICompatibleProvider",
     "Plan",
-    "RiskLevel",
-    "Task",
-    "is_valid_transition",
-    "validate_transition",
+    "PolicyEngine",
+    "PolicyResult",
+    "PolicyVerdict",
     "ProviderConfig",
     "ProviderStore",
-    "OpenAICompatibleProvider",
+    "RiskLevel",
+    "Task",
+    "TypedAction",
     "VisionTestStatus",
+    "is_valid_transition",
+    "validate_transition",
 ]

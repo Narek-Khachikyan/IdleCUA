@@ -41,6 +41,23 @@ class IdleCuaConfig:
         "mastodon.social",
         "google.com",
     ])
+    deny_zones: list[str] = field(default_factory=lambda: [
+        "/messages",
+        "/inbox",
+        "/dm",
+        "/direct",
+        "/chat",
+        "/settings",
+        "/account",
+        "/password",
+        "/2fa",
+        "/two-factor",
+        "/billing",
+        "/payment",
+        "/reauth",
+        "/re-auth",
+        "/notifications",
+    ])
 
     def __post_init__(self) -> None:
         if isinstance(self.data_dir, str):
@@ -64,6 +81,7 @@ class IdleCuaConfig:
             "max_llm_calls_per_day": self.max_llm_calls_per_day,
             "idle_threshold_seconds": self.idle_threshold_seconds,
             "allowlist": self.allowlist,
+            "deny_zones": self.deny_zones,
         }
 
     def save(self) -> Path:
@@ -73,7 +91,7 @@ class IdleCuaConfig:
         return p
 
     @classmethod
-    def load(cls, data_dir: Path | str | None = None) -> "IdleCuaConfig":
+    def load(cls, data_dir: Path | str | None = None) -> IdleCuaConfig:
         base = Path(data_dir).expanduser() if data_dir is not None else Path(
             os.environ.get("IDLECUA_DATA_DIR", str(DEFAULT_DATA_DIR))
         ).expanduser()
@@ -86,7 +104,7 @@ class IdleCuaConfig:
         return cls(data_dir=base, **raw)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "IdleCuaConfig":
+    def from_dict(cls, data: dict) -> IdleCuaConfig:
         d = dict(data)
         if "data_dir" in d:
             d["data_dir"] = Path(d["data_dir"]).expanduser()
