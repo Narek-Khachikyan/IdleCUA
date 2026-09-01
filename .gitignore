@@ -1,12 +1,43 @@
+# Python
 __pycache__/
 *.py[cod]
-.venv/
-.env
-.uv/
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
 dist/
 build/
-*.egg-info/
-.pytest_cache/
+*.whl
+.venv/
+venv/
+.env
+.env.local
+
+# uv
+.uv/
+uv.lock
+
+# IdleCUA runtime
+.idlecua/
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
 .mypy_cache/
 .ruff_cache/
