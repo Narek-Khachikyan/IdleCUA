@@ -12,8 +12,8 @@
       <div>Daily LLM limit: {{ profile.autonomy_boundaries.daily_llm_call_limit if profile else 150 }} (ceiling 150)</div>
       <div>Allowed hours: {{ profile.autonomy_boundaries.allowed_hours if profile else '00:00-23:59' }}</div>
       <div>Idle threshold: {{ profile.computer_usage.idle_threshold_minutes if profile else 10 }} min — single authority in Profile (seconds)</div>
-      <div id="allowlist">Allowlist: {{ (profile.autonomy_boundaries.allowed_sites | join(', ')) if profile else 'x.com, reddit.com' }}</div>
-      <div>Deny-zones: {{ config.deny_zones | join(', ') }}</div>
+      <div id="allowlist">Allowlist: {{ (profile.autonomy_boundaries.allowed_sites | join(', ')) if profile and profile.autonomy_boundaries.allowed_sites else (config.allowlist | join(', ')) }}</div>
+      <div>Deny-zones: {{ (profile.autonomy_boundaries.deny_zones | join(', ')) if profile and profile.autonomy_boundaries.deny_zones else (config.deny_zones | join(', ')) }} — preseed defaults, owner mutation via Profile</div>
       <div>Browser consent: {{ profile.autonomy_boundaries.browser_consent.main_profile_granted if profile and profile.autonomy_boundaries else False }}</div>
     </div>
   </div>
