@@ -54,5 +54,11 @@ def render_human_readable(profile: Profile) -> str:
     lines.append(f"- Daily action limit: {ab.daily_action_limit}")
     lines.append(f"- Daily LLM call limit: {ab.daily_llm_call_limit}")
     lines.append(f"- Allowed hours: {ab.allowed_hours}")
+    # Browser main-profile consent (issue #12)
+    bc = ab.browser_consent
+    if bc.main_profile_granted:
+        lines.append(f"- Browser main profile: GRANTED ({bc.browser}, {bc.granted_at or 'no timestamp'}, via {bc.grant_method or 'unknown'})")
+    else:
+        lines.append("- Browser main profile: NOT granted — agent will not attach to your main Chrome profile until you grant (idle-cua profile grant-browser)")
     lines.append("")
     return "\n".join(lines)

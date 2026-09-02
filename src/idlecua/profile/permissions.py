@@ -13,6 +13,20 @@ class PermissionStatus:
     remediation: str
 
 
+def _check_cua_permissions() -> tuple[bool | None, bool | None]:
+    """Try cua_driver's probe first — it's the most authoritative on macOS."""
+    try:
+        import cua_driver  # type: ignore
+
+        status = cua_driver.current_mac_os_permission_status()
+        # MacOsPermissionStatus has accessibility, screen_recording bools
+        acc = bool(getattr(status, "accessibility", None))
+        scr = bool(getattr(status, "screen_recording", None))
+        return acc, scr
+    except Exception:
+        return None, None
+
+
 def _check_accessibility() -> PermissionStatus:
     """Check macOS Accessibility permission.
 
@@ -25,6 +39,12 @@ def _check_accessibility() -> PermissionStatus:
     )
     if platform.system() != "Darwin":
         return PermissionStatus(name=name, granted=None, remediation=remediation + " (non-macOS: check skipped)")
+    # Prefer cua_driver probe if available
+    cua_acc, _ = _check_cua_permissions()
+    if cua_acc is not None:
+        if cua_acc:
+            return PermissionStatus(name=name, granted=True, remediation=remediation)
+        return PermissionStatus(name=name, granted=False, remediation=remediation + " (via cua-driver probe)")
     # Heuristic 1: try to query via AppleScript UI element access — not reliable, fallback to unknown
     # Heuristic 2: check if `tccutil` or `sqlite3` TCC db is readable — not reliable without SIP bypass
     # Best effort: if we can run `osascript` to check System Events, absence of error suggests granted for osascript.
@@ -65,6 +85,11 @@ def _check_screen_recording() -> PermissionStatus:
     )
     if platform.system() != "Darwin":
         return PermissionStatus(name=name, granted=None, remediation=remediation + " (non-macOS: check skipped)")
+    _, cua_scr = _check_cua_permissions()
+    if cua_scr is not None:
+        if cua_scr:
+            return PermissionStatus(name=name, granted=True, remediation=remediation)
+        return PermissionStatus(name=name, granted=False, remediation=remediation + " (via cua-driver probe)")
     # Heuristic: try `screencapture` to a temp file — fails if not granted on some macOS versions.
     # On newer macOS, screencapture still works but permission status is separate.
     # Use CGWindowListCreateImage style check if pyobjc available; else unknown.

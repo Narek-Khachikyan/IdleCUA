@@ -155,6 +155,48 @@ def run_interview(
 
         _set_nested(profile_dict, q.key, parsed)
 
+    # Browser main-profile consent — explicit, separate from general profile confirmation (issue #12)
+    # This is the product-level consent flag that gates existing-profile attachment.
+    # The driver-level grant (cua-driver --grant existing-profile) is checked at runtime.
+    console.print("\n[bold]Browser Profile Consent[/bold]")
+    console.print("IdleCUA can work in your main Chrome profile (your logged-in sessions stay available).")
+    console.print("The agent will [bold]only[/bold] open/close tabs it creates, never your tabs/windows, never browser chrome (logout/profile switching).")
+    console.print("You can revoke at any time: [dim]idle-cua profile revoke-browser[/dim]")
+    console.print("Driver requirement: [dim]cua-driver serve --grant existing-profile[/dim] (or embedded grant) must be given separately for the DevTools endpoint.\n")
+    if confirm_func is not None:
+        # In --yes mode, treat as not granted by default (conservative); tests that need granted should call grant-browser after interview
+        try:
+            _browser_consent_raw = confirm_func("Grant IdleCUA to use your main Chrome profile?")  # type: ignore
+            # confirm_func signature is str->bool in our interview, but some tests pass str->bool directly
+            browser_granted = bool(_browser_consent_raw) if isinstance(_browser_consent_raw, bool) else str(_browser_consent_raw).lower().strip() in ("y", "yes", "true", "1")
+        except Exception:
+            browser_granted = False
+    else:
+        browser_granted = Confirm.ask("Grant IdleCUA to use your main Chrome profile?", console=console, default=False)
+    if browser_granted:
+        from datetime import datetime, timezone as _tz
+        from .models import BrowserConsent as _BC
+
+        bc = _BC(
+            main_profile_granted=True,
+            granted_at=datetime.now(_tz.utc).isoformat(),
+            browser="chrome",
+            grant_method="profile interview",
+        )
+        # Set both nested and alias
+        profile_dict["autonomy_boundaries"]["browser_consent"] = bc.model_dump()
+        profile_dict["browser_consent"] = bc.model_dump()
+        confirmed_facts["autonomy_boundaries.browser_consent.main_profile_granted"] = True
+        console.print("[green]Browser main-profile consent: GRANTED (recorded in profile.json)[/green]")
+    else:
+        console.print("[yellow]Browser main-profile consent: NOT granted — agent will not attach to main Chrome profile (use isolated profile or grant later via `idle-cua profile grant-browser`)[/yellow]")
+        # Ensure not granted is recorded explicitly
+        from .models import BrowserConsent as _BC
+
+        bc = _BC(main_profile_granted=False)
+        profile_dict["autonomy_boundaries"]["browser_consent"] = bc.model_dump()
+        profile_dict["browser_consent"] = bc.model_dump()
+
     profile = Profile.model_validate(profile_dict)
 
     # Build summary separating confirmed vs assumptions

@@ -89,11 +89,13 @@ def test_cli_run_once_dry_run_prints_same_plan_as_plan():
 
 
 def test_cli_run_once_without_dry_run_is_rejected():
-    result = runner.invoke(cli_app, ["run-once", "do something"])
-    assert result.exit_code != 0
-    # Walking skeleton rejects non-dry-run; with profile gate it may also refuse due to missing/unconfirmed profile.
-    low = result.output.lower()
-    assert "dry-run" in low or "profile" in low or "refused" in low
+    # Use isolated data dir so test is not affected by ~/.idlecua confirmed profile on dev machine
+    with tempfile.TemporaryDirectory() as td:
+        result = runner.invoke(cli_app, ["run-once", "do something", "--data-dir", td])
+        assert result.exit_code != 0
+        # Walking skeleton rejects non-dry-run; with profile gate it may also refuse due to missing/unconfirmed profile.
+        low = result.output.lower()
+        assert "dry-run" in low or "profile" in low or "refused" in low
 
 
 def _extract_json(output: str) -> str:

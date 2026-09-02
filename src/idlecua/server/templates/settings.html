@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Settings — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="p-8 max-w-3xl mx-auto">
+<h1 class="text-2xl font-semibold">Settings</h1>
+<p class="text-sm text-zinc-500">Session duration, daily limits, allowed hours, idle threshold, allowlist, deny-zones, browser consent — one home per setting (the Profile). Ceilings are read-only.</p>
+<div class="mt-6 space-y-4">
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Profile — owner intent</h2>
+    <div class="text-sm mt-2 space-y-1">
+      <div>Session duration: {{ profile.autonomy_boundaries.session_duration_minutes if profile else 45 }} min (ceiling 45)</div>
+      <div>Daily action limit: {{ profile.autonomy_boundaries.daily_action_limit if profile else 200 }}</div>
+      <div>Daily LLM limit: {{ profile.autonomy_boundaries.daily_llm_call_limit if profile else 150 }} (ceiling 150)</div>
+      <div>Allowed hours: {{ profile.autonomy_boundaries.allowed_hours if profile else '00:00-23:59' }}</div>
+      <div>Idle threshold: {{ profile.computer_usage.idle_threshold_minutes if profile else 10 }} min — single authority in Profile (seconds)</div>
+      <div id="allowlist">Allowlist: {{ (profile.autonomy_boundaries.allowed_sites | join(', ')) if profile else 'x.com, reddit.com' }}</div>
+      <div>Deny-zones: {{ config.deny_zones | join(', ') }}</div>
+      <div>Browser consent: {{ profile.autonomy_boundaries.browser_consent.main_profile_granted if profile and profile.autonomy_boundaries else False }}</div>
+    </div>
+  </div>
+  <div class="border rounded-xl p-4 bg-zinc-50">
+    <h2 class="font-semibold">Config — safety</h2>
+    <div class="text-sm mt-2 space-y-1">
+      <div>readonly: {{ config.readonly }} — toggleable in UI</div>
+      <div>require_idle: {{ config.require_idle }} — toggleable</div>
+      <div class="text-zinc-500">Hard ceilings (read-only): 45 min / 200 actions / 150 LLM/day</div>
+    </div>
+  </div>
+</div>
+<div class="mt-6">
+  <h2 class="font-semibold">Providers</h2>
+  <p class="text-sm text-zinc-500">API key accepted on write, only masked on read. Test button does one minimal provider call.</p>
+  <div id="providers-list" class="mt-2 text-sm">Loading...</div>
+  <script>
+    fetch('/api/v1/providers').then(r=>r.json()).then(data=>{
+      const el=document.getElementById('providers-list');
+      if(!data.providers.length) el.textContent='No providers — add one in settings';
+      else el.innerHTML=data.providers.map(p=>'<div class="border p-2 rounded mt-1">'+p.name+' — '+p.masked_key+' — '+p.model+' '+(p.selected?'★':'')+' <button onclick="fetch(\'/api/v1/providers/'+p.name+'/test\',{method:\'POST\'}).then(r=>r.json()).then(j=>alert(JSON.stringify(j)))" class="ml-2 text-xs border px-2 py-1 rounded">Test</button></div>').join('');
+    });
+  </script>
+</div>
+<a href="/" class="underline text-blue-600 mt-6 inline-block">← Dashboard</a>
+</body></html>
