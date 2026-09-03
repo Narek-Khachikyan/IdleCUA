@@ -235,7 +235,12 @@ def test_http_and_cli_parity_same_bundle(tmp_path: Path, monkeypatch):
         assert k in http
 
     assert http["permissions"] == direct["permissions"]
-    assert http["driver"] == direct["driver"]
+    # HTTP exposes only the versioned driver keys {ok, message}; the bundle
+    # carries extra structured fields for CLI renderers (no message parsing).
+    assert http["driver"] == {"ok": direct["driver"]["ok"], "message": direct["driver"]["message"]}
+    assert direct["driver"]["version"] == "0.0.1-parity"
+    assert direct["driver"]["accessibility"] is True
+    assert direct["driver"]["screen_recording"] is True
     assert http["profile"] == direct["profile"]
     assert http["secrets_scan"]["ok"] == direct["secrets_scan"]["ok"]
     assert http["secrets_scan"]["findings"] == direct["secrets_scan"]["findings"]

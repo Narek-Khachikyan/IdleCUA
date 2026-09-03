@@ -122,6 +122,10 @@ def edit(
             data = json.loads(Path(tmp.name).read_text(encoding="utf-8"))
             new_profile = Profile.from_dict(data)
             new_profile.touch()
+            _errs = validate_profile(new_profile)
+            if _errs:
+                console.print(f"[red]Validation failed: {'; '.join(_errs)}[/red]")
+                raise typer.Exit(1)
             save_profile(new_profile, ppath)
             console.print(f"[green]Profile updated via editor -> {ppath}[/green]")
         except Exception as e:
@@ -240,6 +244,12 @@ def edit(
         try:
             new_profile = Profile.from_dict(data)
             new_profile.touch()
+            # Same domain validator the Application API uses, so non-settings
+            # fields accept/reject identically regardless of caller.
+            _errs = validate_profile(new_profile)
+            if _errs:
+                console.print(f"[red]Validation failed: {'; '.join(_errs)}[/red]")
+                raise typer.Exit(1)
             save_profile(new_profile, ppath)
             console.print(f"[green]Profile updated ({len(field)} field(s)) -> {ppath}[/green]")
         except Exception as e:
@@ -281,6 +291,10 @@ def edit(
         new_profile = Profile.from_dict(data)
     except Exception as e:
         console.print(f"[red]Invalid profile data: {e}[/red]")
+        raise typer.Exit(1)
+    _errs = validate_profile(new_profile)
+    if _errs:
+        console.print(f"[red]Validation failed: {'; '.join(_errs)}[/red]")
         raise typer.Exit(1)
     console.print(render_human_readable(new_profile))
     if not Confirm.ask("Save edited profile?", console=console, default=False):
@@ -356,58 +370,55 @@ def grant_browser(
         console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
         raise typer.Exit(1)
     # T3: delegate through Application API so CLI and HTTP share the same consent path.
-    # We preserve the CLI's richer granted_at/browser metadata after the app call.
+    # The grant decision persists via update_owner_settings; the CLI only adds
+    # observed metadata (granted_at/browser/method) afterwards, then re-validates
+    # with the same validator the API uses. No decision persists without validation.
     try:
         from .app import IdleCua as _IdleCua
 
         _app = _IdleCua(config=IdleCuaConfig.load(resolved))
         _app.update_owner_settings({"browser_consent": True})
-        # Re-load to add granted_at/method without diverging from app's single authority.
-        _profile2 = load_profile(ppath)
-        if _profile2 is not None:
-            bc2 = BrowserConsent(
-                main_profile_granted=True,
-                granted_at=datetime.now(timezone.utc).isoformat(),
-                browser=browser.lower().strip() or "chrome",
-                grant_method="cli grant-browser",
-            )
-            _profile2.autonomy_boundaries.browser_consent = bc2
-            _profile2.browser_consent = bc2
-            _profile2.touch()
-            save_profile(_profile2, ppath)
-            try:
-                cfg = IdleCuaConfig.load(resolved)
-                cfg.record_browser_consent(True, browser=bc2.browser, granted_at=bc2.granted_at)
-            except Exception:
-                pass
-            bc = bc2
-        else:
-            bc = BrowserConsent(
-                main_profile_granted=True,
-                granted_at=datetime.now(timezone.utc).isoformat(),
-                browser=browser.lower().strip() or "chrome",
-                grant_method="cli grant-browser",
-            )
     except ValueError as ve:
         console.print(f"[red]Validation failed: {ve}[/red]")
         raise typer.Exit(1)
-    except Exception:
-        # Fallback to direct save if app path fails for any other reason.
+    except Exception as e:
+        # Thin caller per ADR-0002: never persist the decision outside the
+        # Application API — fail loudly instead of direct-saving.
+        console.print(f"[red]Browser consent update failed: {e}[/red]")
+        raise typer.Exit(1)
+    try:
+        # Re-load to add granted_at/method without diverging from app's single authority.
+        # Metadata-only: validate_profile ignores consent metadata (see
+        # profile/validate.py — no consent checks), so validity cannot change
+        # here; the grant decision was already validated via the API above.
+        _profile2 = load_profile(ppath)
+        if _profile2 is None:
+            raise RuntimeError(f"No profile found at {ppath} after update")
+        bc2 = BrowserConsent(
+            main_profile_granted=True,
+            granted_at=datetime.now(timezone.utc).isoformat(),
+            browser=browser.lower().strip() or "chrome",
+            grant_method="cli grant-browser",
+        )
+        _profile2.autonomy_boundaries.browser_consent = bc2
+        _profile2.browser_consent = bc2
+        _profile2.touch()
+        save_profile(_profile2, ppath)
+        try:
+            cfg = IdleCuaConfig.load(resolved)
+            cfg.record_browser_consent(True, browser=bc2.browser, granted_at=bc2.granted_at)
+        except Exception:
+            pass
+        bc = bc2
+    except Exception as e:
+        # Decision already persisted via the API; metadata enrichment failed.
+        console.print(f"[yellow]Consent granted but metadata not recorded: {e}[/yellow]")
         bc = BrowserConsent(
             main_profile_granted=True,
             granted_at=datetime.now(timezone.utc).isoformat(),
             browser=browser.lower().strip() or "chrome",
             grant_method="cli grant-browser",
         )
-        profile.autonomy_boundaries.browser_consent = bc
-        profile.browser_consent = bc
-        profile.touch()
-        save_profile(profile, ppath)
-        try:
-            cfg = IdleCuaConfig.load(resolved)
-            cfg.record_browser_consent(True, browser=bc.browser, granted_at=bc.granted_at)
-        except Exception:
-            pass
     console.print(f"[green]Browser main-profile consent GRANTED for {bc.browser} — recorded at {ppath} + config.json[/green]")
     console.print("[dim]Driver grant still required for existing-profile attachment:[/dim]")
     console.print("[dim]  cua-driver serve --grant existing-profile  (Watch loop process)  or  --grant existing-profile on mcp/embedded launch[/dim]")
@@ -428,7 +439,8 @@ def revoke_browser(
     if profile is None:
         console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
         raise typer.Exit(1)
-    # T3: delegate through Application API for parity.
+    # T3: delegate through Application API for parity. Thin caller per ADR-0002:
+    # never persist the decision outside the API — fail loudly on errors.
     try:
         from .app import IdleCua as _IdleCua
 
@@ -437,18 +449,9 @@ def revoke_browser(
     except ValueError as ve:
         console.print(f"[red]Validation failed: {ve}[/red]")
         raise typer.Exit(1)
-    except Exception:
-        # Fallback direct (keeps output identical if app path unavailable)
-        bc = BrowserConsent(main_profile_granted=False)
-        profile.autonomy_boundaries.browser_consent = bc
-        profile.browser_consent = bc
-        profile.touch()
-        save_profile(profile, ppath)
-        try:
-            cfg = IdleCuaConfig.load(resolved)
-            cfg.record_browser_consent(False, browser="chrome", granted_at=None)
-        except Exception:
-            pass
+    except Exception as e:
+        console.print(f"[red]Browser consent update failed: {e}[/red]")
+        raise typer.Exit(1)
     console.print(f"[yellow]Browser main-profile consent REVOKED — recorded at {ppath} + config.json[/yellow]")
 
 

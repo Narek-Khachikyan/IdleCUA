@@ -377,7 +377,7 @@ def doctor(
     lines.append("to the terminal/app running IdleCUA. After granting, restart the app.")
     console.print("\n".join(lines))
 
-    # Cua driver diagnostics (render bundle driver message; remediation identical).
+    # Cua driver diagnostics (render structured bundle fields; remediation identical).
     console.print("")
     console.print("[bold]Cua Driver[/bold]")
     console.print("==============")
@@ -385,45 +385,18 @@ def doctor(
     drv_ok = bool(drv.get("ok"))
     drv_msg = str(drv.get("message", ""))
     if drv_ok:
-        # Bundle message is "cua-driver <ver> — accessibility=.. screen_recording=.."
-        ver = "unknown"
-        probe_part = ""
-        if "cua-driver" in drv_msg:
-            try:
-                ver = drv_msg.split("cua-driver")[1].strip().split()[0]
-            except Exception:
-                ver = "unknown"
-            if " — " in drv_msg:
-                probe_part = drv_msg.split(" — ", 1)[1]
+        # Structured fields from IdleCua.get_diagnostics() — no message parsing.
+        ver = str(drv.get("version", "unknown") or "unknown")
         console.print(f"cua-driver version: {ver} (pinned 0.23.2 expected)")
-        if probe_part:
-            # Try to extract accessibility/screen_recording for familiar lines.
-            acc = None
-            scr = None
-            if "accessibility=" in probe_part:
-                try:
-                    acc_str = probe_part.split("accessibility=")[1].split()[0].strip(",")
-                    if acc_str.lower().startswith("true"):
-                        acc = True
-                    elif acc_str.lower().startswith("false"):
-                        acc = False
-                except Exception:
-                    pass
-            if "screen_recording=" in probe_part:
-                try:
-                    scr_str = probe_part.split("screen_recording=")[1].split()[0].strip(",")
-                    if scr_str.lower().startswith("true"):
-                        scr = True
-                    elif scr_str.lower().startswith("false"):
-                        scr = False
-                except Exception:
-                    pass
-            if acc is not None or scr is not None:
-                console.print(f"  Accessibility (cua probe): {'granted' if acc else 'NOT granted' if acc is False else 'unknown'}")
-                console.print(f"  Screen Recording (cua probe): {'granted' if scr else 'NOT granted' if scr is False else 'unknown'}")
-            if "probe failed" in probe_part.lower():
-                console.print(f"  Cua permission probe failed: {probe_part}")
-        else:
+        acc = drv.get("accessibility")
+        scr = drv.get("screen_recording")
+        probe_error = drv.get("probe_error")
+        if acc is not None or scr is not None:
+            console.print(f"  Accessibility (cua probe): {'granted' if acc else 'NOT granted' if acc is False else 'unknown'}")
+            console.print(f"  Screen Recording (cua probe): {'granted' if scr else 'NOT granted' if scr is False else 'unknown'}")
+        if probe_error:
+            console.print(f"  Cua permission probe failed: {probe_error}")
+        elif acc is None and scr is None:
             console.print(f"  {drv_msg}")
     else:
         console.print("cua-driver not installed. Install: `uv pip install cua-driver==0.23.2`")
@@ -499,9 +472,10 @@ def doctor(
         secrets = bundle.get("secrets_scan", {})
         sec_ok = bool(secrets.get("ok", True))
         findings = list(secrets.get("findings") or [])
-        # Reconstruct ScanResult without leaking snippet.
+        # Reconstruct ScanResult without leaking snippet (bundle carries
+        # source+pattern only; snippet stays empty — never a raw secret).
         fake_findings = [
-            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet=f.get("pattern", ""))
+            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet="")
             for f in findings
         ]
         # Preserve counts if bundle had them.
@@ -774,11 +748,12 @@ def verify_secrets(
         raise typer.Exit(1)
 
     if json_output:
-        # Masked: snippet is redacted pattern, never raw key.
+        # Masked: source+pattern only; snippet stays empty (never raw key).
+        # Key kept for CLI shape compat with previous output.
         payload = {
             "ok": ok,
             "findings": [
-                {"source": f.get("source", ""), "pattern": f.get("pattern", ""), "snippet": f.get("pattern", "")}
+                {"source": f.get("source", ""), "pattern": f.get("pattern", ""), "snippet": ""}
                 for f in findings
             ],
             "scanned_files": scanned_files,
@@ -790,7 +765,7 @@ def verify_secrets(
         from .secrets_scan import ScanResult, SecretFinding, format_report
 
         fake_findings = [
-            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet=f.get("pattern", ""))
+            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet="")
             for f in findings
         ]
         fake_result = ScanResult(ok=ok, findings=fake_findings, scanned_files=scanned_files, scanned_db_tables=scanned_tables, skipped=[])

@@ -39,8 +39,10 @@ def validate_profile(profile: Profile) -> list[str]:
     # Limits validation — tighten-only vs hard ceilings (ADR-0003)
     # Ceilings are 45 min, 200 actions, 150 LLM calls; Profile values above ceiling are validation errors
     ab = profile.autonomy_boundaries
-    if ab.session_duration_minutes <= 0 or ab.session_duration_minutes > 45:
+    if ab.session_duration_minutes <= 0 or ab.session_duration_minutes > 1000:
         errors.append(f"session_duration_minutes must be 1..45, got {ab.session_duration_minutes}")
+    elif ab.session_duration_minutes > 45:
+        errors.append(f"session_duration_minutes {ab.session_duration_minutes} above ceiling 45 (tighten-only: Profile value above ceiling is rejected)")
     if ab.daily_action_limit <= 0 or ab.daily_action_limit > 1000:
         errors.append(f"daily_action_limit must be 1..1000, got {ab.daily_action_limit}")
     elif ab.daily_action_limit > 200:
