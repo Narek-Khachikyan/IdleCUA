@@ -1063,6 +1063,198 @@ class IdleCua:
         )
         return enriched
 
+    def get_diagnostics(
+        self,
+        project_root: Path | str | None = None,
+        watch_loop: dict | None = None,
+        include_watch: dict | bool | None = None,
+    ) -> dict:
+        """Diagnostics decision bundle behind the Application API (T4).
+
+        Single source for: macOS Permissions checks, ComputerDriver probe,
+        Profile validity, secrets scan, scheduler lock, watch loop observed
+        state, plus effective threshold/limits for context.
+
+        Callers (CLI doctor, HTTP diagnostics) only render; they do not
+        re-implement decisions. Secrets are masked (no snippet, source+pattern
+        only). Profile validity uses T3 settings authority
+        (check_profile_confirmed / validate_profile). Imports inside method
+        to avoid cycles and hard driver dep.
+        """
+        # Normalize watch_loop param (support include_watch as alias).
+        if watch_loop is None and isinstance(include_watch, dict):
+            watch_loop = include_watch
+
+        # Effective threshold/limits for context (tighten-only via T3).
+        try:
+            effective_threshold = int(self.get_effective_idle_threshold())
+        except Exception:
+            effective_threshold = int(getattr(self.config, "idle_threshold_seconds", 600))
+        try:
+            owner = self.get_owner_settings()
+            effective_limits = owner.get("effective", {})
+        except Exception:
+            effective_limits = {
+                "session_duration_minutes": 45,
+                "daily_action_limit": 200,
+                "daily_llm_call_limit": 150,
+                "idle_threshold_seconds": effective_threshold,
+            }
+
+        # Permissions (remediation identical on both surfaces).
+        try:
+            from .profile.permissions import check_permissions
+
+            perms = check_permissions()
+            perms_data = [
+                {"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms
+            ]
+        except Exception as e:
+            perms_data = [
+                {"name": "permissions_check", "granted": None, "remediation": f"check failed: {e}"}
+            ]
+
+        # Driver probe (avoid hard dep on cua_driver).
+        driver_ok = False
+        driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
+        try:
+            import cua_driver  # type: ignore
+
+            ver = getattr(cua_driver, "__version__", "unknown")
+            driver_ok = True
+            driver_msg = f"cua-driver {ver}"
+            try:
+                status = cua_driver.current_mac_os_permission_status()
+                acc = getattr(status, "accessibility", "?")
+                scr = getattr(status, "screen_recording", "?")
+                driver_msg += f" — accessibility={acc} screen_recording={scr}"
+            except Exception as e:
+                driver_msg += f" — probe failed: {e}"
+        except (ImportError, ModuleNotFoundError):
+            driver_ok = False
+            driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
+        except Exception as e:
+            driver_ok = False
+            driver_msg = f"cua-driver probe failed: {e}"
+
+        # Profile validity via T3 authority (check_profile_confirmed + validate_profile).
+        try:
+            from .profile.validate import validate_profile
+
+            profile = self.get_profile()
+            if profile is None:
+                profile_valid = False
+                profile_confirmed = False
+                profile_errors = ["No profile found"]
+            else:
+                errs = validate_profile(profile)
+                profile_confirmed = bool(getattr(profile, "confirmed", False))
+                if not profile_confirmed:
+                    profile_valid = False
+                    profile_errors = list(errs) + ["Profile is unconfirmed"]
+                else:
+                    profile_valid = len(errs) == 0
+                    profile_errors = list(errs)
+        except Exception as e:
+            profile_valid = False
+            profile_confirmed = False
+            profile_errors = [f"profile check failed: {e}"]
+
+        # Secrets scan (masked, never leak snippet or key).
+        try:
+            from .secrets_scan import scan_project
+
+            if project_root is None:
+                # Auto-detect repo root (same logic CLI/server used before).
+                candidates = [Path.cwd(), Path(__file__).resolve().parents[2]]
+                detected = None
+                for cand in candidates:
+                    try:
+                        if (cand / ".git").exists():
+                            detected = cand
+                            break
+                        if (cand / "pyproject.toml").exists() and (cand / "src").exists():
+                            if detected is None:
+                                detected = cand
+                    except Exception:
+                        continue
+                if detected is None:
+                    detected = Path(__file__).resolve().parents[2]
+                proj_root = detected
+            else:
+                proj_root = Path(project_root).expanduser().resolve()
+            scan = scan_project(project_root=proj_root, data_dir=self.config.data_dir)
+            secrets_ok = bool(scan.ok)
+            # Masked: only source + pattern, truncated to contract limit (first 5).
+            secrets_findings = [
+                {"source": f.source, "pattern": f.pattern} for f in scan.findings[:5]
+            ]
+            # Keep counts for CLI detailed report without leaking.
+            secrets_scanned_files = int(getattr(scan, "scanned_files", 0))
+            secrets_scanned_tables = int(getattr(scan, "scanned_db_tables", 0))
+        except Exception as e:
+            secrets_ok = False
+            secrets_findings = [{"source": "scan_failed", "pattern": str(e)}]
+            secrets_scanned_files = 0
+            secrets_scanned_tables = 0
+
+        # Scheduler lock (import inside to avoid cycle).
+        try:
+            from .server.lock import get_lock_info, is_locked
+
+            lock_info = get_lock_info(self.config.data_dir)
+            locked = bool(is_locked(self.config.data_dir))
+        except Exception:
+            lock_info = None
+            locked = False
+            # Fallback direct file check without import.
+            try:
+                import json as _json
+
+                p = Path(self.config.data_dir) / ".scheduler.lock"
+                if p.exists():
+                    lock_info = _json.loads(p.read_text(encoding="utf-8"))
+                    # Consider locked if file exists; liveness check skipped in fallback.
+                    locked = True
+                else:
+                    lock_info = None
+                    locked = False
+            except Exception:
+                lock_info = None
+                locked = False
+
+        # Watch loop observed state (never owned by app; passed in or default).
+        if isinstance(watch_loop, dict):
+            watch = dict(watch_loop)
+            if "idle_threshold" not in watch:
+                watch["idle_threshold"] = effective_threshold
+            for k in ("running", "pid", "started_at", "idle_threshold"):
+                if k not in watch:
+                    watch[k] = None if k != "running" else False
+        else:
+            watch = {
+                "running": False,
+                "pid": lock_info.get("pid") if isinstance(lock_info, dict) else None,
+                "started_at": None,
+                "idle_threshold": effective_threshold,
+            }
+
+        return {
+            "permissions": perms_data,
+            "driver": {"ok": driver_ok, "message": driver_msg},
+            "profile": {"valid": profile_valid, "confirmed": profile_confirmed, "errors": profile_errors},
+            "secrets_scan": {
+                "ok": secrets_ok,
+                "findings": secrets_findings,
+                "scanned_files": secrets_scanned_files,
+                "scanned_db_tables": secrets_scanned_tables,
+            },
+            "scheduler_lock": {"locked": locked, "info": lock_info},
+            "watch_loop": watch,
+            "effective_idle_threshold": effective_threshold,
+            "effective_limits": effective_limits,
+        }
+
     # -- config persistence helpers (used by CLI init) --
 
     def init_data_dir(self) -> Path:

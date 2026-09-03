@@ -656,62 +656,25 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     @app.get("/api/v1/diagnostics")
     def api_diagnostics():
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics()."""
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        # permissions
+        # Watch loop is observed live state (never owned by app); pass current server state.
+        watch = dict(_scheduler_state)
         try:
-            from ..profile.permissions import check_permissions
-
-            perms = check_permissions()
-            perms_data = [{"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms]
-        except Exception as e:
-            perms_data = [{"error": str(e)}]
-        # driver probe
-        try:
-            import cua_driver  # type: ignore
-
-            driver_ok = True
-            driver_msg = f"cua-driver {getattr(cua_driver, '__version__', 'unknown')}"
-            try:
-                status = cua_driver.current_mac_os_permission_status()
-                driver_msg += f" — accessibility={getattr(status, 'accessibility', '?')} screen_recording={getattr(status, 'screen_recording', '?')}"
-            except Exception as e:
-                driver_msg += f" — probe failed: {e}"
-        except ImportError:
-            driver_ok = False
-            driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
-        # profile validity
-        profile = load_profile(data_dir / "profile.json")
-        if profile is None:
-            profile_valid = False
-            profile_errors = ["No profile found"]
-        else:
-            errs = validate_profile(profile)
-            profile_valid = len(errs) == 0
-            profile_errors = errs
-            if not profile.confirmed:
-                profile_valid = False
-                profile_errors = profile_errors + ["Profile is unconfirmed"]
-        # secrets scan
-        try:
-            from ..secrets_scan import scan_project
-
-            scan = scan_project(project_root=Path(__file__).resolve().parents[2], data_dir=data_dir)
-            secrets_ok = scan.ok
-            secrets_findings = [{"source": f.source, "pattern": f.pattern} for f in scan.findings[:5]]
-        except Exception as e:
-            secrets_ok = False
-            secrets_findings = [{"error": str(e)}]
-        # scheduler lock
-        lock = get_lock_info(data_dir)
-        lock_ok = not is_locked(data_dir) or lock is not None
+            watch["idle_threshold"] = int(idle_app.get_effective_idle_threshold())
+        except Exception:
+            pass
+        bundle = idle_app.get_diagnostics(watch_loop=watch)
+        # HTTP contract unchanged (shape-preserving): expose only versioned keys, masked.
+        secrets = bundle.get("secrets_scan", {})
         return {
-            "permissions": perms_data,
-            "driver": {"ok": driver_ok, "message": driver_msg},
-            "profile": {"valid": profile_valid, "confirmed": bool(profile.confirmed) if profile else False, "errors": profile_errors},
-            "secrets_scan": {"ok": secrets_ok, "findings": secrets_findings},
-            "scheduler_lock": {"locked": is_locked(data_dir), "info": lock},
-            "watch_loop": _scheduler_state,
+            "permissions": bundle.get("permissions", []),
+            "driver": bundle.get("driver", {"ok": False, "message": ""}),
+            "profile": bundle.get("profile", {"valid": False, "confirmed": False, "errors": []}),
+            "secrets_scan": {"ok": bool(secrets.get("ok", True)), "findings": list(secrets.get("findings") or [])},
+            "scheduler_lock": bundle.get("scheduler_lock", {"locked": False, "info": None}),
+            "watch_loop": bundle.get("watch_loop", watch),
         }
 
     @app.get("/api/v1/settings")
@@ -1176,27 +1139,25 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     def ui_diagnostics(request: Request):
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics()."""
         if templates is None:
             return HTMLResponse("<html><body>Diagnostics</body></html>")
         data_dir = resolved_data_dir
-        # reuse api diagnostics logic but render html
-        # call api_diagnostics inner? Instead duplicate
+        idle_app = _get_idle_cua(data_dir)
+        watch = dict(_scheduler_state)
         try:
-            from ..profile.permissions import check_permissions
-
-            perms = check_permissions()
-            perms_data = [{"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms]
-        except Exception as e:
-            perms_data = [{"error": str(e)}]
-        profile = load_profile(data_dir / "profile.json")
-        if profile is None:
-            profile_valid = False
-            profile_errors = ["No profile"]
-        else:
-            errs = validate_profile(profile)
-            profile_valid = len(errs) == 0 and profile.confirmed
-            profile_errors = errs
-        lock = get_lock_info(data_dir)
-        return templates.TemplateResponse(request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": _scheduler_state})
+            watch["idle_threshold"] = int(idle_app.get_effective_idle_threshold())
+        except Exception:
+            pass
+        bundle = idle_app.get_diagnostics(watch_loop=watch)
+        perms_data = bundle.get("permissions", [])
+        prof = bundle.get("profile", {})
+        profile_valid = bool(prof.get("valid"))
+        profile_errors = list(prof.get("errors") or [])
+        lock = bundle.get("scheduler_lock", {}).get("info")
+        watch_loop = bundle.get("watch_loop", watch)
+        return templates.TemplateResponse(
+            request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": watch_loop}
+        )
 
     return app
