@@ -63,6 +63,13 @@ def interview(
         profile, facts, assumptions = run_interview(console=console)
 
     if save_confirmed_profile(profile, ppath, console=console):
+        # Mirror browser consent to config.json for "profile/config" requirement (issue #12)
+        try:
+            bc = profile.autonomy_boundaries.browser_consent
+            cfg = IdleCuaConfig.load(resolved)
+            cfg.record_browser_consent(bool(bc.main_profile_granted), browser=bc.browser, granted_at=bc.granted_at)
+        except Exception:
+            pass
         console.print("\n" + render_human_readable(profile))
         raise typer.Exit(0)
     else:
@@ -251,3 +258,103 @@ def check_permissions_cmd(
         raise typer.Exit(1)
     if any(s.granted is None for s in statuses):
         console.print("[yellow]Could not definitively verify permissions — please verify manually via System Settings.[/yellow]")
+
+
+@profile_app.command("grant-browser")
+def grant_browser(
+    ctx: typer.Context,
+    browser: str = typer.Option("chrome", "--browser", help="Browser for main-profile consent (chrome/chromium/edge/brave)"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Explicitly grant IdleCUA to use your main Chrome profile (issue #12).
+
+    Records consent in profile.json (autonomy_boundaries.browser_consent). This is
+    the product-level explicit consent; the driver also requires
+    `cua-driver serve --grant existing-profile` (or equivalent embedded grant)
+    for the DevTools endpoint — see `idle-cua doctor`.
+    Agent opens/closes only its own tabs, never owner tabs/windows, never chrome controls.
+    """
+    from datetime import datetime, timezone
+
+    from .profile.models import BrowserConsent
+
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
+        raise typer.Exit(1)
+    bc = BrowserConsent(
+        main_profile_granted=True,
+        granted_at=datetime.now(timezone.utc).isoformat(),
+        browser=browser.lower().strip() or "chrome",
+        grant_method="cli grant-browser",
+    )
+    profile.autonomy_boundaries.browser_consent = bc
+    profile.browser_consent = bc
+    profile.touch()
+    save_profile(profile, ppath)
+    # Mirror to config.json for "profile/config" requirement
+    try:
+        cfg = IdleCuaConfig.load(resolved)
+        cfg.record_browser_consent(True, browser=bc.browser, granted_at=bc.granted_at)
+    except Exception:
+        pass
+    console.print(f"[green]Browser main-profile consent GRANTED for {bc.browser} — recorded at {ppath} + config.json[/green]")
+    console.print("[dim]Driver grant still required for existing-profile attachment:[/dim]")
+    console.print("[dim]  cua-driver serve --grant existing-profile  (Watch loop process)  or  --grant existing-profile on mcp/embedded launch[/dim]")
+    console.print("[dim]Verify with: idle-cua doctor[/dim]")
+
+
+@profile_app.command("revoke-browser")
+def revoke_browser(
+    ctx: typer.Context,
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Revoke main Chrome profile consent (agent will no longer attach to main profile)."""
+    from .profile.models import BrowserConsent
+
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
+        raise typer.Exit(1)
+    bc = BrowserConsent(main_profile_granted=False)
+    profile.autonomy_boundaries.browser_consent = bc
+    profile.browser_consent = bc
+    profile.touch()
+    save_profile(profile, ppath)
+    try:
+        cfg = IdleCuaConfig.load(resolved)
+        cfg.record_browser_consent(False, browser="chrome", granted_at=None)
+    except Exception:
+        pass
+    console.print(f"[yellow]Browser main-profile consent REVOKED — recorded at {ppath} + config.json[/yellow]")
+
+
+@profile_app.command("browser-status")
+def browser_status(
+    ctx: typer.Context,
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Override data directory"),
+) -> None:
+    """Show browser main-profile consent + driver endpoint status."""
+    resolved = _resolve_data_dir(data_dir, ctx)
+    ppath = _profile_path(resolved)
+    profile = load_profile(ppath)
+    if profile is None:
+        console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
+        raise typer.Exit(1)
+    bc = profile.autonomy_boundaries.browser_consent
+    if bc.main_profile_granted:
+        console.print(f"[green]Browser main-profile consent: GRANTED[/green] ({bc.browser}, {bc.granted_at}, via {bc.grant_method})")
+    else:
+        console.print("[yellow]Browser main-profile consent: NOT granted — agent will not attach to main profile[/yellow]")
+        console.print("[dim]Grant with: idle-cua profile grant-browser[/dim]")
+    # Also show driver grant hint
+    console.print("\n[bold]Driver grant (DevTools endpoint)[/bold]")
+    console.print("[dim]Existing-profile attachment requires driver grant:[/dim]")
+    console.print("[dim]  cua-driver serve --grant existing-profile[/dim]")
+    console.print("[dim]Check driver readiness: idle-cua doctor[/dim]")
+    if not bc.main_profile_granted:
+        raise typer.Exit(1)

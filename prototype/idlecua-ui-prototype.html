@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IdleCUA — UI Prototype (throwaway) — fixed</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>tailwind.config={theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}</script>
+<style>*{font-family:Inter,sans-serif}.mono{font-family:'JetBrains Mono',monospace}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:9999px}#app{padding-bottom:80px}</style>
+</head>
+<body class="antialiased">
+<div class="fixed top-0 inset-x-0 z-[100] bg-amber-400 text-zinc-900 text-[11px] font-semibold tracking-widest text-center py-1.5">PROTOTYPE — throwaway, not production • IdleCUA Local UI • data is mock • Hotkeys ← → to switch variants (pill demo-only)</div>
+<div id="app" class="pt-6"></div>
+<div id="switcher" class="fixed bottom-5 right-5 z-[90] flex items-center gap-1 bg-zinc-900 text-white rounded-full shadow-[0_8px_32px_rgba(0,0,0,0.35)] px-1.5 py-1.5 border border-white/10 hidden md:flex">
+  <button id="prevBtn" class="w-8 h-8 grid place-items-center rounded-full hover:bg-white/15 text-white transition"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8L10 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+  <div class="px-4 py-1 text-sm font-medium min-w-[220px] text-center"><span id="variantLabel"></span><span id="variantDesc" class="opacity-60 ml-2 text-xs hidden sm:inline"></span></div>
+  <button id="nextBtn" class="w-8 h-8 grid place-items-center rounded-full hover:bg-white/15 text-white transition"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+</div>
+<script>
+const VARIANTS = {
+  A:{key:'A', name:'Control Room', desc:'dense • sidebar • dark'},
+  B:{key:'B', name:'Focused Flow', desc:'air • centered'},
+  C:{key:'C', name:'Split Inspector', desc:'3-col • inspector'},
+  D:{key:'D', name:'Hybrid', desc:'A menu + C screen — твой выбор (fixed)'},
+};
+const MOCK = {
+  status:{ agentState:'waiting_for_idle', idleSeconds:742, idleThreshold:600, demoMode:true, today:{actions:47, actionsLimit:200, llmCalls:23, llmLimit:150, duration:18, durationLimit:45}, schedulerPid:8124 },
+  gettingStarted:[
+    {id:'profile', label:'Profile confirmed', desc:'Conservative defaults — readonly, 45 min, 14 sites', done:true, cta:'Confirmed ✓'},
+    {id:'provider', label:'Provider key', desc:'No LLM key — stub planner only', done:false, cta:'Add key'},
+    {id:'permissions', label:'macOS permissions', desc:'Accessibility & Screen Recording granted', done:true, cta:'Granted'},
+    {id:'browser', label:'Browser consent', desc:'Agent may use main Chrome — own tabs only', done:true, cta:'Granted'},
+  ],
+  tasks:[
+    {id:'a1b2c3', goal:'Research latest ArXiv papers on computer-use agents', state:'completed', when:'Today 10:22'},
+    {id:'queued1', goal:'Summarize recent AI papers on arXiv — queued for idle', state:'queued', when:'just now'},
+    {id:'running1', goal:'Research X posts about idle agents — running', state:'running', when:'2m ago'},
+    {id:'d4e5f6', goal:'Find Hacker News top discussions about idle automation', state:'completed', when:'Today 09:41'},
+    {id:'g7h8i9', goal:'Summarize YouTube tutorials on macOS Quartz HID', state:'failed', when:'Yesterday'},
+    {id:'j0k1l2', goal:'Open Calculator and verify window is visible', state:'completed', when:'2 days ago'},
+  ],
+  settings:{ limits:{session:32, actions:120, llmDaily:100, idleSec:600}, allowlist:["x.com","reddit.com","youtube.com","github.com","news.ycombinator.com","arxiv.org","facebook.com","instagram.com","linkedin.com","tiktok.com","bsky.app","threads.net","mastodon.social","google.com"] }
+};
+const TASK_PLANS = {
+  'a1b2c3': { target:'arxiv.org', title:'ArXiv — computer-use agents', date:'Today 10:34', findings:3, urls:5, excerpt:'3 papers flagged: OSWorld, MiniWoB++, WebArena. Relevance scored against your profile interests. Top finding: “OSWorld — real-world OS benchmarks for CUA”.', duration:12, maxActions:28, verdicts:[{action:'open_allowed_site arxiv.org', verdict:'allowed'},{action:'search', verdict:'allowed'},{action:'read_ui', verdict:'allowed'},{action:'save_note', verdict:'allowed'}]},
+  'queued1': { target:'arxiv.org', title:'Queued — arXiv recent', date:'Just now', findings:0, urls:0, excerpt:'Queued for next idle window · 12 min · up to 28 actions · arxiv.org', duration:12, maxActions:28, verdicts:[{action:'open_allowed_site arxiv.org', verdict:'allowed'},{action:'search', verdict:'allowed'}]},
+  'running1': { target:'x.com', title:'Running — X idle agents', date:'Running', findings:1, urls:2, excerpt:'Running · 7/22 actions · 1 finding so far · live…', duration:7, maxActions:22, verdicts:[{action:'open_allowed_site x.com', verdict:'allowed'},{action:'search', verdict:'allowed'},{action:'save_note', verdict:'allowed'}]},
+  'd4e5f6': { target:'news.ycombinator.com', title:'Hacker News — idle automation', date:'Today 09:50', findings:2, urls:3, excerpt:'Top thread: “Show HN: Idle scheduler for local agents” — 142 pts, 47 comments.', duration:9, maxActions:22, verdicts:[{action:'open_allowed_site news.ycombinator.com', verdict:'allowed'},{action:'search', verdict:'allowed'},{action:'save_note', verdict:'allowed'}]},
+  'g7h8i9': { target:'youtube.com', title:'YouTube — Quartz HID', date:'Yesterday', findings:0, urls:0, excerpt:'Blocked — domain not in allowlist. Add it in Settings → Allowlist.', duration:3, maxActions:8, verdicts:[{action:'open_allowed_site youtube.com', verdict:'allowed'},{action:'like', verdict:'needs-confirmation'}], blocked:true},
+  'j0k1l2': { target:'Calculator', title:'Calculator — host probe', date:'Today 08:12', findings:0, urls:0, excerpt:'Driver smoke: launch Calculator, verify window visible.', duration:2, maxActions:4, verdicts:[{action:'open_app Calculator', verdict:'allowed'},{action:'read_ui', verdict:'allowed'}]},
+};
+function mins(s){ const m=Math.floor(s/60); const sec=s%60; return m+'m '+sec+'s'; }
+function toast(msg){ const t=document.createElement('div'); t.className='fixed top-10 right-4 z-[95] bg-zinc-900 text-white text-sm px-4 py-2.5 rounded-xl shadow-xl border border-white/10 max-w-[360px]'; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2200); }
+function humanize(entry){
+  const raw=entry.action||'';
+  const parts=raw.split(' ');
+  const kind=parts[0];
+  const param=parts.slice(1).join(' ');
+  const map={open_allowed_site: param? 'Open '+param : 'Open allowed site', search:'Search', read_ui:'Read page', save_note:'Save note', close_own_tab:'Close tab', open_app: param? 'Open '+param : 'Open app', like:'Like post', scroll:'Scroll'};
+  return map[kind] || raw.replace(/_/g,' ');
+}
+function honest(){
+  const s=MOCK.status, thr=MOCK.settings.limits.idleSec;
+  if(s.demoMode) return {dot:'bg-amber-400', text:'Limited mode — stub planner · LLM off', sub:'Sessions run on stub planner · LLM disabled', cta:'Add key'};
+  if(s.idleSeconds < thr) return {dot:'bg-amber-400', text:'Waiting for idle — '+mins(s.idleSeconds)+' / '+mins(thr), sub:'Starts when you stay idle'};
+  return {dot:'bg-emerald-500', text:'Ready — idle threshold met', sub:'Agent will start at next idle window'};
+}
+function inspectorHtml(taskId){
+  const plan=TASK_PLANS[taskId];
+  if(!plan) return '<div class="text-sm text-zinc-500 p-4">Select a task</div>';
+  let rows='';
+  for(let i=0;i<plan.verdicts.length;i++){
+    const v=plan.verdicts[i];
+    const label=humanize(v);
+    const isNeed=v.verdict==='needs-confirmation';
+    const pill=isNeed ? '<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium bg-amber-50 border-amber-200 text-amber-800">⚠ needs confirmation</span>' : '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full border text-xs font-medium bg-emerald-50 border-emerald-200 text-emerald-800">✓ allowed</span>';
+    const btns=isNeed ? '<div class="flex gap-1.5 ml-2"><button onclick="toast(\'Approve '+taskId+'\')" class="px-2.5 py-1 rounded-full bg-zinc-900 text-white text-xs font-medium">Approve</button><button onclick="toast(\'Skip '+taskId+'\')" class="px-2.5 py-1 rounded-full border border-zinc-200 bg-white text-xs">Skip</button></div>' : '';
+    rows+='<div class="flex justify-between items-center px-4 py-3"><span class="text-[15px] font-medium">'+label+'</span><div class="flex items-center">'+pill+btns+'</div></div>';
+  }
+  const allowed=plan.verdicts.filter(v=>v.verdict==='allowed').length;
+  const needs=plan.verdicts.filter(v=>v.verdict==='needs-confirmation').length;
+  const summary=needs>0 ? allowed+' allowed • '+needs+' needs confirmation' : allowed+' allowed';
+  let report='';
+  if(plan.findings>0){
+    report='<div class="border border-zinc-200 rounded-2xl p-4"><div class="text-[15px] font-semibold">'+plan.title+'</div><div class="text-sm text-zinc-500 mt-0.5">'+plan.date+' • '+plan.findings+' findings • '+plan.urls+' urls</div><div class="text-[15px] text-zinc-700 mt-3 leading-relaxed">'+plan.excerpt+'</div><button onclick="toast(\'Open report '+taskId+'\')" class="mt-3 text-sm bg-zinc-900 text-white px-4 py-2 rounded-full font-medium">Open report</button></div>';
+  } else if(plan.blocked){
+    report='<div class="border border-red-200 bg-red-50 rounded-2xl p-4"><div class="text-[15px] font-semibold text-red-800">Blocked</div><div class="text-sm text-red-600 mt-1">Domain not in allowlist</div><div class="text-[15px] text-zinc-700 mt-3 leading-relaxed">'+plan.excerpt+'</div><button onclick="toast(\'Edit allowlist\')" class="mt-3 text-sm bg-white border border-red-200 px-4 py-2 rounded-full font-medium">Edit allowlist</button></div>';
+  } else {
+    report='<div class="border border-zinc-200 rounded-2xl p-4"><div class="text-[15px] font-semibold">'+plan.title+'</div><div class="text-sm text-zinc-500 mt-0.5">'+plan.date+'</div><div class="text-[15px] text-zinc-600 mt-3">'+plan.excerpt+'</div></div>';
+  }
+  const limits='<div class="border border-zinc-200 rounded-2xl p-4 text-sm"><div class="font-semibold text-[15px]">This plan — budget</div><div class="mt-3 space-y-2 text-[14px] text-zinc-600"><div class="flex justify-between"><span>Duration</span><span class="font-medium text-zinc-900">'+plan.duration+' min</span></div><div class="flex justify-between"><span>Actions</span><span class="font-medium text-zinc-900">up to '+plan.maxActions+'</span></div><div class="flex justify-between"><span>Checks</span><span class="font-medium text-zinc-900">'+summary+'</span></div><div class="text-xs text-zinc-500 mt-2 pt-2 border-t border-zinc-100">Session max: 200 actions · 45 min · 150 LLM/day (see header)</div></div></div>';
+  return '<div class="border border-zinc-200 rounded-2xl overflow-hidden"><div class="px-4 py-3 bg-zinc-50 border-b border-zinc-200 text-sm font-semibold">Plan → '+plan.target+' • '+plan.duration+' min • up to '+plan.maxActions+' actions</div><div class="divide-y divide-zinc-100">'+rows+'</div></div>'+report+limits;
+}
+function gettingHtml(){
+  const doneCount=MOCK.gettingStarted.filter(s=>s.done).length;
+  const total=MOCK.gettingStarted.length;
+  const blocker=MOCK.gettingStarted.find(s=>!s.done);
+  const desc=blocker ? blocker.desc : '';
+  return '<div class="bg-white border border-zinc-200 rounded-2xl px-5 py-3 flex items-center gap-3"><span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-sm font-medium">Getting started — '+doneCount+'/'+total+'</span><span class="hidden sm:inline text-sm text-zinc-500">One step left — '+blocker.label+': '+desc+'</span><button onclick="toast(\'Add key\')" class="ml-auto bg-zinc-900 text-white px-4 py-1.5 rounded-full text-sm font-medium">Add key</button><button onclick="document.getElementById(\'gettingDetails\')?.classList.toggle(\'hidden\')" class="text-sm text-zinc-500 underline ml-2">Details</button></div><div id="gettingDetails" class="hidden mt-2 bg-white border border-zinc-200 rounded-2xl p-4"><div class="grid grid-cols-4 gap-3">'+MOCK.gettingStarted.map(s=>'<div class="border rounded-xl p-3 '+( !s.done && s.id==='provider' ? 'border-zinc-900 bg-zinc-900 text-white' : s.done ? 'border-zinc-200 bg-zinc-50' : 'border-amber-300 bg-amber-50')+'"><div class="text-[13px] font-medium">'+s.label+'</div><div class="text-xs mt-1 '+( !s.done && s.id==='provider' ? 'text-zinc-300' : 'text-zinc-500')+'">'+s.desc+'</div></div>').join('')+'</div></div>';
+}
+function tasksHtml(){
+  let rows='';
+  for(let i=0;i<MOCK.tasks.length;i++){
+    const t=MOCK.tasks[i];
+    const plan=TASK_PLANS[t.id];
+    let res='—'; if(plan){ if(t.state==='queued') res='—'; else res=plan.findings+' findings · '+plan.urls+' urls'; }
+    const sel=i===0;
+    const cls=sel ? 'bg-blue-50 border-l-2 border-blue-500' : 'hover:bg-zinc-50 border-l-2 border-transparent';
+    const col=t.state==='failed' ? 'text-red-600' : t.state==='running' ? 'text-blue-600' : t.state==='queued' ? 'text-amber-600' : 'text-emerald-700';
+    const ic=t.state==='completed' ? '✓' : t.state==='failed' ? '⚠' : t.state==='running' ? '●' : t.state==='queued' ? '○' : '○';
+    let extra=''; if(t.state==='failed') extra='<button onclick="event.stopPropagation(); toast(\'Retry '+t.id+'\')" class="ml-2 text-xs px-2 py-1 rounded-full bg-white border border-red-200 text-red-700">Retry</button>'; else if(t.state==='running') extra='<span class="ml-2 text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">live</span>'; else if(t.state==='queued') extra='<span class="ml-2 text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">queued</span>';
+    rows+='<div onclick="selectTask(\''+t.id+'\')" data-task="'+t.id+'" class="task-row grid grid-cols-[1fr_110px_90px_80px] px-4 py-3.5 cursor-pointer '+cls+'"><span class="text-[15px] font-medium truncate pr-3 text-zinc-900 leading-snug">'+t.goal+'</span><span class="text-sm text-zinc-600 mono truncate">'+res+'</span><span class="inline-flex items-center gap-1.5 text-sm truncate '+col+'">'+ic+' '+t.state+'</span><span class="text-sm text-zinc-500">'+t.when+'</span></div>';
+  }
+  return rows;
+}
+function renderA(){
+  return `
+  <div class="min-h-screen bg-zinc-950 text-zinc-100 flex">
+    <aside class="w-[260px] shrink-0 bg-zinc-900 border-r border-zinc-800 flex flex-col sticky top-6 h-[calc(100vh-24px)]">
+      <div class="px-5 py-5 border-b border-zinc-800"><div class="flex items-center gap-2.5"><div class="w-8 h-8 rounded-lg bg-white text-zinc-900 grid place-items-center font-bold text-[13px]">◧</div><div><div class="text-[13px] font-semibold leading-none">IdleCUA</div><div class="text-[11px] text-zinc-500">Local • 127.0.0.1:8000</div></div><span class="ml-auto text-[10px] tracking-widest font-semibold bg-amber-400 text-zinc-900 px-1.5 py-0.5 rounded">DEMO</span></div></div>
+      <nav class="p-3 space-y-1 text-[13px]">
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-white text-zinc-900 font-medium"><span class="w-5 text-center">◎</span> Dashboard</a>
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">◧</span> Tasks</a>
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">≡</span> History</a>
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">▭</span> Reports</a>
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⚙</span> Settings</a>
+        <a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⧉</span> Diagnostics</a>
+      </nav>
+      <div class="mt-auto p-3 space-y-3 border-t border-zinc-800">
+        <div class="bg-zinc-800 rounded-xl p-3"><div class="text-[11px] tracking-widest font-semibold text-zinc-400">WATCH LOOP</div><div class="flex items-center gap-2 mt-1.5"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span class="text-sm font-medium">Running</span><span class="ml-auto mono text-xs text-zinc-500">pid 8124</span></div><div class="text-xs text-zinc-500 mt-1">Idle 12m 22s • threshold 10m</div></div>
+        <button onclick="toast('Emergency stop')" class="w-full bg-red-600 hover:bg-red-500 text-white text-sm font-semibold py-2.5 rounded-xl">⬢ Emergency stop</button>
+      </div>
+    </aside>
+    <div class="flex-1 min-w-0">
+      <header class="h-14 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur sticky top-6 z-20 flex items-center px-6 gap-4"><div class="text-sm text-zinc-400">Dashboard <span class="text-zinc-600">/</span> <span class="text-zinc-100">Today</span></div><div class="ml-auto flex items-center gap-3"><span class="mono text-xs bg-zinc-900 border border-zinc-800 px-2.5 py-1 rounded-full text-zinc-400">waiting_for_idle</span><span class="w-2 h-2 rounded-full bg-emerald-500"></span><span class="text-xs text-zinc-400">idle 12m 22s</span></div></header>
+      <div class="p-6 space-y-6 max-w-[1280px]">
+        <div class="grid grid-cols-4 gap-3">
+          <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><div class="text-[11px] tracking-widest font-semibold text-zinc-500">AGENT STATE</div><div class="text-[22px] font-semibold mt-1">Waiting For Idle</div></div>
+          <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><div class="text-[11px] tracking-widest font-semibold text-zinc-500">IDLE</div><div class="text-[22px] font-semibold mono mt-1">12m 22s <span class="text-sm font-normal text-zinc-500">/ 10m</span></div><div class="mt-2 h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div class="h-full bg-emerald-500" style="width:100%"></div></div></div>
+          <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><div class="text-[11px] tracking-widest font-semibold text-zinc-500">LIMITS TODAY</div><div class="text-sm mono mt-2 space-y-1.5"><div class="flex justify-between"><span class="text-zinc-500">Actions</span><span>47 / 200</span></div><div class="flex justify-between"><span class="text-zinc-500">LLM calls</span><span>23 / 150</span></div></div></div>
+          <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><div class="text-[11px] tracking-widest font-semibold text-zinc-500">LAST REPORT</div><div class="text-sm font-medium mt-1">ArXiv — computer-use agents</div><div class="text-xs mono text-zinc-500 mt-1">2026-09-01 10:34 • 3 findings</div></div>
+        </div>
+        <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><div class="text-sm font-semibold">Fixed variant — see D for corrected hybrid.</div><div class="text-sm text-zinc-400">Switch to D via pill at bottom.</div></div>
+      </div>
+    </div>
+  </div>`;
+}
+function renderB(){
+  return `
+  <div class="min-h-screen bg-stone-50 text-stone-900"><div class="max-w-[980px] mx-auto px-6">
+    <div class="sticky top-6 z-20 -mx-6 px-6 py-3 bg-stone-50/80 backdrop-blur border-b border-stone-200 flex items-center gap-6"><div class="flex items-center gap-2"><div class="w-7 h-7 rounded-lg bg-stone-900 text-white grid place-items-center text-xs font-bold">◧</div><span class="font-semibold text-sm">IdleCUA</span><span class="text-[10px] tracking-widest font-bold bg-amber-400 text-stone-900 px-1.5 py-0.5 rounded">DEMO</span></div><nav class="hidden md:flex items-center gap-1 ml-6 text-sm"><a class="px-3 py-2 font-semibold border-b-2 border-stone-900">Dashboard</a><a class="px-3 py-2 text-stone-500">Tasks</a><a class="px-3 py-2 text-stone-500">History</a></nav><div class="ml-auto"><button onclick="toast('Emergency stop')" class="w-8 h-8 grid place-items-center rounded-full bg-red-600 text-white">⬢</button></div></div>
+    <div class="mt-6 bg-white border border-stone-200 rounded-[24px] p-6 shadow-sm"><div class="text-[22px] font-semibold">You’re 1 step from your first idle session</div><div class="text-sm text-stone-500 mt-1">See variant D for fixed onboarding.</div></div>
+    <div class="mt-6 bg-white border border-stone-200 rounded-[24px] p-6 shadow-sm"><div class="text-lg font-semibold">What should the agent do while you’re away?</div><textarea class="mt-4 w-full h-[96px] bg-stone-50 border border-stone-200 rounded-2xl p-4 text-sm" placeholder="e.g. Research Reddit..."></textarea><div class="flex gap-3 mt-4"><button onclick="toast('Preview plan')" class="bg-stone-900 text-white px-5 py-2.5 rounded-full text-sm font-medium">Preview plan</button></div></div>
+  </div></div>`;
+}
+function renderC(){
+  return `
+  <div class="h-[calc(100vh-24px)] flex bg-white text-zinc-900 overflow-hidden border-t border-zinc-200">
+    <div class="w-[56px] shrink-0 bg-zinc-900 text-zinc-400 flex flex-col items-center py-4 gap-2 border-r border-zinc-800"><div class="w-8 h-8 rounded-lg bg-white text-zinc-900 grid place-items-center font-bold text-xs">◧</div><div class="mt-4 flex flex-col gap-1"><button class="w-10 h-10 grid place-items-center rounded-xl bg-white text-zinc-900 text-sm">◎</button><button class="w-10 h-10 grid place-items-center rounded-xl hover:bg-white/10 text-sm">◧</button></div><button onclick="toast('Emergency stop')" class="mt-auto w-10 h-10 grid place-items-center rounded-xl bg-red-600 text-white">⬢</button></div>
+    <div class="w-[200px] shrink-0 bg-zinc-50 border-r border-zinc-200 hidden lg:flex flex-col"><div class="px-4 py-4 border-b border-zinc-200"><div class="text-[11px] tracking-widest font-semibold text-zinc-500">NAVIGATION</div><div class="text-sm font-semibold mt-1">Dashboard</div></div><div class="p-2 space-y-1 text-sm"><a class="flex items-center gap-2 px-3 py-2 rounded-lg bg-white border border-zinc-200 font-medium">◎ Overview</a><a class="flex items-center gap-2 px-3 py-2 rounded-lg text-zinc-600">◧ Tasks</a></div></div>
+    <div class="flex-1 min-w-0 central-scroll bg-zinc-50"><div class="sticky top-0 z-10 bg-zinc-50/80 backdrop-blur border-b border-zinc-200 px-5 py-3 flex items-center gap-3"><span class="font-semibold">Overview</span><span class="hidden sm:inline-flex mono text-xs bg-amber-400 text-zinc-900 px-2 py-1 rounded-full font-semibold">DEMO — stub planner</span></div><div class="p-5"><div class="bg-white border border-zinc-200 rounded-2xl p-4"><div class="text-sm">See D for fixed hybrid.</div></div></div></div>
+    <div class="w-[360px] shrink-0 bg-white border-l border-zinc-200 hidden xl:flex flex-col overflow-auto"><div class="sticky top-0 bg-white border-b border-zinc-200 px-4 py-3"><div class="text-sm font-semibold">Inspector</div></div><div class="p-4 text-sm text-zinc-500">Select a task in D.</div></div>
+  </div>`;
+}
+function renderD(){
+  const hs=honest();
+  const statusBanner='<div class="border rounded-2xl p-4 flex gap-3 items-start '+(hs.dot==='bg-amber-400'?'bg-amber-50 border-amber-200':'bg-emerald-50 border-emerald-200')+'"><span class="mt-1 w-2.5 h-2.5 rounded-full '+hs.dot+' shrink-0"></span><div class="flex-1 min-w-0"><div class="text-[15px] font-semibold '+(hs.dot==='bg-amber-400'?'text-amber-900':'text-emerald-900')+'">'+hs.text+'</div><div class="text-sm '+(hs.dot==='bg-amber-400'?'text-amber-800':'text-emerald-800')+'">'+hs.sub+'</div></div>'+(hs.cta ? '<button onclick="toast(\'Add key\')" class="shrink-0 bg-zinc-900 text-white px-4 py-2 rounded-full text-sm font-medium">'+hs.cta+'</button>' : '')+'</div>';
+  return `
+  <div class="h-[calc(100vh-24px)] flex overflow-hidden border-t border-zinc-200">
+    <aside class="w-[260px] shrink-0 bg-zinc-900 border-r border-zinc-800 flex flex-col">
+      <div class="px-5 py-5 border-b border-zinc-800"><div class="flex items-center gap-2.5"><div class="w-8 h-8 rounded-lg bg-white text-zinc-900 grid place-items-center font-bold text-[13px]">◧</div><div><div class="text-[13px] font-semibold leading-none text-white">IdleCUA</div><div class="text-[11px] text-zinc-500">Local • 127.0.0.1:8000</div></div><span class="ml-auto text-[10px] tracking-widest font-semibold bg-amber-400 text-zinc-900 px-1.5 py-0.5 rounded">DEMO</span></div></div>
+      <nav class="p-3 space-y-1 text-[13px]"><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-white text-zinc-900 font-medium"><span class="w-5 text-center">◎</span> Dashboard</a><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">◧</span> Tasks</a><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">≡</span> History</a><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">▭</span> Reports</a><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⚙</span> Settings</a><a class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⧉</span> Diagnostics</a></nav>
+      <div class="mt-auto p-3 space-y-3 border-t border-zinc-800"><div class="bg-zinc-800 rounded-xl p-3"><div class="text-[11px] tracking-widest font-semibold text-zinc-400">WATCH LOOP</div><div class="flex items-center gap-2 mt-1.5"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span class="text-sm font-medium text-white">Running</span><span class="ml-auto mono text-xs text-zinc-500">pid 8124</span></div><div class="text-xs text-zinc-500 mt-1">Idle 12m 22s • threshold 10m</div></div><button onclick="toast('Emergency stop')" class="w-full bg-red-600 hover:bg-red-500 text-white text-sm font-semibold py-2.5 rounded-xl">⬢ Emergency stop</button></div>
+    </aside>
+    <div class="flex-1 min-w-0 flex overflow-hidden">
+      <div class="flex-1 min-w-0 central-scroll bg-zinc-50">
+        <div class="sticky top-6 z-30 bg-zinc-50 border-b border-zinc-200 px-5 py-3 flex items-center gap-3"><span class="font-semibold text-zinc-900">Overview</span><span class="hidden sm:inline-flex items-center gap-1.5 mono text-xs bg-zinc-900 text-white px-2.5 py-1 rounded-full">Waiting for idle • 12m 22s • Limited mode</span><span class="ml-auto mono text-xs text-zinc-500">127.0.0.1:8000 • Demo</span></div>
+        <div class="px-5 pt-3 sticky top-[52px] z-20 bg-zinc-50">`+statusBanner+`</div>
+        <div class="px-5">
+          <div class="bg-white border border-zinc-200 rounded-2xl p-5">
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <div class="text-xs tracking-widest font-semibold text-zinc-500">AGENT — NOW</div>
+                <div class="text-[22px] font-semibold mt-1 text-zinc-900 truncate">${MOCK.tasks.some(x=>x.state==='running') ? 'Running — '+MOCK.tasks.find(x=>x.state==='running').goal.slice(0,40)+'…' : 'Waiting for idle'}</div>
+                <div class="text-sm text-zinc-500">${MOCK.tasks.some(x=>x.state==='running') ? '2m / 12 min · 7/22 actions · live — see table' : 'Idle 12m 22s / 10m · Watch loop Running · Threshold met · Next session when idle window holds'}</div>
+              </div>
+              <div class="hidden sm:block w-px h-12 bg-zinc-200 mx-4"></div>
+              <div class="hidden sm:block text-right">
+                <div class="mono text-xs text-zinc-500">Idle</div>
+                <div class="text-sm font-medium">12m 22s / 10m</div>
+                <div class="mt-1 h-1.5 bg-zinc-100 rounded-full overflow-hidden w-24"><div class="h-full ${MOCK.tasks.some(x=>x.state==='running') ? 'bg-blue-500' : 'bg-emerald-500'}" style="width:${MOCK.tasks.some(x=>x.state==='running') ? '32%' : '100%'}"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="p-5 space-y-5 pb-20">
+          <div id="gettingStartedWrap">`+gettingHtml()+`</div>
+          <div class="bg-white border border-zinc-200 rounded-2xl p-5">
+            <div class="flex items-center justify-between"><span class="text-xs tracking-widest font-semibold text-zinc-500">TODAY — SESSION USAGE</span><span class="mono text-xs text-zinc-500">Session max: 200 actions · 45 min · 150 LLM</span></div>
+            <div class="mt-4 grid grid-cols-3 gap-6">
+              <div><div class="flex justify-between text-sm"><span class="text-zinc-600">Actions</span><span class="font-medium mono">47 / 200</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width:23.5%"></div></div></div>
+              <div><div class="flex justify-between text-sm"><span class="text-zinc-600">LLM calls</span><span class="font-medium mono">23 / 150</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width:15.3%"></div></div></div>
+              <div><div class="flex justify-between text-sm"><span class="text-zinc-600">Duration</span><span class="font-medium mono">18 / 45 min</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width:40%"></div></div></div>
+            </div>
+          </div>
+          <div class="bg-white border border-zinc-200 rounded-2xl overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-zinc-200 flex items-center"><span class="font-semibold text-[15px] text-zinc-900">Composer</span><span class="ml-2 text-sm text-zinc-500">dry-run · zero actions until you queue</span></div>
+            <div class="p-5"><textarea placeholder="What should the agent do while you are away?" class="w-full h-[84px] bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-[15px] leading-relaxed placeholder:text-zinc-400 focus:outline-none focus:border-zinc-300 focus:bg-white"></textarea>
+              <div class="flex gap-2 mt-3"><button onclick="toast('Queue for idle')" class="bg-zinc-900 text-white px-5 py-2.5 rounded-full text-[15px] font-medium">Queue for idle</button><button onclick="toast('Preview plan')" class="px-5 py-2.5 rounded-full text-[15px] border border-zinc-200 bg-white">Preview plan</button><button class="px-5 py-2.5 rounded-full text-[15px] border border-zinc-200 bg-white">Clear</button></div>
+            </div>
+            <div class="border-t border-zinc-200 divide-y divide-zinc-100 text-sm">
+              <div class="grid grid-cols-[1fr_110px_90px_80px] px-4 py-2.5 text-zinc-500 bg-zinc-50 text-xs mono"><span>Goal</span><span>Result</span><span>State</span><span>When</span></div>
+              `+tasksHtml()+`
+            </div>
+            <div class="px-4 py-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-800">Selected row is blue — not yellow. Inspector → right shows the plan.</div>
+          </div>
+        </div>
+      </div>
+      <div class="w-[400px] shrink-0 bg-white border-l border-zinc-200 hidden xl:flex flex-col overflow-auto">
+        <div class="sticky top-0 bg-white border-b border-zinc-200 px-5 py-4 flex items-center justify-between"><div><div class="text-[15px] font-semibold text-zinc-900">Inspector</div><div id="inspectorSub" class="text-sm text-zinc-500 mt-0.5">ArXiv — plan & verdicts</div></div><button onclick="toast('Collapse inspector')" class="w-8 h-8 grid place-items-center rounded-full border border-zinc-200 hover:bg-zinc-50">›</button></div>
+        <div id="inspector" class="p-4 space-y-4 pb-20"></div>
+        <div class="mt-auto p-4 border-t border-zinc-100 text-xs text-zinc-500">“This plan” budget is separate from “Today” usage. Approve/Skip lives in the verdict row.</div>
+      </div>
+    </div>
+  </div>`;
+}
+let selectedTask='a1b2c3';
+function selectTask(id){
+  selectedTask=id;
+  const rows=document.querySelectorAll('.task-row');
+  for(let i=0;i<rows.length;i++){
+    const el=rows[i];
+    const isSel=el.getAttribute('data-task')===id;
+    el.classList.toggle('bg-blue-50',isSel);
+    el.classList.toggle('border-blue-500',isSel);
+  }
+  const insp=document.getElementById('inspector');
+  if(insp) insp.innerHTML=inspectorHtml(id);
+  const sub=document.getElementById('inspectorSub');
+  const t=MOCK.tasks.find(x=>x.id===id);
+  if(sub && t) sub.textContent=t.goal.slice(0,48);
+}
+function getVariant(){ const p=new URLSearchParams(location.search).get('variant'); return (p && VARIANTS[p] ? p : 'D'); }
+function setVariant(k){ const url=new URL(location.href); url.searchParams.set('variant',k); history.replaceState(null,'',url); render(); }
+function render(){
+  const v=getVariant();
+  let html='';
+  if(v==='A') html=renderA();
+  else if(v==='B') html=renderB();
+  else if(v==='C') html=renderC();
+  else html=renderD();
+  document.getElementById('app').innerHTML=html;
+  const meta=VARIANTS[v];
+  document.getElementById('variantLabel').textContent=meta.key+' — '+meta.name;
+  document.getElementById('variantDesc').textContent=meta.desc;
+  if(v==='D' || v==='C'){
+    setTimeout(()=>{ const insp=document.getElementById('inspector'); if(insp) insp.innerHTML=inspectorHtml(selectedTask); },0);
+  }
+}
+document.getElementById('prevBtn').onclick=()=>{ const ks=Object.keys(VARIANTS); const cur=getVariant(); const i=ks.indexOf(cur); setVariant(ks[(i-1+ks.length)%ks.length]); };
+document.getElementById('nextBtn').onclick=()=>{ const ks=Object.keys(VARIANTS); const cur=getVariant(); const i=ks.indexOf(cur); setVariant(ks[(i+1)%ks.length]); };
+document.addEventListener('keydown',e=>{ if(e.target.matches('input,textarea,[contenteditable]')) return; if(e.key==='ArrowLeft') document.getElementById('prevBtn').click(); if(e.key==='ArrowRight') document.getElementById('nextBtn').click(); });
+render();
+window.selectTask=selectTask;
+</script>
+</body>
+</html>

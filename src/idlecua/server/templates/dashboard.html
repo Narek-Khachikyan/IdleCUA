@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IdleCUA — Local UI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>tailwind.config={theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}</script>
+<style>*{font-family:Inter,sans-serif}.mono{font-family:'JetBrains Mono',monospace}body{font-size:15px}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:9999px}</style>
+<script src="/static/htmx.min.js"></script>
+</head>
+<body class="antialiased bg-white text-zinc-900">
+<div class="h-screen flex overflow-hidden">
+  <!-- Sidebar -->
+  <aside class="w-[260px] shrink-0 bg-zinc-900 border-r border-zinc-800 flex flex-col">
+    <div class="px-5 py-5 border-b border-zinc-800">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-white text-zinc-900 grid place-items-center font-bold text-[13px]">◧</div>
+        <div>
+          <div class="text-[13px] font-semibold leading-none text-white">IdleCUA</div>
+          <div class="text-[11px] text-zinc-500">Local • 127.0.0.1:8000</div>
+        </div>
+        {% if demo_mode %}<span class="ml-auto text-[10px] tracking-widest font-semibold bg-amber-400 text-zinc-900 px-1.5 py-0.5 rounded">DEMO</span>{% endif %}
+      </div>
+    </div>
+    <nav class="p-3 space-y-1 text-[14px]">
+      <a href="/" class="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-white text-zinc-900 font-medium"><span class="w-5 text-center">◎</span> Dashboard</a>
+      <a href="/tasks" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">◧</span> Tasks</a>
+      <a href="/history" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">≡</span> History</a>
+      <a href="/reports" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">▭</span> Reports</a>
+      <a href="/settings" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⚙</span> Settings</a>
+      <a href="/diagnostics" class="flex items-center gap-2.5 px-3 py-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 font-medium"><span class="w-5 text-center">⧉</span> Diagnostics</a>
+    </nav>
+    <div class="mt-auto p-3 space-y-3 border-t border-zinc-800">
+      <div class="bg-zinc-800 rounded-xl p-3">
+        <div class="text-[11px] tracking-widest font-semibold text-zinc-400">WATCH LOOP</div>
+        <div class="flex items-center gap-2 mt-1.5">
+          <span class="w-2 h-2 rounded-full {{ 'bg-emerald-500 animate-pulse' if watch_loop.running else 'bg-zinc-500' }}"></span>
+          <span class="text-sm font-medium text-white">{{ 'Running' if watch_loop.running else 'Stopped' }}</span>
+          {% if lock_info %}<span class="ml-auto mono text-xs text-zinc-500">pid {{ lock_info.pid }}</span>{% endif %}
+        </div>
+        <div class="text-xs text-zinc-500 mt-1">Idle threshold {{ effective_idle_threshold }}s</div>
+        <div class="flex gap-1.5 mt-2">
+          <button onclick="fetch('/api/v1/scheduler/start',{method:'POST'}).then(()=>location.reload())" class="text-xs bg-zinc-700 text-white px-2.5 py-1 rounded-full">Start</button>
+          <button onclick="fetch('/api/v1/scheduler/stop',{method:'POST'}).then(()=>location.reload())" class="text-xs border border-zinc-600 text-zinc-300 px-2.5 py-1 rounded-full">Stop</button>
+        </div>
+      </div>
+      <button onclick="fetch('/api/v1/emergency-stop',{method:'POST'}).then(()=>alert('Emergency stop sent'))" class="w-full bg-red-600 hover:bg-red-500 text-white text-sm font-semibold py-2.5 rounded-xl">⬢ Emergency stop</button>
+      <div class="text-[11px] text-zinc-500 text-center">Always visible — halt at any scroll</div>
+    </div>
+  </aside>
+
+  <!-- Center + Right -->
+  <div class="flex-1 min-w-0 flex overflow-hidden">
+    <!-- Center work column -->
+    <div class="flex-1 min-w-0 bg-zinc-50 overflow-auto">
+      <!-- Sticky Overview header + status banner -->
+      <div class="sticky top-0 z-30 bg-zinc-50 border-b border-zinc-200 px-5 py-3 flex items-center gap-3">
+        <span class="font-semibold text-zinc-900">Overview</span>
+        <span class="hidden sm:inline-flex items-center gap-1.5 mono text-xs bg-zinc-900 text-white px-2.5 py-1 rounded-full">{{ honest.text }}</span>
+        <span class="ml-auto mono text-xs text-zinc-500">127.0.0.1:8000 {% if demo_mode %}• Demo{% endif %}</span>
+      </div>
+
+      <!-- Honest status banner (hx poll 3s) -->
+      <div id="status-banner" class="px-5 pt-3" hx-get="/ui/status" hx-trigger="every 3s" hx-swap="innerHTML">
+        {% include "partials/status_banner.html" %}
+      </div>
+
+      <!-- Hero AGENT — NOW -->
+      <div class="px-5 pt-3">
+        <div class="bg-white border border-zinc-200 rounded-2xl p-5">
+          <div class="flex items-center gap-3">
+            <div class="flex-1 min-w-0">
+              <div class="text-xs tracking-widest font-semibold text-zinc-500">AGENT — NOW</div>
+              <div class="text-[22px] font-semibold mt-1 text-zinc-900 truncate">{{ honest.hero_title }}</div>
+              <div class="text-sm text-zinc-500">{{ honest.hero_sub }}</div>
+            </div>
+            <div class="hidden sm:block w-px h-12 bg-zinc-200 mx-4"></div>
+            <div class="hidden sm:block text-right">
+              <div class="mono text-xs text-zinc-500">Idle</div>
+              <div class="text-sm font-medium" id="idle-display">— / {{ effective_idle_threshold }}s</div>
+              <div class="mt-1 h-1.5 bg-zinc-100 rounded-full overflow-hidden w-24"><div class="h-full {{ 'bg-emerald-500' if honest.level=='ready' else 'bg-amber-400' if honest.level in ['waiting','limited'] else 'bg-blue-500' }}" style="width:60%"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="p-5 space-y-5 pb-20">
+        <!-- Getting Started collapsed line + Details expander -->
+        <div id="gettingStartedWrap" class="bg-white border border-zinc-200 rounded-2xl px-5 py-3 flex items-center gap-3">
+          <span class="w-2 h-2 rounded-full {{ 'bg-emerald-500' if done_count==total else 'bg-amber-400' }}"></span>
+          <span class="text-sm font-medium">Getting started — {{ done_count }}/{{ total }}</span>
+          {% if done_count != total %}
+          <span class="hidden sm:inline text-sm text-zinc-500">
+            {% for c in checklist if not c.done %}{{ c.label }}: {{ c.desc }}{% if not loop.last %}, {% endif %}{% endfor %}
+          </span>
+          {% else %}
+          <span class="hidden sm:inline text-sm text-zinc-500">All steps complete</span>
+          {% endif %}
+          {% if not checklist[1].done %}
+          <button onclick="location.href='/settings'" class="ml-auto bg-zinc-900 text-white px-4 py-1.5 rounded-full text-sm font-medium">Add key</button>
+          {% endif %}
+          <button onclick="document.getElementById('gettingDetails').classList.toggle('hidden')" class="text-sm text-zinc-500 underline ml-2">Details</button>
+        </div>
+        <div id="gettingDetails" class="hidden bg-white border border-zinc-200 rounded-2xl p-4">
+          <div class="grid grid-cols-4 gap-3">
+            {% for item in checklist %}
+            <div class="border rounded-xl p-3 {{ 'border-zinc-900 bg-zinc-900 text-white' if not item.done and item.id=='provider' else 'border-zinc-200 bg-zinc-50' if item.done else 'border-amber-300 bg-amber-50' }}">
+              <div class="text-[13px] font-medium">{{ item.label }}</div>
+              <div class="text-xs mt-1 {{ 'text-zinc-300' if not item.done and item.id=='provider' else 'text-zinc-500' }}">{{ item.desc }}</div>
+              <div class="text-xs mt-2 font-medium">{{ item.cta }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="mt-3 flex gap-2">
+            <button onclick="fetch('/api/v1/profile/confirm',{method:'POST'}).then(()=>location.reload())" class="text-sm bg-white border border-zinc-200 px-3 py-1.5 rounded-full">Confirm defaults</button>
+            <a href="/diagnostics" class="text-sm text-zinc-500 underline">Open diagnostics</a>
+          </div>
+        </div>
+
+        <!-- Today session-usage meters -->
+        <div class="bg-white border border-zinc-200 rounded-2xl p-5">
+          <div class="flex items-center justify-between"><span class="text-xs tracking-widest font-semibold text-zinc-500">TODAY — SESSION USAGE</span><span class="mono text-xs text-zinc-500">Session max: 200 actions · 45 min · 150 LLM</span></div>
+          <div class="mt-4 grid grid-cols-3 gap-6">
+            <div><div class="flex justify-between text-sm"><span class="text-zinc-600">Actions</span><span class="font-medium mono">{{ today.actions }} / {{ today.actions_limit }}</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width: {{ (today.actions / today.actions_limit * 100) if today.actions_limit else 0 }}%"></div></div></div>
+            <div><div class="flex justify-between text-sm"><span class="text-zinc-600">LLM calls</span><span class="font-medium mono">{{ today.llm_calls }} / {{ today.llm_limit }}</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width: {{ (today.llm_calls / today.llm_limit * 100) if today.llm_limit else 0 }}%"></div></div></div>
+            <div><div class="flex justify-between text-sm"><span class="text-zinc-600">Duration</span><span class="font-medium mono">{{ today.duration }} / {{ today.duration_limit }} min</span></div><div class="mt-1.5 h-2 bg-zinc-100 rounded-full overflow-hidden"><div class="h-full bg-zinc-900" style="width: {{ (today.duration / today.duration_limit * 100) if today.duration_limit else 0 }}%"></div></div></div>
+          </div>
+        </div>
+
+        <!-- Composer -->
+        <div class="bg-white border border-zinc-200 rounded-2xl overflow-hidden">
+          <div class="px-5 py-3.5 border-b border-zinc-200 flex items-center"><span class="font-semibold text-[15px] text-zinc-900">Composer</span><span class="ml-2 text-sm text-zinc-500">dry-run · zero actions until you queue</span></div>
+          <div class="p-5">
+            <textarea id="composer-input" placeholder="What should the agent do while you are away?" class="w-full h-[84px] bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-[15px] leading-relaxed placeholder:text-zinc-400 focus:outline-none focus:border-zinc-300 focus:bg-white"></textarea>
+            <div class="flex gap-2 mt-3">
+              <button onclick="queueTask()" class="bg-zinc-900 text-white px-5 py-2.5 rounded-full text-[15px] font-medium">Queue for idle</button>
+              <button onclick="previewPlan()" class="px-5 py-2.5 rounded-full text-[15px] border border-zinc-200 bg-white">Preview plan</button>
+              <button onclick="document.getElementById('composer-input').value=''" class="px-5 py-2.5 rounded-full text-[15px] border border-zinc-200 bg-white">Clear</button>
+              <button onclick="runOnceNow()" class="ml-auto px-5 py-2.5 rounded-full text-[15px] border border-zinc-200 bg-white">Run once now</button>
+            </div>
+            <div id="composer-feedback" class="mt-3 text-sm text-zinc-600 hidden"></div>
+            <div id="plan-preview" class="mt-4 hidden border border-zinc-200 rounded-xl p-4"></div>
+          </div>
+          <!-- Task table -->
+          <div class="border-t border-zinc-200">
+            <div class="grid grid-cols-[1fr_110px_90px_80px] px-4 py-2.5 text-zinc-500 bg-zinc-50 text-xs mono"><span>Goal</span><span>Result</span><span>State</span><span>When</span></div>
+            <div id="task-table">
+              {% for t in tasks %}
+              <div onclick="selectTask('{{ t.id }}')" data-task="{{ t.id }}" class="task-row grid grid-cols-[1fr_110px_90px_80px] px-4 py-3.5 cursor-pointer hover:bg-zinc-50 border-l-2 {{ 'bg-blue-50 border-blue-500' if loop.first else 'border-transparent' }}">
+                <span class="text-[15px] font-medium truncate pr-3 text-zinc-900 leading-snug">{{ t.description }}</span>
+                <span class="text-sm text-zinc-600 mono truncate">{{ t.result_str }}</span>
+                <span class="inline-flex items-center gap-1.5 text-sm truncate {{ 'text-red-600' if t.ui_state=='failed' else 'text-blue-600' if t.ui_state=='running' else 'text-amber-600' if t.ui_state=='queued' else 'text-emerald-700' }}">
+                  {{ '✓' if t.ui_state=='completed' else '⚠' if t.ui_state=='failed' else '●' if t.ui_state=='running' else '○' }} {{ t.ui_state }}
+                </span>
+                <span class="text-sm text-zinc-500">{{ t.created_at[:10] if t.created_at else '' }}</span>
+              </div>
+              {% if t.ui_state=='failed' %}
+              <div class="px-4 pb-2 flex items-center gap-2 text-xs">
+                <span class="text-red-600">{{ t.failure_reason }}</span>
+                <button onclick="event.stopPropagation(); retryTask('{{ t.id }}')" class="ml-2 text-xs px-2 py-1 rounded-full bg-white border border-red-200 text-red-700">Retry</button>
+              </div>
+              {% endif %}
+              {% endfor %}
+              {% if not tasks %}
+              <div class="px-4 py-8 text-center text-sm text-zinc-500">No tasks yet — describe a goal above</div>
+              {% endif %}
+            </div>
+          </div>
+          <div class="px-4 py-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-800">Selected row is blue — not yellow. Inspector → right shows the plan.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right inspector ~400px -->
+    <div class="w-[400px] shrink-0 bg-white border-l border-zinc-200 hidden xl:flex flex-col overflow-auto">
+      <div class="sticky top-0 bg-white border-b border-zinc-200 px-5 py-4 flex items-center justify-between">
+        <div>
+          <div class="text-[15px] font-semibold text-zinc-900">Inspector</div>
+          <div id="inspectorSub" class="text-sm text-zinc-500 mt-0.5">{{ inspector.task.description[:48] if inspector and inspector.task else 'Select a task' }}</div>
+        </div>
+        <button onclick="document.querySelector('.w-\\[400px\\]').classList.toggle('hidden')" class="w-8 h-8 grid place-items-center rounded-full border border-zinc-200 hover:bg-zinc-50">›</button>
+      </div>
+      <div id="inspector" class="p-4 space-y-4 pb-20">
+        {% if inspector %}
+          <div class="border border-zinc-200 rounded-2xl overflow-hidden">
+            <div class="px-4 py-3 bg-zinc-50 border-b border-zinc-200 text-sm font-semibold">Plan → {{ inspector.plan.target }} • {{ inspector.budget.duration }} min • up to {{ inspector.budget.actions }} actions</div>
+            <div class="divide-y divide-zinc-100">
+              {% for v in inspector.verdicts %}
+              <div class="flex justify-between items-center px-4 py-3">
+                <span class="text-[15px] font-medium">{{ v.label }}</span>
+                <div class="flex items-center">
+                  {% if v.verdict == 'needs-confirmation' %}
+                    <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium bg-amber-50 border-amber-200 text-amber-800">⚠ needs confirmation</span>
+                    <div class="flex gap-1.5 ml-2">
+                      <button onclick="setDecision('{{ v.action }}','approve')" class="px-2.5 py-1 rounded-full bg-zinc-900 text-white text-xs font-medium">Approve</button>
+                      <button onclick="setDecision('{{ v.action }}','skip')" class="px-2.5 py-1 rounded-full border border-zinc-200 bg-white text-xs">Skip</button>
+                    </div>
+                  {% elif v.verdict == 'blocked' %}
+                    <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium bg-red-50 border-red-200 text-red-800">✗ blocked</span>
+                  {% else %}
+                    <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full border text-xs font-medium bg-emerald-50 border-emerald-200 text-emerald-800">✓ allowed</span>
+                  {% endif %}
+                </div>
+              </div>
+              {% if v.verdict == 'blocked' %}
+              <div class="px-4 pb-2 text-xs text-red-600">{{ v.reason }} {% if v.allowlist_link %}<a href="/settings#allowlist" class="underline">Edit allowlist</a>{% endif %}</div>
+              {% endif %}
+              {% if v.verdict == 'needs-confirmation' %}
+              <div class="px-4 pb-2 text-xs text-amber-700">Skipped in unattended runs — pre-decide at queue time</div>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+          <div class="border border-zinc-200 rounded-2xl p-4">
+            <div class="text-[15px] font-semibold">{{ inspector.plan.goal[:60] }}</div>
+            <div class="text-sm text-zinc-500 mt-0.5">{{ inspector.task.created_at }} • {{ inspector.verdicts|length }} checks</div>
+            <div class="text-[15px] text-zinc-700 mt-3 leading-relaxed">Plan: {{ inspector.plan.expected_result }}</div>
+          </div>
+          <div class="border border-zinc-200 rounded-2xl p-4 text-sm">
+            <div class="font-semibold text-[15px]">This plan — budget</div>
+            <div class="mt-3 space-y-2 text-[14px] text-zinc-600">
+              <div class="flex justify-between"><span>Duration</span><span class="font-medium text-zinc-900">{{ inspector.budget.duration }} min</span></div>
+              <div class="flex justify-between"><span>Actions</span><span class="font-medium text-zinc-900">up to {{ inspector.budget.actions }}</span></div>
+              <div class="text-xs text-zinc-500 mt-2 pt-2 border-t border-zinc-100">Session max: 200 actions · 45 min · 150 LLM/day (see header)</div>
+            </div>
+          </div>
+        {% else %}
+          <div class="text-sm text-zinc-500 p-4">Select a task to inspect plan, verdicts, and budget</div>
+        {% endif %}
+      </div>
+      <div class="mt-auto p-4 border-t border-zinc-100 text-xs text-zinc-500">“This plan” budget is separate from “Today” usage. Approve/Skip lives in the verdict row.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+let pendingDecisions={};
+function toast(msg){const t=document.createElement('div');t.className='fixed top-4 right-4 z-50 bg-zinc-900 text-white text-sm px-4 py-2.5 rounded-xl shadow-xl border border-white/10';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2200);}
+function setDecision(kind,val){pendingDecisions[kind]=val;toast(kind+': '+(val==='approve'?'Approved':'Skipped')+' at queue time — baked into plan');document.querySelectorAll('[data-decision="'+kind+'"]').forEach(el=>{el.textContent=val==='approve'?'Approved':'Skipped';el.className='text-xs px-2 py-1 rounded-full '+(val==='approve'?'bg-zinc-900 text-white':'bg-zinc-100 text-zinc-600 border');});}
+async function queueTask(){
+  const goal=document.getElementById('composer-input').value.trim();
+  if(!goal){toast('Enter a goal');return;}
+  const payload={goal};
+  if(Object.keys(pendingDecisions).length) payload.decisions=pendingDecisions;
+  const res=await fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(res.ok){toast('Queued for idle — '+data.task.id.slice(0,6)+(Object.keys(pendingDecisions).length?' with decisions':'') ); pendingDecisions={}; location.reload();} else toast('Error: '+(data.detail||'failed'));
+}
+async function previewPlan(){
+  const goal=document.getElementById('composer-input').value.trim();
+  if(!goal){toast('Enter a goal to preview');return;}
+  // Preview via dedicated dry-run without creating persisted task: use POST /tasks/{id}/plan after temp create, or directly via API preview
+  let r=await fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});
+  let d=await r.json();
+  if(!r.ok){toast('Error: '+d.detail);return;}
+  let pr=await fetch('/api/v1/tasks/'+d.task.id+'/plan',{method:'POST'});
+  let pd=await pr.json();
+  const box=document.getElementById('plan-preview');
+  box.classList.remove('hidden');
+  pendingDecisions={};
+  let html='<div class="font-semibold">Plan preview — '+pd.plan.target+' • '+pd.plan.max_duration_minutes+' min • up to '+pd.plan.max_actions+' actions</div><div class="text-xs text-zinc-500 mt-1">Approve/Skip at queue time — decisions are baked into queued plan for unattended run</div><div class="mt-3 space-y-2">';
+  for(let v of pd.verdicts){
+    let pill=v.verdict==='allowed' ? '<span class="bg-emerald-50 border-emerald-200 text-emerald-800 px-2 py-1 rounded-full text-xs border">✓ allowed</span>' : v.verdict==='needs-confirmation' ? '<span class="bg-amber-50 border-amber-200 text-amber-800 px-2 py-1 rounded-full text-xs border">⚠ needs confirmation</span>' : '<span class="bg-red-50 border-red-200 text-red-800 px-2 py-1 rounded-full text-xs border">✗ blocked</span>';
+    html+='<div class="flex justify-between items-center py-2 border-b border-zinc-100"><span class="text-sm font-medium">'+v.label+'</span><span class="flex items-center gap-1">'+pill;
+    if(v.verdict==='needs-confirmation'){
+      html+=' <button onclick="setDecision(\''+v.action+'\',\'approve\')" class="ml-2 text-xs px-2.5 py-1 rounded-full bg-zinc-900 text-white">Approve</button> <button onclick="setDecision(\''+v.action+'\',\'skip\')" class="text-xs px-2.5 py-1 rounded-full border">Skip</button> <span data-decision="'+v.action+'" class="text-xs text-zinc-500 ml-1"></span>';
+    }
+    html+='</span></div>';
+    if(v.verdict==='blocked') html+='<div class="text-xs text-red-600 pb-2">'+v.reason+' <a href="/settings#allowlist" class="underline">Edit allowlist</a></div>';
+    if(v.verdict==='needs-confirmation') html+='<div class="text-xs text-amber-700 pb-2">Skipped in unattended runs — pre-decide Approve/Skip before queueing above</div>';
+  }
+  html+='</div><div class="mt-3 flex gap-2"><button onclick="queueTask()" class="bg-zinc-900 text-white px-4 py-2 rounded-full text-sm">Queue for idle with decisions</button><button onclick="pendingDecisions={};toast(\'Decisions cleared\')" class="border px-4 py-2 rounded-full text-sm">Clear</button></div>';
+  box.innerHTML=html;
+}
+async function runOnceNow(){
+  const goal=document.getElementById('composer-input').value.trim();
+  if(!goal){toast('Enter a goal');return;}
+  let r=await fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});
+  let d=await r.json();
+  if(!r.ok){toast('Error: '+d.detail);return;}
+  let rr=await fetch('/api/v1/tasks/'+d.task.id+'/run',{method:'POST'});
+  let rd=await rr.json();
+  if(rr.ok){toast('Run completed — '+rd.state); location.reload();} else toast('Run blocked: '+(rd.detail||'failed'));
+}
+function selectTask(id){
+  document.querySelectorAll('.task-row').forEach(el=>{el.classList.toggle('bg-blue-50', el.dataset.task===id); el.classList.toggle('border-blue-500', el.dataset.task===id);});
+  fetch('/api/v1/tasks/'+id).then(r=>r.json()).then(data=>{
+    const insp=document.getElementById('inspector');
+    const sub=document.getElementById('inspectorSub');
+    if(sub) sub.textContent=data.task.description.slice(0,48);
+    let html='<div class="border border-zinc-200 rounded-2xl overflow-hidden"><div class="px-4 py-3 bg-zinc-50 border-b text-sm font-semibold">Plan → '+(data.plan?data.plan.target:'unknown')+'</div><div class="divide-y">';
+    if(data.verdicts) for(let v of data.verdicts){
+      let pill=v.verdict==='allowed' ? '✓ allowed' : v.verdict==='needs-confirmation' ? '⚠ needs confirmation' : '✗ blocked';
+      let cls=v.verdict==='allowed' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : v.verdict==='needs-confirmation' ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-red-50 border-red-200 text-red-800';
+      html+='<div class="flex justify-between items-center px-4 py-3"><span class="text-[15px] font-medium">'+v.label+'</span><span class="flex items-center gap-1"><span class="px-2.5 py-1 rounded-full border text-xs '+cls+'">'+pill+'</span>';
+      if(v.verdict==='needs-confirmation') html+=' <button onclick="setDecision(\''+v.action+'\',\'approve\')" class="ml-1 text-xs px-2 py-1 rounded-full bg-zinc-900 text-white">Approve</button> <button onclick="setDecision(\''+v.action+'\',\'skip\')" class="text-xs px-2 py-1 rounded-full border">Skip</button>';
+      html+='</span></div>';
+      if(v.verdict==='blocked'&&v.reason) html+='<div class="px-4 pb-2 text-xs text-red-600">'+v.reason+'</div>';
+      if(v.verdict==='needs-confirmation') html+='<div class="px-4 pb-1 text-xs text-amber-700">Skipped in unattended runs — pre-decide Approve/Skip before queueing (use preview above)</div>';
+    }
+    html+='</div></div>';
+    if(data.report) html+='<div class="border border-zinc-200 rounded-2xl p-4"><div class="text-sm font-semibold">Report excerpt</div><div class="text-sm text-zinc-600 mt-2">'+data.report.markdown.slice(0,600)+'</div></div>';
+    else html+='<div class="border border-zinc-200 rounded-2xl p-4"><div class="text-sm text-zinc-500">No report yet — task is '+data.task.state+'</div><div class="text-sm mt-2">Result: '+(data.result_counts.findings||0)+' findings · '+(data.result_counts.urls||0)+' urls</div></div>';
+    html+='<div class="border border-zinc-200 rounded-2xl p-4 text-sm"><div class="font-semibold">This plan — budget</div><div class="mt-2 text-xs text-zinc-500">Session max: 200 actions · 45 min · 150 LLM/day</div></div>';
+    insp.innerHTML=html;
+  });
+}
+async function retryTask(id){
+  const r=await fetch('/api/v1/tasks/'+id+'/run',{method:'POST'});
+  const d=await r.json();
+  if(r.ok) location.reload(); else toast('Retry failed: '+d.detail);
+}
+</script>
+</body>
+</html>

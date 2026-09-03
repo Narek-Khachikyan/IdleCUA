@@ -46,10 +46,33 @@ class FakeModelProvider(ModelProvider):
 
     response: str = "fake-model-response"
     calls: list[str] = field(default_factory=list)
+    data_dir: str | None = None  # optional for LLM accounting in tests
 
     def complete(self, prompt: str) -> str:
         self.calls.append(prompt)
+        # Mirror real provider accounting hook when data_dir is set (cap tests)
+        if self.data_dir is not None:
+            try:
+                from ..accounting import record_llm_call
+
+                record_llm_call(self.data_dir, model="fake")
+            except Exception:
+                pass
         return self.response
+
+    def chat(self, messages: list[dict]) -> str:
+        # Use complete path so accounting stays single
+        # Extract last user text like base class but keep accounting via complete
+        for m in reversed(messages):
+            content = m.get("content", "")
+            if isinstance(content, str):
+                return self.complete(content)
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return self.complete(str(part.get("text", "")))
+                return self.complete("")
+        return self.complete("")
 
     def reset(self) -> None:
         self.calls.clear()

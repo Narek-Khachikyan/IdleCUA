@@ -28,7 +28,58 @@ class ComputerUsage(BaseModel):
     common_apps: list[str] = Field(default_factory=list)
     common_sites: list[str] = Field(default_factory=list)
     return_signals: list[str] = Field(default_factory=list)
+    # Single authority per ADR-0003: idle threshold lives in Profile in seconds.
+    # Minutes kept for back-compat migration only; canonical is idle_threshold_seconds.
     idle_threshold_minutes: int = 10
+    idle_threshold_seconds: int = 600
+
+    @property
+    def effective_idle_threshold_seconds(self) -> int:
+        """Single source per ADR-0003: canonical seconds, synced with minutes."""
+        try:
+            secs = int(self.idle_threshold_seconds)
+            if 60 <= secs <= 7200:
+                return secs
+        except Exception:
+            pass
+        try:
+            return max(60, min(7200, int(self.idle_threshold_minutes) * 60))
+        except Exception:
+            return 600
+
+    def model_post_init(self, __context):  # type: ignore[override]
+        # ADR-0003: one field, one unit (seconds), one home (Profile).
+        # Migration: old files have only minutes; new files have seconds.
+        # Keep both in sync without precision loss.
+        try:
+            mins = int(self.idle_threshold_minutes)
+            secs = int(self.idle_threshold_seconds)
+            # If seconds is default but minutes is non-default, derive seconds from minutes
+            if secs == 600 and mins != 10:
+                self.idle_threshold_seconds = mins * 60
+            # Always keep minutes as ceil(seconds/60) for display/back-compat
+            expected_mins = (self.idle_threshold_seconds + 59) // 60 if self.idle_threshold_seconds else 10
+            if mins != expected_mins:
+                # Update minutes to match seconds (avoid drift)
+                object.__setattr__(self, "idle_threshold_minutes", expected_mins)
+        except Exception:
+            pass
+
+
+class BrowserConsent(BaseModel):
+    """Explicit consent for using the owner's main Chrome profile.
+
+    The agent attaches to the existing Chrome profile only when this consent is
+    recorded. This satisfies the 'main profile via driver's existing-profile
+    attachment, with explicit consent recorded in the profile/config' requirement
+    (issue #12). The driver-level grant (cua-driver --grant existing-profile) is
+    separate and checked at runtime; this flag is the product-level consent.
+    """
+
+    main_profile_granted: bool = False
+    granted_at: str | None = None
+    browser: str = "chrome"  # chrome | chromium | edge | brave
+    grant_method: str | None = None  # e.g. "profile interview", "cli grant-browser"
 
 
 class AutonomyBoundaries(BaseModel):
@@ -37,11 +88,13 @@ class AutonomyBoundaries(BaseModel):
     auto_allowed_actions: list[str] = Field(default_factory=list)
     confirmation_required_actions: list[str] = Field(default_factory=list)
     forbidden_actions: list[str] = Field(default_factory=list)
+    deny_zones: list[str] = Field(default_factory=list)
     results_location: str = ""
     session_duration_minutes: int = 45
     daily_action_limit: int = 200
     daily_llm_call_limit: int = 150
     allowed_hours: str = "00:00-23:59"
+    browser_consent: BrowserConsent = Field(default_factory=BrowserConsent)
 
 
 class ProfileMeta(BaseModel):
@@ -56,6 +109,18 @@ class Profile(BaseModel):
     computer_usage: ComputerUsage = Field(default_factory=ComputerUsage)
     autonomy_boundaries: AutonomyBoundaries = Field(default_factory=AutonomyBoundaries)
     meta: ProfileMeta = Field(default_factory=ProfileMeta)
+    # Back-compat: browser consent also mirrored at top-level for older code that checks profile.browser_consent
+    # Prefer autonomy_boundaries.browser_consent; this alias keeps serialized files readable if edited manually.
+    browser_consent: BrowserConsent | None = None
+
+    def model_post_init(self, __context):  # type: ignore[override]
+        # Normalize: if top-level browser_consent is set, migrate to autonomy_boundaries; keep both in sync
+        if self.browser_consent is not None and not self.autonomy_boundaries.browser_consent.main_profile_granted:
+            # If top-level was granted but nested not, copy over
+            if self.browser_consent.main_profile_granted:
+                self.autonomy_boundaries.browser_consent = self.browser_consent
+        # Always keep alias in sync for serialization convenience
+        self.browser_consent = self.autonomy_boundaries.browser_consent
 
     def touch(self) -> None:
         self.meta.updated_at = datetime.now(timezone.utc).isoformat()
@@ -66,3 +131,17 @@ class Profile(BaseModel):
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Profile":
         return cls.model_validate(data)
+
+    def effective_idle_threshold_seconds(self) -> int:
+        """Profile-level single source for idle threshold (seconds)."""
+        return self.computer_usage.effective_idle_threshold_seconds
+
+
+def get_effective_idle_threshold_seconds(profile: Profile | None, fallback: int = 600) -> int:
+    """Single source per ADR-0003: Profile seconds, else fallback (usually Config)."""
+    if profile is None:
+        return fallback
+    try:
+        return profile.effective_idle_threshold_seconds()
+    except Exception:
+        return fallback

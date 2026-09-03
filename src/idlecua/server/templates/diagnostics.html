@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Diagnostics — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="p-8 max-w-3xl mx-auto">
+<h1 class="text-2xl font-semibold">Diagnostics</h1>
+<p class="text-sm text-zinc-500">macOS permissions, driver probe, profile validity, secrets scan, scheduler lock — troubleshooting without CLI</p>
+<div class="mt-6 space-y-4">
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">macOS Permissions</h2>
+    <ul class="text-sm mt-2">
+      {% for p in perms %}
+      <li>{{ p.name }} — {{ p.granted }} — {{ p.remediation }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Profile</h2>
+    <div class="text-sm">Valid: {{ profile_valid }} — errors: {{ profile_errors | join(', ') }}</div>
+  </div>
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Scheduler lock</h2>
+    <div class="text-sm">Locked: {{ lock.pid if lock else 'not locked' }} — watch_loop running: {{ watch_loop.running }}</div>
+  </div>
+</div>
+<a href="/" class="underline text-blue-600 mt-6 inline-block">← Dashboard</a>
+</body></html>

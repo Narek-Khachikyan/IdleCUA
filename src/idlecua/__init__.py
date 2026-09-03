@@ -2,7 +2,7 @@
 
 from .app import IdleCua
 from .config import IdleCuaConfig
-from .contracts import ComputerDriver, FakeComputerDriver, FakeModelProvider, ModelProvider
+from .contracts import ComputerDriver, CuaComputerDriver, FakeComputerDriver, FakeModelProvider, ModelProvider
 from .models import AgentState, Plan, RiskLevel, Task, is_valid_transition, validate_transition
 from .policy import (
     PRESEEDED_ALLOWLIST,
@@ -25,6 +25,7 @@ __all__ = [
     "ActionClass",
     "AgentState",
     "ComputerDriver",
+    "CuaComputerDriver",
     "FakeComputerDriver",
     "FakeModelProvider",
     "IdleCua",
