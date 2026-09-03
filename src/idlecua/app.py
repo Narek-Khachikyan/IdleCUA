@@ -623,6 +623,218 @@ class IdleCua:
     def list_reports(self, limit: int = 50) -> list[dict]:
         return self.memory.list_reports(limit=limit)
 
+    def get_owner_settings(self) -> dict:
+        """Owner-settings read behind the Application API (T3).
+
+        Moves server GET /api/v1/settings logic here so Local UI and CLI
+        share one place per ADR-0002/0003. Prefill of unset Profile fields
+        from Config is display-only (never persisted here). Effective limits
+        are tighten-only min(Profile, ceiling). Provider keys are never touched.
+
+        Returns {profile, config, effective} with same keys as the HTTP
+        contract (byte-identical to the previous server handler).
+        """
+        from .config import IdleCuaConfig as _Cfg
+        from .profile.models import Profile as _Profile
+        from .profile.store import load_profile as _load_profile
+
+        data_dir = self.config.data_dir
+        # Reload config from disk so HTTP and CLI see the same persisted value.
+        try:
+            config = _Cfg.load(data_dir)
+            # Keep the instance in sync for callers that reuse self.config.
+            self.config = config
+        except Exception:
+            config = self.config
+        profile = _load_profile(data_dir / "profile.json")
+        if profile is None:
+            profile_dict = _Profile().model_dump()
+        else:
+            profile_dict = profile.model_dump()
+            # One-time prefill for review (display only, not persisted).
+            ab_pref = profile_dict.get("autonomy_boundaries", {})
+            if isinstance(ab_pref, dict) and not ab_pref.get("allowed_sites"):
+                ab_pref["allowed_sites"] = list(config.allowlist)
+            if isinstance(ab_pref, dict) and not ab_pref.get("deny_zones"):
+                ab_pref["deny_zones"] = (
+                    list(config.deny_zones) if ab_pref.get("deny_zones") == [] else ab_pref.get("deny_zones", [])
+                )
+            cu_pref = profile_dict.get("computer_usage", {})
+            if (
+                isinstance(cu_pref, dict)
+                and cu_pref.get("idle_threshold_seconds", 600) == 600
+                and config.idle_threshold_seconds != 600
+            ):
+                cu_pref["idle_threshold_seconds"] = int(config.idle_threshold_seconds)
+                cu_pref["idle_threshold_minutes"] = max(1, (int(config.idle_threshold_seconds) + 59) // 60)
+
+        ab = profile_dict.get("autonomy_boundaries", {}) if isinstance(profile_dict, dict) else {}
+        cu = profile_dict.get("computer_usage", {}) if isinstance(profile_dict, dict) else {}
+        idle_sec_profile = None
+        if isinstance(cu, dict):
+            secs = cu.get("idle_threshold_seconds")
+            if isinstance(secs, int):
+                idle_sec_profile = secs
+            else:
+                minutes = cu.get("idle_threshold_minutes")
+                if isinstance(minutes, int):
+                    idle_sec_profile = minutes * 60
+
+        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
+        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, 200)
+        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, 150)
+        return {
+            "profile": {
+                "confirmed": profile.confirmed if profile else False,
+                "session_duration_minutes": ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45,
+                "daily_action_limit": ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200,
+                "daily_llm_call_limit": ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150,
+                "allowed_hours": ab.get("allowed_hours", "00:00-23:59") if isinstance(ab, dict) else "00:00-23:59",
+                "allowlist": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
+                "deny_zones": ab.get("deny_zones", []) if isinstance(ab, dict) else [],
+                "allowed_sites": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
+                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
+                "idle_threshold_minutes": cu.get("idle_threshold_minutes", 10) if isinstance(cu, dict) else 10,
+                "browser_consent": ab.get("browser_consent", {}) if isinstance(ab, dict) else {},
+            },
+            "config": {
+                "readonly": config.readonly,
+                "require_idle": config.require_idle,
+                "ceilings": {
+                    "max_duration_minutes": 45,
+                    "max_actions": 200,
+                    "max_llm_calls_per_day": 150,
+                },
+                "current": {
+                    "max_duration_minutes": config.max_duration_minutes,
+                    "max_actions": config.max_actions,
+                    "max_llm_calls_per_day": config.max_llm_calls_per_day,
+                    "idle_threshold_seconds": config.idle_threshold_seconds,
+                },
+                "data_dir": str(config.data_dir),
+            },
+            "effective": {
+                "session_duration_minutes": eff_session,
+                "daily_action_limit": eff_actions,
+                "daily_llm_call_limit": eff_llm,
+                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
+            },
+        }
+
+    def update_owner_settings(self, patch: dict) -> dict:
+        """Owner-settings write behind the Application API (T3).
+
+        Owns all validation (range, allowlist domain shape, idle bounds,
+        consent) plus tighten-only ceiling checks, then validate_profile,
+        then persistence to the single authority per setting per ADR-0003.
+        Raises ValueError with a clear user-facing message on any failure;
+        callers map to transport errors with identical text (HTTP 400, CLI).
+
+        Returns {profile, config, effective} on success. Provider keys are
+        untouched and never included in returns/logs/errors.
+        """
+        from .config import IdleCuaConfig as _Cfg
+        from .profile.models import BrowserConsent as _BC
+        from .profile.models import Profile as _Profile
+        from .profile.store import load_profile as _load_profile
+        from .profile.store import save_profile as _save_profile
+        from .profile.validate import _is_valid_domain as _is_valid
+        from .profile.validate import validate_profile as _validate
+
+        data_dir = self.config.data_dir
+        config = _Cfg.load(data_dir)
+        profile = _load_profile(data_dir / "profile.json")
+        if profile is None:
+            profile = _Profile()
+        ab = profile.autonomy_boundaries
+        cu = profile.computer_usage
+
+        # Extract patch values (support both SettingsPatch keys and legacy dotted paths if ever passed).
+        # Only the canonical keys are expected; unknown keys are ignored.
+        if "session_duration_minutes" in patch and patch["session_duration_minutes"] is not None:
+            val = int(patch["session_duration_minutes"])
+            if val <= 0 or val > 45:
+                raise ValueError("session_duration_minutes must be 1..45")
+            if val > 45:
+                raise ValueError("session_duration_minutes above ceiling 45")
+            ab.session_duration_minutes = val
+        if "daily_action_limit" in patch and patch["daily_action_limit"] is not None:
+            val = int(patch["daily_action_limit"])
+            if val <= 0 or val > 1000:
+                raise ValueError("daily_action_limit must be 1..1000")
+            if val > 200:
+                raise ValueError("daily_action_limit above ceiling 200")
+            ab.daily_action_limit = val
+        if "daily_llm_call_limit" in patch and patch["daily_llm_call_limit"] is not None:
+            val = int(patch["daily_llm_call_limit"])
+            if val <= 0 or val > 1000:
+                raise ValueError("daily_llm_call_limit must be 1..1000")
+            if val > 150:
+                raise ValueError("daily_llm_call_limit above ceiling 150")
+            ab.daily_llm_call_limit = val
+        if "allowed_hours" in patch and patch["allowed_hours"] is not None:
+            ab.allowed_hours = str(patch["allowed_hours"])
+        if "allowlist" in patch and patch["allowlist"] is not None:
+            allowlist = patch["allowlist"]
+            if not isinstance(allowlist, list):
+                raise ValueError("allowlist must be list")
+            for site in allowlist:
+                if not _is_valid(site):
+                    raise ValueError(f"allowlist: invalid domain '{site}'")
+            ab.allowed_sites = [s.strip().lower() for s in allowlist]
+        if "deny_zones" in patch and patch["deny_zones"] is not None:
+            ab.deny_zones = list(patch["deny_zones"])
+        if "idle_threshold_seconds" in patch and patch["idle_threshold_seconds"] is not None:
+            val = int(patch["idle_threshold_seconds"])
+            if val < 60 or val > 7200:
+                raise ValueError("idle_threshold_seconds must be 60..7200")
+            cu.idle_threshold_seconds = val
+            cu.idle_threshold_minutes = max(1, min(120, (val + 59) // 60))
+        if "browser_consent" in patch and patch["browser_consent"] is not None:
+            granted = bool(patch["browser_consent"])
+            bc = _BC(main_profile_granted=granted, browser="chrome")
+            ab.browser_consent = bc
+            profile.browser_consent = bc
+        if "readonly" in patch and patch["readonly"] is not None:
+            config.readonly = bool(patch["readonly"])
+        if "require_idle" in patch and patch["require_idle"] is not None:
+            config.require_idle = bool(patch["require_idle"])
+
+        errs = _validate(profile)
+        if errs:
+            raise ValueError("; ".join(errs))
+
+        _save_profile(profile, data_dir / "profile.json")
+        config.save()
+        self.config = config
+        # Mirror browser consent to both stores (profile already set; this ensures config mirror and profile alias stay in sync).
+        if "browser_consent" in patch and patch["browser_consent"] is not None:
+            try:
+                from .browser_consent import record_consent as _record
+
+                _record(data_dir, bool(patch["browser_consent"]))
+                # record_consent rewrites config.json and profile.json; reload config to keep in sync
+                try:
+                    self.config = _Cfg.load(data_dir)
+                    config = self.config
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Compute effective the same way as get_owner_settings (tighten-only).
+        eff = {
+            "session_duration_minutes": min(int(ab.session_duration_minutes), 45),
+            "daily_action_limit": min(int(ab.daily_action_limit), 200),
+            "daily_llm_call_limit": min(int(ab.daily_llm_call_limit), 150),
+            "idle_threshold_seconds": int(cu.idle_threshold_seconds),
+        }
+        return {
+            "profile": profile.model_dump(),
+            "config": config.to_dict(),
+            "effective": eff,
+        }
+
     def get_status(self) -> dict:
         """Status view: agent state, idle time, active task, last action, current site/app, limit usage, stop command."""
         # Active task: most recent
