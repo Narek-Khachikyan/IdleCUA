@@ -716,178 +716,24 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     @app.get("/api/v1/settings")
     def api_get_settings():
-        data_dir = resolved_data_dir
-        config = IdleCuaConfig.load(data_dir)
-        profile = load_profile(data_dir / "profile.json")
-        # One-time prefill: unset Profile fields inherit current Config values for review (ADR-0003)
-        # If profile exists and confirmed but has empty allowlist etc., prefill from config without persisting
-        if profile is None:
-            profile_dict = Profile().model_dump()
-        else:
-            profile_dict = profile.model_dump()
-            # Prefill empty owner-intent fields from config for one-time migration display
-            ab_pref = profile_dict.get("autonomy_boundaries", {})
-            if isinstance(ab_pref, dict) and not ab_pref.get("allowed_sites"):
-                ab_pref["allowed_sites"] = list(config.allowlist)
-            if isinstance(ab_pref, dict) and not ab_pref.get("deny_zones"):
-                # Use preseeded deny_zones as default if profile has none
-                ab_pref["deny_zones"] = list(config.deny_zones) if ab_pref.get("deny_zones") == [] else ab_pref.get("deny_zones", [])
-            # idle threshold: one field seconds in Profile; if profile has default seconds but config is non-default, surface for review (do not auto-persist)
-            cu_pref = profile_dict.get("computer_usage", {})
-            if isinstance(cu_pref, dict) and cu_pref.get("idle_threshold_seconds", 600) == 600 and config.idle_threshold_seconds != 600:
-                cu_pref["idle_threshold_seconds"] = int(config.idle_threshold_seconds)
-                # Keep minutes in sync for display
-                cu_pref["idle_threshold_minutes"] = max(1, (int(config.idle_threshold_seconds) + 59) // 60)
-
-        # Extract owner-intent from profile
-        ab = profile_dict.get("autonomy_boundaries", {}) if isinstance(profile_dict, dict) else {}
-        cu = profile_dict.get("computer_usage", {}) if isinstance(profile_dict, dict) else {}
-        # Single authority: idle threshold lives in Profile seconds
-        idle_sec_profile = None
-        if isinstance(cu, dict):
-            secs = cu.get("idle_threshold_seconds")
-            if isinstance(secs, int):
-                idle_sec_profile = secs
-            else:
-                minutes = cu.get("idle_threshold_minutes")
-                if isinstance(minutes, int):
-                    idle_sec_profile = minutes * 60
-
-        # Effective limits: tighten-only min(Profile, ceiling) in one place
-        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
-        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, 200)
-        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, 150)
-        return {
-            "profile": {
-                "confirmed": profile.confirmed if profile else False,
-                "session_duration_minutes": ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45,
-                "daily_action_limit": ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200,
-                "daily_llm_call_limit": ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150,
-                "allowed_hours": ab.get("allowed_hours", "00:00-23:59") if isinstance(ab, dict) else "00:00-23:59",
-                "allowlist": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
-                "deny_zones": ab.get("deny_zones", []) if isinstance(ab, dict) else [],
-                "allowed_sites": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
-                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
-                "idle_threshold_minutes": cu.get("idle_threshold_minutes", 10) if isinstance(cu, dict) else 10,
-                "browser_consent": ab.get("browser_consent", {}) if isinstance(ab, dict) else {},
-            },
-            "config": {
-                "readonly": config.readonly,
-                "require_idle": config.require_idle,
-                "ceilings": {
-                    "max_duration_minutes": 45,
-                    "max_actions": 200,
-                    "max_llm_calls_per_day": 150,
-                },
-                "current": {
-                    "max_duration_minutes": config.max_duration_minutes,
-                    "max_actions": config.max_actions,
-                    "max_llm_calls_per_day": config.max_llm_calls_per_day,
-                    "idle_threshold_seconds": config.idle_threshold_seconds,
-                },
-                "data_dir": str(config.data_dir),
-            },
-            "effective": {
-                "session_duration_minutes": eff_session,
-                "daily_action_limit": eff_actions,
-                "daily_llm_call_limit": eff_llm,
-                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
-            },
-        }
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_owner_settings()."""
+        idle_app = _get_idle_cua(resolved_data_dir)
+        return idle_app.get_owner_settings()
 
     @app.patch("/api/v1/settings")
     def api_patch_settings(payload: SettingsPatch):
-        data_dir = resolved_data_dir
-        config = IdleCuaConfig.load(data_dir)
-        profile = load_profile(data_dir / "profile.json")
-        created = False
-        if profile is None:
-            profile = Profile()
-            created = True
-        # Apply Profile owner-intent fields with tighten-only validation
-        ab = profile.autonomy_boundaries
-        cu = profile.computer_usage
-
-        # Session duration — tighten-only vs ceiling 45
-        if payload.session_duration_minutes is not None:
-            val = int(payload.session_duration_minutes)
-            if val <= 0 or val > 45:
-                raise HTTPException(status_code=400, detail="session_duration_minutes must be 1..45")
-            # ceiling check — if profile value above ceiling, reject (not clamp)
-            if val > 45:
-                raise HTTPException(status_code=400, detail="session_duration_minutes above ceiling 45")
-            ab.session_duration_minutes = val
-
-        if payload.daily_action_limit is not None:
-            val = int(payload.daily_action_limit)
-            if val <= 0 or val > 1000:
-                raise HTTPException(status_code=400, detail="daily_action_limit must be 1..1000")
-            if val > 200:
-                raise HTTPException(status_code=400, detail="daily_action_limit above ceiling 200")
-            ab.daily_action_limit = val
-
-        if payload.daily_llm_call_limit is not None:
-            val = int(payload.daily_llm_call_limit)
-            if val <= 0 or val > 1000:
-                raise HTTPException(status_code=400, detail="daily_llm_call_limit must be 1..1000")
-            if val > 150:
-                raise HTTPException(status_code=400, detail="daily_llm_call_limit above ceiling 150")
-            ab.daily_llm_call_limit = val
-
-        if payload.allowed_hours is not None:
-            ab.allowed_hours = str(payload.allowed_hours)
-
-        if payload.allowlist is not None:
-            # Validate domains
-            from ..profile.validate import _is_valid_domain
-
-            for site in payload.allowlist:
-                if not _is_valid_domain(site):
-                    raise HTTPException(status_code=400, detail=f"allowlist: invalid domain '{site}'")
-            ab.allowed_sites = [s.strip().lower() for s in payload.allowlist]
-
-        if payload.deny_zones is not None:
-            # ADR-0003: deny-zones are owner-intent, stored in Profile (not Config). Config keeps preseed defaults immutable.
-            ab.deny_zones = list(payload.deny_zones)
-
-        # Idle threshold — single field seconds in Profile (ADR-0003), no precision loss
-        if payload.idle_threshold_seconds is not None:
-            val = int(payload.idle_threshold_seconds)
-            if val < 60 or val > 7200:
-                raise HTTPException(status_code=400, detail="idle_threshold_seconds must be 60..7200")
-            cu.idle_threshold_seconds = val
-            # Keep minutes in sync for back-compat display
-            cu.idle_threshold_minutes = max(1, min(120, (val + 59) // 60))
-
-        if payload.browser_consent is not None:
-            bc = BrowserConsent(main_profile_granted=bool(payload.browser_consent), browser="chrome")
-            ab.browser_consent = bc
-            profile.browser_consent = bc
-
-        # Config safety toggles
-        if payload.readonly is not None:
-            config.readonly = bool(payload.readonly)
-        if payload.require_idle is not None:
-            config.require_idle = bool(payload.require_idle)
-
-        # Validate profile before saving (tighten-only)
-        errs = validate_profile(profile)
-        if errs:
-            raise HTTPException(status_code=400, detail="; ".join(errs))
-
-        # Save both
-        save_profile(profile, data_dir / "profile.json")
-        config.save()
-        # Mirror browser consent
+        """Thin caller per ADR-0002: validation+write lives in IdleCua.update_owner_settings()."""
+        idle_app = _get_idle_cua(resolved_data_dir)
         try:
-            if payload.browser_consent is not None:
-                from ..browser_consent import record_consent
-
-                record_consent(data_dir, bool(payload.browser_consent))
-        except Exception:
-            pass
-
-        return {"ok": True, "profile": profile.model_dump(), "config": config.to_dict()}
+            try:
+                patch = payload.model_dump(exclude_none=True)
+            except AttributeError:
+                patch = payload.dict(exclude_none=True)
+            result = idle_app.update_owner_settings(patch)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # Keep HTTP contract byte-identical: ok + profile + config (no effective leak in PATCH shape).
+        return {"ok": True, "profile": result["profile"], "config": result["config"]}
 
     # Providers
     @app.get("/api/v1/providers")
