@@ -47,7 +47,7 @@ def _decode_tool_result_images(tool_result) -> bytes | None:
 class CuaComputerDriver(ComputerDriver):
     """Real driver over cua-driver Rust backend.
 
-    - Uses ``cua_driver.CuaDriver.create()`` (same-process runtime, no daemon required).
+    - Uses ``cua_driver.CuaDriver.create()`` (same-process runtime, no separate process required).
     - Host primitives: screenshot, accessibility tree / window state reading, typed input (click, type, hotkey, scroll), app launch.
     - Input journal for held-input release (emergency-stop path).
     - Driver failures surface as actionable RuntimeErrors (install / permission remediation).
@@ -87,7 +87,7 @@ class CuaComputerDriver(ComputerDriver):
                 # Provide actionable error
                 self._init_error = (
                     f"Cua driver initialization failed: {e}. "
-                    "Remediation: `uv sync` or `uv pip install cua-driver==0.23.2`, then verify daemon: `cua-driver --help`. "
+                    "Remediation: `uv sync` or `uv pip install cua-driver==0.23.2`, then verify install: `cua-driver --help`. "
                     "On macOS, ensure you run from a terminal with Accessibility + Screen Recording granted. "
                     "See README `Cua driver install` docs."
                 )
@@ -485,7 +485,7 @@ class CuaComputerDriver(ComputerDriver):
                 "Browser main-profile consent not granted. "
                 "Run `idle-cua profile grant-browser` to record explicit consent in profile.json/config.json. "
                 "Agent will not attach to main Chrome profile until consent is recorded. "
-                "After granting, also ensure driver grant: `cua-driver serve --grant existing-profile` (daemon) or embedded grant."
+                "After granting, also ensure driver grant: `cua-driver serve --grant existing-profile` (separate process) or embedded grant."
             )
         # Find browser window
         found = self._find_browser_window(browser)

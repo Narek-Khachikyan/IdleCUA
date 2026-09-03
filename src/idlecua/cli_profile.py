@@ -302,7 +302,7 @@ def grant_browser(
         pass
     console.print(f"[green]Browser main-profile consent GRANTED for {bc.browser} — recorded at {ppath} + config.json[/green]")
     console.print("[dim]Driver grant still required for existing-profile attachment:[/dim]")
-    console.print("[dim]  cua-driver serve --grant existing-profile  (daemon)  or  --grant existing-profile on mcp/embedded launch[/dim]")
+    console.print("[dim]  cua-driver serve --grant existing-profile  (Watch loop process)  or  --grant existing-profile on mcp/embedded launch[/dim]")
     console.print("[dim]Verify with: idle-cua doctor[/dim]")
 
 

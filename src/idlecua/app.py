@@ -417,9 +417,17 @@ class IdleCua:
             task = task_or_description
         if dry_run:
             return self.dry_run(task.description)
-        # Hard gates before execution (US14 idle gate, profile confirmed)
+        # Hard gates before execution (US14 idle gate, profile confirmed) — threshold single source Profile per ADR-0003
         if not dry_run and self.config.require_idle:
-            ok, reason = self.idle_detector.can_run(self.config.idle_threshold_seconds)
+            # Effective threshold: Profile seconds if available, else Config
+            try:
+                from .profile.models import get_effective_idle_threshold_seconds
+
+                _p = self.get_profile()
+                _thr = get_effective_idle_threshold_seconds(_p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
+            except Exception:
+                _thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+            ok, reason = self.idle_detector.can_run(_thr)
             if not ok:
                 # Report as failed like executor does
                 try:
@@ -637,7 +645,14 @@ class IdleCua:
                 poll_interval=poll_interval, timeout=timeout, threshold_override=idle_threshold_override
             )
             if not ok:
-                raise RuntimeError(f"Timed out waiting for idle (threshold {idle_threshold_override or self.config.idle_threshold_seconds}s)")
+                try:
+                    from .profile.models import get_effective_idle_threshold_seconds
+
+                    _p_eff = self.get_profile()
+                    _thr_msg = idle_threshold_override if idle_threshold_override is not None else get_effective_idle_threshold_seconds(_p_eff, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
+                except Exception:
+                    _thr_msg = idle_threshold_override or getattr(self.config, "idle_threshold_seconds", 600)
+                raise RuntimeError(f"Timed out waiting for idle (threshold {_thr_msg}s)")
         ok, reason = scheduler.can_start(threshold_override=idle_threshold_override)
         if not ok:
             raise RuntimeError(f"Cannot start idle session — gate failed: {reason}")

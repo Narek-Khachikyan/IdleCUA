@@ -254,8 +254,15 @@ class TaskExecutor:
         try:
             # If idle detector reports not idle, user returned
             idle_secs = self.idle_detector.seconds_since_last_input()
-            # Use threshold from config (idle_threshold_seconds)
-            threshold = getattr(self.config, "idle_threshold_seconds", 600)
+            # Single source per ADR-0003: Profile seconds, else Config
+            try:
+                from .profile.models import get_effective_idle_threshold_seconds
+                from .profile.store import load_profile as _lp
+
+                _p = _lp(self.config.data_dir / "profile.json")
+                threshold = get_effective_idle_threshold_seconds(_p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
+            except Exception:
+                threshold = int(getattr(self.config, "idle_threshold_seconds", 600))
             if isinstance(self.idle_detector, FakeIdleDetector):
                 # For fake, check directly via its logic
                 can, _ = self.idle_detector.can_run(threshold)
@@ -337,9 +344,15 @@ class TaskExecutor:
         except Exception:
             pass
 
-        # Idle gate: when require_idle, enforce HID check before any planning/execution (US14)
+        # Idle gate: when require_idle, enforce HID check before any planning/execution (US14) — single source Profile
         if not dry_run and self.config.require_idle:
-            ok, reason = self.idle_detector.can_run(self.config.idle_threshold_seconds)
+            try:
+                from .profile.models import get_effective_idle_threshold_seconds
+
+                _thr = get_effective_idle_threshold_seconds(profile, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
+            except Exception:
+                _thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+            ok, reason = self.idle_detector.can_run(_thr)
             if not ok:
                 # Report and fail fast — do not execute while user is present
                 try:

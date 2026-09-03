@@ -50,12 +50,17 @@ def validate_profile(profile: Profile) -> list[str]:
     elif ab.daily_llm_call_limit > 150:
         errors.append(f"daily_llm_call_limit {ab.daily_llm_call_limit} above ceiling 150 (tighten-only: Profile value above ceiling is rejected)")
     cu = profile.computer_usage
-    if cu.idle_threshold_minutes < 1 or cu.idle_threshold_minutes > 120:
-        errors.append(f"idle_threshold_minutes must be 1..120, got {cu.idle_threshold_minutes}")
-    # also check seconds view (one field, one unit seconds per ADR-0003)
-    idle_seconds = cu.idle_threshold_minutes * 60
+    # ADR-0003: single threshold in seconds, home is Profile
+    idle_seconds = int(getattr(cu, "idle_threshold_seconds", 600))
+    # Back-compat: if seconds is default but minutes differs, use minutes
+    if idle_seconds == 600 and int(cu.idle_threshold_minutes) != 10:
+        idle_seconds = int(cu.idle_threshold_minutes) * 60
     if idle_seconds < 60 or idle_seconds > 7200:
-        errors.append(f"idle_threshold_seconds {idle_seconds} must be 60..7200 (derived from {cu.idle_threshold_minutes} minutes)")
+        errors.append(f"idle_threshold_seconds must be 60..7200, got {idle_seconds}")
+    # Also validate minutes derived
+    mins = (idle_seconds + 59) // 60
+    if mins < 1 or mins > 120:
+        errors.append(f"idle_threshold_minutes must be 1..120, got {mins}")
 
     # Schedule / allowed_hours sanity
     allowed_hours = ab.allowed_hours.strip()

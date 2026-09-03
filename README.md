@@ -93,7 +93,7 @@ uv pip install cua-driver==0.23.2
 # or: uv sync --group dev  # already pins cua-driver
 uv run python -c "import cua_driver; print(cua_driver.__version__)"  # 0.23.2
 # Docs: https://cua.ai/docs/how-to-guides/driver/install  and  https://cua.ai/docs/reference/cua-driver/mcp-tools
-# The embedded runtime (CuaDriver.create()) needs no separate daemon; the `cua-driver` binary is bundled in the wheel.
+# The embedded runtime (CuaDriver.create()) needs no separate process; the `cua-driver` binary is bundled in the wheel.
 ```
 
 **macOS permissions (required before `--real-driver`):**
@@ -154,7 +154,7 @@ driver.release_all_inputs()  # releases held keys/buttons synchronously
 - `click(x,y)`, `type_text(text)`, `press(key)`, `hotkey(keys)`, `scroll(dx,dy)` → typed input via `click` / `type_text` / `press_key` / `hotkey` / `scroll` with `scope="desktop"` and `InputJournal` recording.
 - `open_app(name)` → `launch_app(bundle_id)` (backgrounded, no foreground steal).
 - `release_all_inputs()` → journal `release_all()` (emergency-stop path, LLM-independent).
-- Driver failures (missing wheel, permissions, daemon) surface as task failures with actionable `Remediation:` messages and are persisted to `reports/` and `errors` table — never silent.
+- Driver failures (missing wheel, permissions, driver process) surface as task failures with actionable `Remediation:` messages and are persisted to `reports/` and `errors` table — never silent.
 
 ### Browser surface on main Chrome profile (issue #12)
 

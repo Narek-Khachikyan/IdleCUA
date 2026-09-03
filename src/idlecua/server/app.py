@@ -38,8 +38,8 @@ class SettingsPatch(BaseModel):
     allowed_hours: str | None = None
     allowlist: list[str] | None = None
     deny_zones: list[str] | None = None
+    # ADR-0003: single idle threshold in seconds, home is Profile
     idle_threshold_seconds: int | None = None
-    idle_threshold_minutes: int | None = None
     readonly: bool | None = None
     require_idle: bool | None = None
     browser_consent: bool | None = None
@@ -49,10 +49,10 @@ class ProviderCreate(BaseModel):
     name: str
     base_url: str
     model: str
-    api_key: str
+    api_key: str  # write-only, never returned; masked as •••• on read
 
     class Config:
-        json_schema_extra = {"example": {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1", "model": "anthropic/claude-3.5-sonnet", "api_key": "sk-..."}}
+        json_schema_extra = {"example": {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1", "model": "anthropic/claude-3.5-sonnet", "api_key": "••••"}}
 
 
 # Global per-process scheduler state (live, not reconstructed from SQLite)
@@ -81,13 +81,32 @@ def _resolve_data_dir(data_dir: Path | str | None = None) -> Path:
     return IdleCuaConfig().data_dir
 
 
+def _get_effective_idle_threshold(data_dir: Path) -> int:
+    """Single source per ADR-0003: Profile idle_threshold_seconds, fallback to Config default."""
+    try:
+        from ..profile.models import get_effective_idle_threshold_seconds
+        from ..profile.store import load_profile as _lp_thr
+
+        p = _lp_thr(data_dir / "profile.json")
+        if p is not None:
+            # Use Profile's canonical effective value
+            return get_effective_idle_threshold_seconds(p, fallback=600)
+    except Exception:
+        pass
+    try:
+        cfg = IdleCuaConfig.load(data_dir)
+        return int(getattr(cfg, "idle_threshold_seconds", 600))
+    except Exception:
+        return 600
+
+
 def _get_idle_cua(data_dir: Path | None = None) -> IdleCua:
     resolved = _resolve_data_dir(data_dir)
     # Ensure data dir exists (auto-init)
     resolved.mkdir(parents=True, exist_ok=True)
     config = IdleCuaConfig.load(resolved)
-    # Keep scheduler_state threshold in sync with config
-    _scheduler_state["idle_threshold"] = int(getattr(config, "idle_threshold_seconds", 600))
+    # Keep scheduler_state threshold in sync with effective Profile threshold (ADR-0003 single source)
+    _scheduler_state["idle_threshold"] = _get_effective_idle_threshold(resolved)
     return IdleCua(config=config)
 
 
@@ -112,13 +131,32 @@ def _is_demo_mode(data_dir: Path) -> bool:
         return True
 
 
+def _fetch_history_filtered(idle_app: IdleCua, task_id: str | None, limit: int = 200) -> dict:
+    """Single helper for task-filtered history — used by both API and UI (DRY)."""
+    if task_id:
+        actions = idle_app.memory.list_actions(task_id=task_id)
+        queries = [q for q in idle_app.memory.list_queries(limit=limit) if q.get("task_id") == task_id]
+        urls = [u for u in idle_app.memory.list_urls(limit=limit) if u.get("task_id") == task_id]
+        findings = idle_app.memory.list_findings(task_id=task_id)
+        errors = idle_app.memory.list_errors(task_id=task_id)
+        tasks_all = idle_app.memory.list_tasks(limit=limit)
+        tasks = [t for t in tasks_all if t.get("id") == task_id]
+    else:
+        actions = idle_app.memory.list_actions()
+        queries = idle_app.memory.list_queries(limit=limit)
+        urls = idle_app.memory.list_urls(limit=limit)
+        findings = idle_app.memory.list_findings(limit=limit)
+        errors = idle_app.memory.list_errors()
+        tasks = idle_app.memory.list_tasks(limit=limit)
+    return {"actions": actions, "queries": queries, "urls": urls, "findings": findings, "errors": errors, "tasks": tasks}
+
+
 def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_running: bool | None = None) -> dict:
     """Single status source driving banner, header chip, and hero. No 'Blocked' for degraded.
 
     Precedence: running session → Limited mode (no provider) → Waiting for idle → Ready
     """
-    config = IdleCuaConfig.load(data_dir)
-    threshold = int(getattr(config, "idle_threshold_seconds", 600))
+    threshold = _get_effective_idle_threshold(data_dir)
     # Check for running session via memory active task
     try:
         idle_app = _get_idle_cua(data_dir)
@@ -153,8 +191,8 @@ def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_runn
             "dot": "bg-amber-400",
             "banner_text": "Limited mode — stub planner · LLM off",
             "chip_text": "Limited mode",
-            "hero_title": "Waiting for idle",
-            "hero_sub": f"Idle {idle_seconds:.0f}s / {threshold}s · Limited mode — stub planner",
+            "hero_title": "Limited mode — stub planner",
+            "hero_sub": f"Idle {idle_seconds:.0f}s / {threshold}s · LLM off · threshold {threshold}s",
         }
 
     # Idle check
@@ -230,16 +268,7 @@ def _watch_loop_worker(data_dir: Path, poll_interval: float = 5.0):
                 idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
             except Exception:
                 idle_secs = 0.0
-            threshold = int(getattr(config, "idle_threshold_seconds", 600))
-            # also check profile if exists
-            try:
-                from ..profile.store import load_profile as _lp
-
-                p = _lp(data_dir / "profile.json")
-                if p is not None:
-                    threshold = int(p.computer_usage.idle_threshold_minutes * 60)
-            except Exception:
-                pass
+            threshold = _get_effective_idle_threshold(data_dir)
             _scheduler_state["idle_threshold"] = threshold
             if idle_secs < threshold or idle_app.idle_detector.is_screen_locked():
                 _time.sleep(poll_interval)
@@ -309,7 +338,7 @@ def _start_watch_worker(data_dir: Path):
     if _watch_thread and _watch_thread.is_alive():
         return
     _watch_stop_event.clear()
-    _watch_thread = threading.Thread(target=_watch_loop_worker, args=(data_dir,), daemon=True)
+    _watch_thread = threading.Thread(target=_watch_loop_worker, args=(data_dir,), daemon=True)  # Python thread flag, not domain Watch loop term
     _watch_thread.start()
 
 
@@ -404,7 +433,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         return {
             "agent_state": st.get("agent_state", "unknown"),
             "idle_seconds": idle_secs,
-            "idle_threshold_seconds": config.idle_threshold_seconds,
+            "idle_threshold_seconds": _get_effective_idle_threshold(data_dir),
             "screen_locked": locked,
             "watch_loop": {
                 "running": bool(watch.get("running")),
@@ -626,10 +655,11 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             for t in tasks:
                 if t.get("state") in ("running", "planning") and t.get("id") != task_id:
                     raise HTTPException(status_code=409, detail="session already in flight")
-            # Also check idle gate
+            # Also check idle gate — threshold from Profile (single source)
             config = idle_app.config
             if config.require_idle:
-                ok, reason = idle_app.idle_detector.can_run(config.idle_threshold_seconds)
+                thr = _get_effective_idle_threshold(data_dir)
+                ok, reason = idle_app.idle_detector.can_run(thr)
                 if not ok:
                     raise HTTPException(status_code=423, detail=f"idle gate blocked: {reason}")
                 if idle_app.idle_detector.is_screen_locked():
@@ -702,28 +732,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.get("/api/v1/history")
     def api_history(task_id: str | None = None, limit: int = 200):
         idle_app = _get_idle_cua(resolved_data_dir)
-        if task_id:
-            actions = idle_app.memory.list_actions(task_id=task_id)
-            queries = [q for q in idle_app.memory.list_queries(limit=limit) if q.get("task_id") == task_id]
-            urls = [u for u in idle_app.memory.list_urls(limit=limit) if u.get("task_id") == task_id]
-            findings = idle_app.memory.list_findings(task_id=task_id)
-            errors = idle_app.memory.list_errors(task_id=task_id)
-        else:
-            actions = idle_app.memory.list_actions()
-            queries = idle_app.memory.list_queries(limit=limit)
-            urls = idle_app.memory.list_urls(limit=limit)
-            findings = idle_app.memory.list_findings(limit=limit)
-            errors = idle_app.memory.list_errors()
-        # Also include tasks
-        tasks = idle_app.memory.list_tasks(limit=limit)
-        return {
-            "actions": actions,
-            "queries": queries,
-            "urls": urls,
-            "findings": findings,
-            "errors": errors,
-            "tasks": tasks,
-        }
+        return _fetch_history_filtered(idle_app, task_id, limit)
 
     @app.get("/api/v1/reports")
     def api_list_reports():
@@ -827,20 +836,26 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             if isinstance(ab_pref, dict) and not ab_pref.get("deny_zones"):
                 # Use preseeded deny_zones as default if profile has none
                 ab_pref["deny_zones"] = list(config.deny_zones) if ab_pref.get("deny_zones") == [] else ab_pref.get("deny_zones", [])
-            # idle threshold: if minutes is default 10 but config is non-default, surface for review (do not auto-persist)
+            # idle threshold: one field seconds in Profile; if profile has default seconds but config is non-default, surface for review (do not auto-persist)
             cu_pref = profile_dict.get("computer_usage", {})
-            if isinstance(cu_pref, dict) and cu_pref.get("idle_threshold_minutes", 10) == 10 and config.idle_threshold_seconds != 600:
-                cu_pref["idle_threshold_minutes"] = max(1, config.idle_threshold_seconds // 60)
+            if isinstance(cu_pref, dict) and cu_pref.get("idle_threshold_seconds", 600) == 600 and config.idle_threshold_seconds != 600:
+                cu_pref["idle_threshold_seconds"] = int(config.idle_threshold_seconds)
+                # Keep minutes in sync for display
+                cu_pref["idle_threshold_minutes"] = max(1, (int(config.idle_threshold_seconds) + 59) // 60)
 
         # Extract owner-intent from profile
         ab = profile_dict.get("autonomy_boundaries", {}) if isinstance(profile_dict, dict) else {}
         cu = profile_dict.get("computer_usage", {}) if isinstance(profile_dict, dict) else {}
-        # Single authority: idle threshold lives in Profile seconds; Config's value is default for new profiles
+        # Single authority: idle threshold lives in Profile seconds
         idle_sec_profile = None
         if isinstance(cu, dict):
-            minutes = cu.get("idle_threshold_minutes")
-            if isinstance(minutes, int):
-                idle_sec_profile = minutes * 60
+            secs = cu.get("idle_threshold_seconds")
+            if isinstance(secs, int):
+                idle_sec_profile = secs
+            else:
+                minutes = cu.get("idle_threshold_minutes")
+                if isinstance(minutes, int):
+                    idle_sec_profile = minutes * 60
 
         # Effective limits: tighten-only min(Profile, ceiling) in one place
         eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
@@ -939,19 +954,14 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             # ADR-0003: deny-zones are owner-intent, stored in Profile (not Config). Config keeps preseed defaults immutable.
             ab.deny_zones = list(payload.deny_zones)
 
-        # Idle threshold — single field in seconds in Profile (ADR-0003), config becomes default
+        # Idle threshold — single field seconds in Profile (ADR-0003), no precision loss
         if payload.idle_threshold_seconds is not None:
             val = int(payload.idle_threshold_seconds)
             if val < 60 or val > 7200:
                 raise HTTPException(status_code=400, detail="idle_threshold_seconds must be 60..7200")
-            # Store in profile as minutes (ceil)
-            cu.idle_threshold_minutes = max(1, min(120, val // 60 if val % 60 == 0 else val // 60 + 1))
-
-        elif payload.idle_threshold_minutes is not None:
-            val = int(payload.idle_threshold_minutes)
-            if val < 1 or val > 120:
-                raise HTTPException(status_code=400, detail="idle_threshold_minutes must be 1..120")
-            cu.idle_threshold_minutes = val
+            cu.idle_threshold_seconds = val
+            # Keep minutes in sync for back-compat display
+            cu.idle_threshold_minutes = max(1, min(120, (val + 59) // 60))
 
         if payload.browser_consent is not None:
             bc = BrowserConsent(main_profile_granted=bool(payload.browser_consent), browser="chrome")
@@ -1312,11 +1322,13 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             except Exception:
                 inspector = {"task": inspector_task}
 
+        effective_idle = _get_effective_idle_threshold(data_dir)
         return templates.TemplateResponse(
             request,
             "dashboard.html",
             {
                 "config": config,
+                "effective_idle_threshold": effective_idle,
                 "honest": honest,
                 "demo_mode": _is_demo_mode(data_dir),
                 "checklist": checklist,
@@ -1359,8 +1371,11 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         if templates is None:
             return HTMLResponse("<html><body>History</body></html>")
         idle_app = _get_idle_cua(resolved_data_dir)
-        hist = idle_app.get_history(limit=50)
-        return templates.TemplateResponse(request, "history.html", {"history": hist})
+        task_filter = request.query_params.get("task_id") or request.query_params.get("task")
+        # Reuse single helper for API/UI filtering (DRY)
+        hist = _fetch_history_filtered(idle_app, task_filter, limit=200)
+        tasks = idle_app.memory.list_tasks(limit=100)
+        return templates.TemplateResponse(request, "history.html", {"history": hist, "tasks": tasks, "selected_task": task_filter})
 
     @app.get("/reports", response_class=HTMLResponse)
     def ui_reports(request: Request):

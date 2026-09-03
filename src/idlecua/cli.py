@@ -39,6 +39,30 @@ def _resolve_data_dir(data_dir: Optional[str]) -> Path:
         return Path(env).expanduser()
     return IdleCuaConfig().data_dir
 
+
+def is_loopback_host(host: str) -> bool:
+    """Public seam for v1 bind validation — only loopback allowed per ADR-0005."""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def validate_bind_host(host: str) -> None:
+    """Validate v1 bind host; rejects non-loopback with loud error per spec."""
+    if not is_loopback_host(host):
+        console.print(f"[red]Non-loopback bind '{host}' rejected in v1 — only 127.0.0.1 allowed[/red]")
+        raise typer.Exit(1)
+
+
+def _effective_idle_threshold_for_cli(data_dir: Path, config: IdleCuaConfig) -> int:
+    """Single source per ADR-0003: Profile seconds, fallback to Config."""
+    try:
+        from .profile.models import get_effective_idle_threshold_seconds
+        from .profile.store import load_profile as _lp
+
+        p = _lp(data_dir / "profile.json")
+        return get_effective_idle_threshold_seconds(p, fallback=int(getattr(config, "idle_threshold_seconds", 600)))
+    except Exception:
+        return int(getattr(config, "idle_threshold_seconds", 600))
+
 def _print_plan(idle: IdleCua, p, title: str, json_output: bool) -> None:
     if json_output:
         console.print_json(json.dumps(idle.plan_to_dict(p)))
@@ -334,7 +358,7 @@ def doctor(
             console.print(f"  Screen Recording (cua probe): {'granted' if scr else 'NOT granted' if scr is False else 'unknown'}")
         except Exception as e:
             console.print(f"  Cua permission probe failed: {e}")
-        # Try init driver (embedded runtime, no daemon required)
+        # Try init driver (embedded runtime, no separate process required)
         try:
             drv = cua_driver.CuaDriver.create(None)
             console.print("  Driver init: [green]OK[/green] (embedded runtime)")
@@ -395,7 +419,7 @@ def doctor(
         # Driver existing-profile grant hint
         console.print("")
         console.print("[bold]Browser Driver Grant (existing-profile)[/bold]")
-        console.print("[dim]Driver requires `cua-driver serve --grant existing-profile` (daemon) or embedded grant for main-profile attachment.[/dim]")
+        console.print("[dim]Driver requires `cua-driver serve --grant existing-profile` (separate process) or embedded grant for main-profile attachment.[/dim]")
         console.print("[dim]When granted, `get_browser_state` binds to your running Chrome window via CDP.[/dim]")
         if _profile and hasattr(_profile.autonomy_boundaries, "browser_consent") and not _profile.autonomy_boundaries.browser_consent.main_profile_granted:
             console.print("[yellow]Profile browser consent not granted — grant first, then restart driver with grant.[/yellow]")
@@ -722,7 +746,7 @@ def start(
     ] = None,
     watch: Annotated[
         bool,
-        typer.Option("--watch", help="Poll for idle and auto-start sessions in a loop (daemon-like)"),
+        typer.Option("--watch", help="Poll for idle and auto-start sessions in a loop (Watch loop mode)"),
     ] = False,
     once: Annotated[
         bool,
@@ -822,7 +846,21 @@ def start(
 
     # If watch mode: autonomous loop (wait-for-idle → session → wait again)
     if watch or (effective_task and timeout is not None):
-        thr = idle_threshold if idle_threshold is not None else config.idle_threshold_seconds
+        thr = int(idle_threshold) if idle_threshold is not None else _effective_idle_threshold_for_cli(_resolved, config)
+        # ADR-0004: exactly one scheduler per data dir enforced by lock — also for CLI Watch loop
+        _watch_lock_info = None
+        try:
+            from .server.lock import acquire_lock as _acquire_wlock, release_lock as _release_wlock
+
+            _watch_lock_info = _acquire_wlock(_resolved)
+            console.print(f"[dim]Scheduler lock acquired for Watch loop: pid {_watch_lock_info['pid']} data_dir={_resolved}[/dim]")
+        except RuntimeError as _le:
+            if "already running" in str(_le):
+                console.print(f"[red]Failed to start Watch loop: {_le}[/red]")
+                console.print(f"[dim]Data dir: {_resolved}[/dim]")
+                console.print("[dim]If the process crashed, the stale lock was cleaned — retry. If still running, stop the other process first (idle-cua kill or kill PID).[/dim]")
+                raise typer.Exit(1)
+            raise
         console.print(f"[bold]Idle watch:[/bold] waiting for idle ≥ {thr}s (poll {poll_interval}s) — synthetic never masks HID — Ctrl-C to stop")
         console.print(f"Task: {effective_task}")
         console.print(f"Screen locked check: hard gate — agent will not run while locked")
@@ -886,6 +924,14 @@ def start(
         except RuntimeError as e:
             console.print(f"[red]Watch failed: {e}[/red]")
             raise typer.Exit(1)
+        finally:
+            try:
+                from .server.lock import release_lock as _release_wlock2
+
+                _release_wlock2(_resolved)
+                console.print("[dim]Scheduler lock released for Watch loop[/dim]")
+            except Exception:
+                pass
 
         if not results:
             console.print("[yellow]No session started (idle not reached, timeout, or gate blocked). See `idle-cua status` and `idle-cua doctor`.[/yellow]")
@@ -907,8 +953,9 @@ def start(
 
     # Non-watch path (legacy single check): show status and run if idle, else wait briefly if task given
     st = idle.get_status()
+    _eff_thr = _effective_idle_threshold_for_cli(_resolved, config)
     console.print(f"Agent state: {st.get('agent_state')}")
-    console.print(f"Idle: {st.get('idle_time')} (threshold {config.idle_threshold_seconds}s)")
+    console.print(f"Idle: {st.get('idle_time')} (threshold {_eff_thr}s)")
     console.print(f"Screen locked: {st.get('screen_locked')}")
     if st.get("screen_locked"):
         console.print("[yellow]Screen is locked — agent will not run until unlocked[/yellow]")
@@ -916,21 +963,21 @@ def start(
     # Use effective_task fallback if task is None but derived exists
     run_task = effective_task or task
     # If not idle but task given and timeout allows waiting, wait once
-    if run_task and float(st.get("idle_seconds", 0)) < config.idle_threshold_seconds:
+    if run_task and float(st.get("idle_seconds", 0)) < _eff_thr:
         if timeout is not None and float(timeout) > 0:
-            console.print(f"[yellow]Not idle yet — waiting up to {timeout}s for idle ≥ {config.idle_threshold_seconds}s[/yellow]")
+            console.print(f"[yellow]Not idle yet — waiting up to {timeout}s for idle ≥ {_eff_thr}s[/yellow]")
             ok = idle.wait_for_idle(poll_interval=poll_interval, timeout=float(timeout))
             if not ok:
                 console.print(f"[yellow]Still not idle after {timeout}s — not starting[/yellow]")
                 raise typer.Exit(1)
         else:
-            console.print(f"[yellow]Not idle yet — need {config.idle_threshold_seconds}s, have {st.get('idle_seconds'):.1f}s[/yellow]")
+            console.print(f"[yellow]Not idle yet — need {_eff_thr}s, have {st.get('idle_seconds'):.1f}s[/yellow]")
             if not run_task:
                 console.print("[dim]Use `idle-cua run-once \"task\"` to run immediately, or `idle-cua start --watch` to auto-start when idle.[/dim]")
                 return
             # For backward compat with tests: if FakeIdleDetector default is 1000s, we are idle; if not, we still run when task explicitly given?
             # Respect threshold strictly when no timeout: refuse unless idle
-            if float(st.get("idle_seconds", 0)) < config.idle_threshold_seconds:
+            if float(st.get("idle_seconds", 0)) < _eff_thr:
                 console.print("[yellow]Refusing to run — not idle (use --timeout or --watch to wait, or `run-once` to bypass idle gate)[/yellow]")
                 raise typer.Exit(1)
     if run_task:
@@ -944,7 +991,7 @@ def start(
         if daily.exists():
             console.print(f"Daily report: {daily}")
     else:
-        console.print("[dim]Idle watch would run here in daemon mode (MVP: use `idle-cua start --watch \"task\"` or `idle-cua run-once`).[/dim]")
+        console.print("[dim]Idle watch would run here in Watch loop mode (MVP: use `idle-cua start --watch \"task\"` or `idle-cua run-once`).[/dim]")
 
 
 @app.command()
@@ -994,8 +1041,9 @@ def resume(
     if active.get("state") != "paused_by_user":
         console.print(f"[yellow]Task {active.get('id','')[:8]} is not paused (state={active.get('state')})[/yellow]")
         raise typer.Exit(1)
-    # Check idle gate
-    ok, reason = idle.idle_detector.can_run(config.idle_threshold_seconds)
+    # Check idle gate — effective Profile threshold (ADR-0003)
+    _eff = _effective_idle_threshold_for_cli(_resolved, config)
+    ok, reason = idle.idle_detector.can_run(_eff)
     if not ok:
         console.print(f"[yellow]Cannot resume yet: {reason}[/yellow]")
         raise typer.Exit(1)
@@ -1037,8 +1085,9 @@ def serve(
         console.print(f"[red]Invalid --port {port}: must be 1..65535[/red]")
         raise typer.Exit(1)
 
-    # Enforce localhost-only in v1 — reject non-loopback if somehow passed (we only support 127.0.0.1)
+    # v1 only supports loopback; explicit validation path for spec compliance and tests
     host = "127.0.0.1"
+    validate_bind_host(host)
 
     # Scheduler lock — one per data dir, crash-safe via PID liveness
     try:
