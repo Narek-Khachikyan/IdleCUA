@@ -468,23 +468,45 @@ def status(
     _resolved = _resolve_data_dir(data_dir)
     config = IdleCuaConfig(data_dir=_resolved)
     idle = IdleCua(config=config)
-    st = idle.get_status()
+    # Watch loop observed data — CLI owns live state observation (never owned by app)
+    try:
+        from .server.lock import get_lock_info as _get_lock_info_cli
+
+        _lock_info_cli = _get_lock_info_cli(_resolved)
+        _watch_loop_cli = {
+            "running": False,
+            "pid": _lock_info_cli.get("pid") if _lock_info_cli else None,
+            "started_at": None,
+            "lock": _lock_info_cli,
+        }
+    except Exception:
+        _watch_loop_cli = None
+    st = idle.get_status_enriched(watch_loop=_watch_loop_cli)
 
     if json_output:
-        # Make JSON serializable
+        # Versioned contract (same keys as GET /api/v1/status) plus legacy idle_time for CLI compat
         payload = {
             "agent_state": str(st.get("agent_state")),
             "idle_time": st.get("idle_time"),
             "idle_seconds": st.get("idle_seconds"),
+            "idle_threshold_seconds": st.get("idle_threshold_seconds"),
             "screen_locked": st.get("screen_locked"),
+            "watch_loop": st.get("watch_loop"),
+            "demo_mode": st.get("demo_mode"),
+            "honest_status": st.get("honest_status"),
+            "limits": st.get("limits"),
+            "daily_usage": st.get("daily_usage"),
+            "today_usage": st.get("today_usage"),
+            "last_report": st.get("last_report"),
             "active_task": st.get("active_task"),
             "last_action": st.get("last_action"),
             "current_site": st.get("current_site"),
+            "stop_command": st.get("stop_command"),
+            # legacy flat limits for backward compat
             "llm_calls_today": st.get("llm_calls_today"),
             "max_llm_calls_per_day": st.get("max_llm_calls_per_day"),
             "max_actions": st.get("max_actions"),
             "max_duration_minutes": st.get("max_duration_minutes"),
-            "stop_command": st.get("stop_command"),
         }
         console.print_json(json.dumps(payload))
         return
@@ -518,6 +540,11 @@ def status(
                 console.print("[yellow]Browser main-profile consent: NOT granted[/yellow] — run `idle-cua profile grant-browser`")
         except Exception:
             pass
+    # Demo badge — identical to server's honest_status chip/banners (stub never presented as LLM work)
+    honest_cli = st.get("honest_status") or {}
+    if st.get("demo_mode"):
+        console.print(f"[black on yellow] DEMO [/] {honest_cli.get('chip_text','Limited mode')} — {honest_cli.get('banner_text','Limited mode — stub planner · LLM off')}")
+        console.print("[dim]Stub planner active — LLM off; outputs are stub, not LLM work.[/dim]")
     table = Table(title="IdleCUA Status", show_header=True)
     table.add_column("Field", style="bold")
     table.add_column("Value")

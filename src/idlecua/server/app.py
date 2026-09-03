@@ -109,22 +109,9 @@ def _get_idle_cua(data_dir: Path | None = None) -> IdleCua:
 
 
 def _is_demo_mode(data_dir: Path) -> bool:
+    """Thin delegate to Application API — keep name/signature for backward compat."""
     try:
-        store = ProviderStore.load(data_dir)
-        selected = store.get_selected()
-        if selected is None:
-            return True
-        kc = get_default_store(data_dir)
-        key = kc.get(selected.name)
-        if not key:
-            # also check env fallbacks
-            env_map = {
-                "openrouter": "OPENROUTER_API_KEY",
-                "opencode-go": "OPENCODE_GO_API_KEY",
-            }
-            env_var = env_map.get(selected.name) or f"{selected.name.upper().replace('-', '_')}_API_KEY"
-            key = os.environ.get(env_var) or os.environ.get("OPENAI_API_KEY")
-        return not bool(key)
+        return _get_idle_cua(data_dir).is_demo_mode()
     except Exception:
         return True
 
@@ -150,38 +137,11 @@ def _fetch_history_filtered(idle_app: IdleCua, task_id: str | None, limit: int =
 
 
 def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_running: bool | None = None) -> dict:
-    """Single status source driving banner, header chip, and hero. No 'Blocked' for degraded.
-
-    Precedence: running session → Limited mode (no provider) → Waiting for idle → Ready
-    """
-    threshold = _get_effective_idle_threshold(data_dir)
-    # Check for running session via memory active task
+    """Thin delegate to Application API — keep name/signature for backward compat."""
     try:
-        idle_app = _get_idle_cua(data_dir)
-        tasks = idle_app.memory.list_tasks(limit=5)
-        active = None
-        for t in tasks:
-            if t.get("state") in ("running", "planning", "waiting_for_idle", "paused_by_user"):
-                active = t
-                break
-        if active and active.get("state") in ("running", "planning"):
-            goal = active.get("description", "")[:50]
-            return {
-                "text": f"Running — {goal}",
-                "sub": "Session in progress",
-                "level": "running",
-                "dot": "bg-blue-500",
-                "banner_text": f"Running — {goal}",
-                "chip_text": "running",
-                "hero_title": f"Running — {goal}",
-                "hero_sub": "Session in progress — see inspector",
-            }
+        return _get_idle_cua(data_dir).get_honest_status(watch_running=watch_running, idle_seconds=idle_seconds)
     except Exception:
-        pass
-
-    # Demo mode / Limited
-    demo = _is_demo_mode(data_dir)
-    if demo:
+        # Fallback minimal (should not happen in tests)
         return {
             "text": "Limited mode — stub planner · LLM off",
             "sub": "Sessions run on stub planner · LLM disabled",
@@ -190,42 +150,8 @@ def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_runn
             "banner_text": "Limited mode — stub planner · LLM off",
             "chip_text": "Limited mode",
             "hero_title": "Limited mode — stub planner",
-            "hero_sub": f"Idle {idle_seconds:.0f}s / {threshold}s · LLM off · threshold {threshold}s",
+            "hero_sub": f"Idle {(idle_seconds or 0):.0f}s / 600s · LLM off · threshold 600s",
         }
-
-    # Idle check
-    try:
-        app = _get_idle_cua(data_dir)
-        secs = float(idle_seconds) if idle_seconds is not None else float(app.idle_detector.seconds_since_last_input())
-    except Exception:
-        secs = float(idle_seconds or 0)
-
-    if secs < threshold:
-        remaining = threshold - secs
-        mins = int(remaining // 60)
-        secs_r = int(remaining % 60)
-        countdown = f"{mins}m {secs_r}s" if mins else f"{secs_r}s"
-        return {
-            "text": f"Waiting for idle {secs:.0f}s / {threshold}s",
-            "sub": f"Starts when you stay idle · {countdown} remaining",
-            "level": "waiting",
-            "dot": "bg-amber-400",
-            "banner_text": f"Waiting for idle {secs:.0f}s / {threshold}s",
-            "chip_text": f"Waiting for idle",
-            "hero_title": "Waiting for idle",
-            "hero_sub": f"Idle {secs:.0f}s / {threshold}s · threshold {threshold}s · Watch loop {'Running' if watch_running else 'Stopped'}",
-        }
-
-    return {
-        "text": "Ready — idle threshold met",
-        "sub": "Agent will start at next idle window",
-        "level": "ready",
-        "dot": "bg-emerald-500",
-        "banner_text": "Ready — idle threshold met",
-        "chip_text": "Ready",
-        "hero_title": "Ready — idle threshold met",
-        "hero_sub": f"Idle {secs:.0f}s / {threshold}s · Next session when idle window holds",
-    }
 
 
 def _mask_key(key: str) -> str:
@@ -396,74 +322,36 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     # -- API routes under /api/v1 --
 
-    # Status
+    # Status — thin delegate to Application API (T2)
     @app.get("/api/v1/status")
     def api_status():
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        config = idle_app.config
-        # Idle seconds
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-            locked = bool(idle_app.idle_detector.is_screen_locked())
-        except Exception:
-            idle_secs = 0.0
-            locked = False
-        watch = _scheduler_state
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=watch.get("running"))
-        # Limits usage today
-        from ..accounting import get_today_count
-
-        llm_today = get_today_count(data_dir)
-        # Session usage — we use today's counts? For dashboard meters, show actions vs ceilings?
-        # Use get_status from app for active task and site
-        st = idle_app.get_status()
-        last_report = None
-        try:
-            reports = idle_app.list_reports(limit=1)
-            if reports:
-                last_report = reports[0]
-        except Exception:
-            pass
-        # Scheduler lock info
         lock_info = get_lock_info(data_dir)
-        demo = _is_demo_mode(data_dir)
+        watch_loop = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info.get("pid") if lock_info else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info,
+        }
+        enriched = idle_app.get_status_enriched(watch_loop=watch_loop)
+        # Map to versioned contract keys exactly (no breaking change)
         return {
-            "agent_state": st.get("agent_state", "unknown"),
-            "idle_seconds": idle_secs,
-            "idle_threshold_seconds": _get_effective_idle_threshold(data_dir),
-            "screen_locked": locked,
-            "watch_loop": {
-                "running": bool(watch.get("running")),
-                "pid": watch.get("pid") or (lock_info.get("pid") if lock_info else None),
-                "started_at": watch.get("started_at"),
-                "lock": lock_info,
-            },
-            "demo_mode": demo,
-            "honest_status": honest,
-            "limits": {
-                "actions_used_today": None,  # placeholder
-                "max_actions": config.max_actions,
-                "max_duration_minutes": config.max_duration_minutes,
-                "llm_calls_today": llm_today,
-                "max_llm_calls_per_day": config.max_llm_calls_per_day,
-            },
-            "daily_usage": {
-                # For UI meters: show headroom
-                "actions": {"used": 0, "limit": config.max_actions},
-                "llm_calls": {"used": llm_today, "limit": config.max_llm_calls_per_day},
-                "duration": {"used": 0, "limit": config.max_duration_minutes},
-            },
-            "today_usage": {
-                "actions": {"used": 0, "limit": config.max_actions},
-                "llm_calls": {"used": llm_today, "limit": config.max_llm_calls_per_day},
-                "duration": {"used": 0, "limit": config.max_duration_minutes},
-            },
-            "last_report": last_report,
-            "active_task": st.get("active_task"),
-            "last_action": st.get("last_action"),
-            "current_site": st.get("current_site"),
-            "stop_command": st.get("stop_command"),
+            "agent_state": enriched.get("agent_state", "unknown"),
+            "idle_seconds": enriched.get("idle_seconds", 0.0),
+            "idle_threshold_seconds": enriched.get("idle_threshold_seconds", 600),
+            "screen_locked": enriched.get("screen_locked", False),
+            "watch_loop": enriched.get("watch_loop", watch_loop),
+            "demo_mode": enriched.get("demo_mode", False),
+            "honest_status": enriched.get("honest_status", {}),
+            "limits": enriched.get("limits", {}),
+            "daily_usage": enriched.get("daily_usage", {}),
+            "today_usage": enriched.get("today_usage", {}),
+            "last_report": enriched.get("last_report"),
+            "active_task": enriched.get("active_task"),
+            "last_action": enriched.get("last_action"),
+            "current_site": enriched.get("current_site"),
+            "stop_command": enriched.get("stop_command"),
         }
 
     @app.get("/api/v1/tasks")
@@ -1234,17 +1122,21 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
         config = idle_app.config
-        # Status
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-        except Exception:
-            idle_secs = 0.0
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=_scheduler_state.get("running"))
+        # Status — thin delegate to Application API (T2)
+        lock_info_dash = get_lock_info(data_dir)
+        watch_loop_dash = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info_dash.get("pid") if lock_info_dash else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info_dash,
+        }
+        enriched_dash = idle_app.get_status_enriched(watch_loop=watch_loop_dash)
+        honest = enriched_dash.get("honest_status", {})
         # Getting started checklist
         profile = load_profile(data_dir / "profile.json")
         store = ProviderStore.load(data_dir)
-        # Provider key check
-        has_key = not _is_demo_mode(data_dir)
+        # Provider key check — single source via Application API demo badge
+        has_key = not bool(enriched_dash.get("demo_mode", True))
         # perms
         try:
             from ..profile.permissions import check_permissions
@@ -1330,7 +1222,10 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             except Exception:
                 inspector = {"task": inspector_task}
 
-        effective_idle = _get_effective_idle_threshold(data_dir)
+        effective_idle = int(enriched_dash.get("idle_threshold_seconds", 600))
+        # Today meters from enriched limits (single source; mirrors api_status)
+        _limits_dash = enriched_dash.get("limits", {})
+        _daily = enriched_dash.get("daily_usage", {})
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -1338,31 +1233,43 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 "config": config,
                 "effective_idle_threshold": effective_idle,
                 "honest": honest,
-                "demo_mode": _is_demo_mode(data_dir),
+                "demo_mode": bool(enriched_dash.get("demo_mode", False)),
                 "checklist": checklist,
                 "done_count": done_count,
                 "total": len(checklist),
-                "today": {"actions": 0, "actions_limit": config.max_actions, "llm_calls": llm_today, "llm_limit": config.max_llm_calls_per_day, "duration": 0, "duration_limit": config.max_duration_minutes},
-                "watch_loop": _scheduler_state,
+                "today": {
+                    "actions": _daily.get("actions", {}).get("used", 0),
+                    "actions_limit": _daily.get("actions", {}).get("limit", config.max_actions),
+                    "llm_calls": _daily.get("llm_calls", {}).get("used", _limits_dash.get("llm_calls_today", 0)),
+                    "llm_limit": _daily.get("llm_calls", {}).get("limit", config.max_llm_calls_per_day),
+                    "duration": _daily.get("duration", {}).get("used", 0),
+                    "duration_limit": _daily.get("duration", {}).get("limit", config.max_duration_minutes),
+                },
+                "watch_loop": enriched_dash.get("watch_loop", watch_loop_dash),
                 "tasks": tasks_enriched,
                 "inspector": inspector,
-                "lock_info": get_lock_info(data_dir),
+                "lock_info": lock_info_dash,
             },
         )
 
     @app.get("/ui/status", response_class=HTMLResponse)
     def ui_status_fragment(request: Request):
-        # htmx polling fragment — returns honest status banner
+        # htmx polling fragment — thin delegate to Application API status (T2)
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-        except Exception:
-            idle_secs = 0.0
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=_scheduler_state.get("running"))
+        lock_info_frag = get_lock_info(data_dir)
+        watch_loop_frag = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info_frag.get("pid") if lock_info_frag else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info_frag,
+        }
+        enriched_frag = idle_app.get_status_enriched(watch_loop=watch_loop_frag)
+        honest = enriched_frag.get("honest_status", {})
+        demo_mode = bool(enriched_frag.get("demo_mode", False))
         if templates is None:
-            return HTMLResponse(f"<div>{honest['text']}</div>")
-        return templates.TemplateResponse(request, "partials/status_banner.html", {"honest": honest, "demo_mode": _is_demo_mode(data_dir)})
+            return HTMLResponse(f"<div>{honest.get('text','')}</div>")
+        return templates.TemplateResponse(request, "partials/status_banner.html", {"honest": honest, "demo_mode": demo_mode})
 
     @app.get("/tasks", response_class=HTMLResponse)
     def ui_tasks(request: Request):

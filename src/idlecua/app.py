@@ -674,6 +674,183 @@ class IdleCua:
             "stop_command": "idle-cua kill  |  idle-cua stop  |  Ctrl-C (SIGINT)",
         }
 
+    def is_demo_mode(self) -> bool:
+        """Demo badge decision — True when no provider key is configured.
+
+        Reuses ProviderStore + Keychain + env fallback (same as server's
+        _is_demo_mode). Stub output must never be presented as LLM work.
+        Secrets are masked reads only, never leaked.
+        """
+        try:
+            from .keychain import get_default_store
+            from .providers.config import ProviderStore
+
+            store = ProviderStore.load(self.config.data_dir)
+            selected = store.get_selected()
+            if selected is None:
+                return True
+            kc = get_default_store(self.config.data_dir)
+            key = kc.get(selected.name)
+            if not key:
+                import os
+
+                env_map = {
+                    "openrouter": "OPENROUTER_API_KEY",
+                    "opencode-go": "OPENCODE_GO_API_KEY",
+                }
+                env_var = env_map.get(selected.name) or f"{selected.name.upper().replace('-', '_')}_API_KEY"
+                key = os.environ.get(env_var) or os.environ.get("OPENAI_API_KEY")
+            return not bool(key)
+        except Exception:
+            return True
+
+    def get_honest_status(self, watch_running: bool | None = None, idle_seconds: float | None = None) -> dict:
+        """Single status source driving banner, header chip, and hero (T2).
+
+        Precedence: running session → Limited mode (no provider) → Waiting for idle → Ready.
+        Uses self.get_effective_idle_threshold(), self.is_demo_mode(), memory, idle_detector.
+        watch_running is observed live state (never owned by app).
+        """
+        threshold = self.get_effective_idle_threshold()
+        # Check for running session via memory active task
+        try:
+            tasks = self.memory.list_tasks(limit=5)
+            active = None
+            for t in tasks:
+                if t.get("state") in ("running", "planning", "waiting_for_idle", "paused_by_user"):
+                    active = t
+                    break
+            if active and active.get("state") in ("running", "planning"):
+                goal = active.get("description", "")[:50]
+                return {
+                    "text": f"Running — {goal}",
+                    "sub": "Session in progress",
+                    "level": "running",
+                    "dot": "bg-blue-500",
+                    "banner_text": f"Running — {goal}",
+                    "chip_text": "running",
+                    "hero_title": f"Running — {goal}",
+                    "hero_sub": "Session in progress — see inspector",
+                }
+        except Exception:
+            pass
+
+        demo = self.is_demo_mode()
+        if demo:
+            try:
+                demo_idle = float(idle_seconds) if idle_seconds is not None else float(self.idle_detector.seconds_since_last_input())
+            except Exception:
+                demo_idle = float(idle_seconds or 0)
+            return {
+                "text": "Limited mode — stub planner · LLM off",
+                "sub": "Sessions run on stub planner · LLM disabled",
+                "level": "limited",
+                "dot": "bg-amber-400",
+                "banner_text": "Limited mode — stub planner · LLM off",
+                "chip_text": "Limited mode",
+                "hero_title": "Limited mode — stub planner",
+                "hero_sub": f"Idle {demo_idle:.0f}s / {threshold}s · LLM off · threshold {threshold}s",
+            }
+
+        try:
+            secs = float(idle_seconds) if idle_seconds is not None else float(self.idle_detector.seconds_since_last_input())
+        except Exception:
+            secs = float(idle_seconds or 0)
+
+        if secs < threshold:
+            remaining = threshold - secs
+            mins = int(remaining // 60)
+            secs_r = int(remaining % 60)
+            countdown = f"{mins}m {secs_r}s" if mins else f"{secs_r}s"
+            return {
+                "text": f"Waiting for idle {secs:.0f}s / {threshold}s",
+                "sub": f"Starts when you stay idle · {countdown} remaining",
+                "level": "waiting",
+                "dot": "bg-amber-400",
+                "banner_text": f"Waiting for idle {secs:.0f}s / {threshold}s",
+                "chip_text": "Waiting for idle",
+                "hero_title": "Waiting for idle",
+                "hero_sub": f"Idle {secs:.0f}s / {threshold}s · threshold {threshold}s · Watch loop {'Running' if watch_running else 'Stopped'}",
+            }
+
+        return {
+            "text": "Ready — idle threshold met",
+            "sub": "Agent will start at next idle window",
+            "level": "ready",
+            "dot": "bg-emerald-500",
+            "banner_text": "Ready — idle threshold met",
+            "chip_text": "Ready",
+            "hero_title": "Ready — idle threshold met",
+            "hero_sub": f"Idle {secs:.0f}s / {threshold}s · Next session when idle window holds",
+        }
+
+    def get_status_enriched(self, watch_loop: dict | None = None) -> dict:
+        """Enriched status behind the Application API (T2).
+
+        Extends get_status() with idle_threshold_seconds, demo_mode,
+        honest_status, watch_loop passthrough, limits, daily_usage/today_usage
+        duplicates, last_report. Does NOT change existing get_status() keys;
+        callers format the returned data.
+        watch_loop is observed live state (never owned by app).
+        """
+        base = self.get_status()
+        threshold = self.get_effective_idle_threshold()
+        demo = self.is_demo_mode()
+        # Derive watch_running for honest_status
+        watch_running = None
+        if isinstance(watch_loop, dict):
+            watch_running = bool(watch_loop.get("running"))
+        elif isinstance(watch_loop, bool):
+            watch_running = bool(watch_loop)
+        honest = self.get_honest_status(watch_running=watch_running, idle_seconds=base.get("idle_seconds"))
+        from .accounting import get_today_count
+
+        try:
+            llm_today = int(get_today_count(self.config.data_dir))
+        except Exception:
+            llm_today = int(base.get("llm_calls_today", 0) or 0)
+        max_actions = int(getattr(self.config, "max_actions", 200))
+        max_duration = int(getattr(self.config, "max_duration_minutes", 45))
+        max_llm = int(getattr(self.config, "max_llm_calls_per_day", 150))
+        limits = {
+            "actions_used_today": None,
+            "max_actions": max_actions,
+            "max_duration_minutes": max_duration,
+            "llm_calls_today": llm_today,
+            "max_llm_calls_per_day": max_llm,
+        }
+        daily_usage = {
+            "actions": {"used": 0, "limit": max_actions},
+            "llm_calls": {"used": llm_today, "limit": max_llm},
+            "duration": {"used": 0, "limit": max_duration},
+        }
+        today_usage = {
+            "actions": {"used": 0, "limit": max_actions},
+            "llm_calls": {"used": llm_today, "limit": max_llm},
+            "duration": {"used": 0, "limit": max_duration},
+        }
+        last_report = None
+        try:
+            reports = self.list_reports(limit=1)
+            if reports:
+                last_report = reports[0]
+        except Exception:
+            pass
+        enriched = dict(base)
+        enriched.update(
+            {
+                "idle_threshold_seconds": threshold,
+                "demo_mode": demo,
+                "honest_status": honest,
+                "watch_loop": watch_loop,
+                "limits": limits,
+                "daily_usage": daily_usage,
+                "today_usage": today_usage,
+                "last_report": last_report,
+            }
+        )
+        return enriched
+
     # -- config persistence helpers (used by CLI init) --
 
     def init_data_dir(self) -> Path:
