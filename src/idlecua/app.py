@@ -527,6 +527,24 @@ class IdleCua:
                 import uuid
                 self.memory.record_error(uuid.uuid4().hex, task.id, f"screen locked — {reason}")
                 raise RuntimeError(f"screen locked — {reason}")
+        # Schedule/limits also block identically via get_readiness (T1 single source) while preserving legacy idle/screen/profile messages.
+        if not dry_run:
+            readiness = self.get_readiness()
+            if not readiness["can_start"]:
+                fg = readiness.get("failed_gate")
+                if fg in ("schedule", "limits"):
+                    try:
+                        task.transition_to(AgentState.failed)
+                    except Exception:
+                        task.state = AgentState.failed
+                    self.memory.upsert_task(task.id, task.description, task.state.value, None)
+                    import uuid
+                    self.memory.record_error(uuid.uuid4().hex, task.id, readiness["reason"])
+                    raise RuntimeError(readiness["reason"])
+                # profile/idle/screen already handled above with legacy messages; for require_idle False, idle is disabled so no fallback needed.
+                # Keep ProfileNotConfirmedError for profile gate if we somehow reach here without prior raise.
+                if fg == "profile":
+                    self.ensure_profile_confirmed()
         profile = self.get_profile()
         executor = self._get_executor()
         return executor.execute_task(task, profile=profile, dry_run=False, is_interactive=is_interactive, confirm_func=confirm_func)
@@ -753,10 +771,9 @@ class IdleCua:
         # Only the canonical keys are expected; unknown keys are ignored.
         if "session_duration_minutes" in patch and patch["session_duration_minutes"] is not None:
             val = int(patch["session_duration_minutes"])
+            # Range and ceiling are identical (45); single check covers both. Dead `if val>45` branch removed.
             if val <= 0 or val > 45:
                 raise ValueError("session_duration_minutes must be 1..45")
-            if val > 45:
-                raise ValueError("session_duration_minutes above ceiling 45")
             ab.session_duration_minutes = val
         if "daily_action_limit" in patch and patch["daily_action_limit"] is not None:
             val = int(patch["daily_action_limit"])

@@ -541,25 +541,26 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             for t in tasks:
                 if t.get("state") in ("running", "planning") and t.get("id") != task_id:
                     raise HTTPException(status_code=409, detail="session already in flight")
-            # Also check idle gate — decision owned by the Application API (T1 single source).
-            # Profile gate first so HTTP blocks identically to CLI with the same message.
-            ok_p, reason_p = idle_app.check_profile_confirmed()
-            if not ok_p:
-                raise HTTPException(status_code=423, detail=f"Refused: {reason_p}")
-            config = idle_app.config
-            if config.require_idle:
-                thr = idle_app.get_effective_idle_threshold()
-                ok, reason = idle_app.idle_detector.can_run(thr)
-                if not ok:
-                    raise HTTPException(status_code=423, detail=f"idle gate blocked: {reason}")
-                if idle_app.idle_detector.is_screen_locked():
+            # Single decision via Application API (T1 § get_readiness) — maps legacy 423 messages byte-identically.
+            # Replaces separate can_run/is_screen_locked pre-checks that duplicated the gate logic.
+            readiness = idle_app.get_readiness()
+            if not readiness["can_start"]:
+                fg = readiness.get("failed_gate")
+                if fg == "profile":
+                    raw = readiness.get("profile", {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+                elif fg == "idle":
+                    raw = readiness.get("idle", {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"idle gate blocked: {raw}")
+                elif fg == "screen":
+                    # Legacy HTTP contract returned exactly "screen locked" (no suffix); keep byte-identical.
                     raise HTTPException(status_code=423, detail="screen locked")
-            # Schedule/limits gates also decide inside the Application API; map to 423 with the same reason text.
-            # Idle/screen/profile already mapped above with legacy messages; only surface other gates here
-            # so the explicit idle/screen messages above stay byte-identical.
-            _readiness = idle_app.get_readiness()
-            if not _readiness["can_start"] and _readiness.get("failed_gate") not in ("idle", "screen", "profile"):
-                raise HTTPException(status_code=423, detail=f"Refused: {_readiness['reason']}")
+                elif fg in ("schedule", "limits"):
+                    raw = readiness.get(fg, {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+                else:
+                    raw = readiness.get("reason", "")
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
             # Now run — honor queue-time Approve/Skip decisions baked into plan
             try:
                 # Load decisions if previously stored (Approve/Skip per action)

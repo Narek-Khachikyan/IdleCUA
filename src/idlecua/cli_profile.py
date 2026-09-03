@@ -135,88 +135,76 @@ def edit(
         return
 
     if field:
-        # T3 thinning: owner-settings fields delegate to the Application API so CLI and HTTP
-        # share identical validation messages. We attempt the app path first; if the patch
-        # maps cleanly to SettingsPatch keys we validate via app.update_owner_settings for
-        # parity, but we preserve the existing CLI output contract ("Profile updated ..."
-        # vs "Validation failed: ...") and we avoid breaking the existing
-        # profile_show_edit_validate_cli test which intentionally allows saving an
-        # invalid profile and checking via `profile validate` afterwards.
-        # For that reason, when app validation would reject, we fall back to the
-        # legacy direct-save path (which keeps the old allow-save-invalid behaviour) so
-        # output churn is avoided while server-side validation remains strict.
-        # This satisfies the "at minimum" thinning guidance: server delegates fully,
-        # app owns the logic, CLI field path is app-aware without changing texts.
-        try:
-            # Build a SettingsPatch-style dict from dotted paths if they are owner-settings.
-            _patch = {}
-            _is_settings_patch = True
-            _data_for_fallback = profile.to_dict()
-            for f in field:
-                if "=" not in f:
-                    _is_settings_patch = False
-                    break
-                dotted, value = f.split("=", 1)
-                # Map dotted keys to canonical patch keys (ADR-0003 single authority)
-                if dotted == "autonomy_boundaries.session_duration_minutes":
-                    _patch["session_duration_minutes"] = int(value)
-                elif dotted == "autonomy_boundaries.daily_action_limit":
-                    _patch["daily_action_limit"] = int(value)
-                elif dotted == "autonomy_boundaries.daily_llm_call_limit":
-                    _patch["daily_llm_call_limit"] = int(value)
-                elif dotted == "autonomy_boundaries.allowed_hours":
-                    _patch["allowed_hours"] = value
-                elif dotted in ("autonomy_boundaries.allowed_sites", "autonomy_boundaries.allowlist"):
-                    _patch["allowlist"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
-                elif dotted == "autonomy_boundaries.deny_zones":
-                    _patch["deny_zones"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
-                elif dotted in ("computer_usage.idle_threshold_seconds", "autonomy_boundaries.idle_threshold_seconds"):
-                    _patch["idle_threshold_seconds"] = int(value)
-                elif dotted == "computer_usage.idle_threshold_minutes":
-                    # Minutes-only edit maps to seconds (ceil) to keep single field in Profile.
-                    _patch["idle_threshold_seconds"] = int(value) * 60
-                elif dotted in (
-                    "autonomy_boundaries.browser_consent.main_profile_granted",
-                    "browser_consent.main_profile_granted",
-                ):
-                    _patch["browser_consent"] = value.lower() in ("true", "1", "yes", "y")
-                elif dotted in ("readonly", "config.readonly"):
-                    _patch["readonly"] = value.lower() in ("true", "1", "yes", "y")
-                elif dotted in ("require_idle", "config.require_idle"):
-                    _patch["require_idle"] = value.lower() in ("true", "1", "yes", "y")
-                else:
-                    _is_settings_patch = False
-                    break
-            if _is_settings_patch:
-                # Try Application API validation for parity (same messages as HTTP 400).
-                from .app import IdleCua as _IdleCua
-
-                _app = _IdleCua(config=IdleCuaConfig.load(resolved))
+        # T3: owner-settings fields delegate to Application API so CLI and HTTP share
+        # identical validation (same accept/reject, same message text). No silent
+        # save of invalid values; ValueError from app.update_owner_settings is
+        # surfaced as `Validation failed: ...` with exit 1, byte-identical to HTTP 400.
+        _patch = {}
+        _is_settings_patch = True
+        for f in field:
+            if "=" not in f:
+                _is_settings_patch = False
+                break
+            dotted, value = f.split("=", 1)
+            if dotted == "autonomy_boundaries.session_duration_minutes":
                 try:
-                    _app.update_owner_settings(_patch)
-                    console.print(f"[green]Profile updated ({len(field)} field(s)) -> {ppath}[/green]")
-                    return
-                except ValueError as ve:
-                    # Preserve legacy CLI behaviour for the existing test that expects
-                    # `edit` to succeed even when the profile becomes invalid (so
-                    # `profile validate` can later report the error). For tighten-only
-                    # ceiling cases we still surface the app's clear message but we do
-                    # not change the exit code contract for the allowlist domain case?
-                    # To keep byte-identical output for the test suite, fall back to
-                    # direct save on allowlist/allowed_hours/idle shape errors; only
-                    # ceiling over-limit errors are surfaced immediately with app text.
-                    msg = str(ve)
-                    if "above ceiling" in msg or "must be 1..45" in msg or "must be 1..1000" in msg or "must be 60..7200" in msg or "invalid domain" in msg or "allowed_hours" in msg:
-                        # For now, keep the old direct-save path so `edit` stays exit 0
-                        # and `validate` reports the same message later. This avoids
-                        # output churn while still exercising the app path for valid patches.
-                        pass
-                    else:
-                        console.print(f"[red]Validation failed: {ve}[/red]")
-                        raise typer.Exit(1)
-        except Exception:
-            # Any unexpected error in the app-aware path falls back to legacy handling.
-            pass
+                    _patch["session_duration_minutes"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.daily_action_limit":
+                try:
+                    _patch["daily_action_limit"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.daily_llm_call_limit":
+                try:
+                    _patch["daily_llm_call_limit"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.allowed_hours":
+                _patch["allowed_hours"] = value
+            elif dotted in ("autonomy_boundaries.allowed_sites", "autonomy_boundaries.allowlist"):
+                _patch["allowlist"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
+            elif dotted == "autonomy_boundaries.deny_zones":
+                _patch["deny_zones"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
+            elif dotted in ("computer_usage.idle_threshold_seconds", "autonomy_boundaries.idle_threshold_seconds"):
+                try:
+                    _patch["idle_threshold_seconds"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "computer_usage.idle_threshold_minutes":
+                try:
+                    _patch["idle_threshold_seconds"] = int(value) * 60
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted in (
+                "autonomy_boundaries.browser_consent.main_profile_granted",
+                "browser_consent.main_profile_granted",
+            ):
+                _patch["browser_consent"] = value.lower() in ("true", "1", "yes", "y")
+            elif dotted in ("readonly", "config.readonly"):
+                _patch["readonly"] = value.lower() in ("true", "1", "yes", "y")
+            elif dotted in ("require_idle", "config.require_idle"):
+                _patch["require_idle"] = value.lower() in ("true", "1", "yes", "y")
+            else:
+                _is_settings_patch = False
+                break
+        if _is_settings_patch:
+            from .app import IdleCua as _IdleCua
+
+            _app = _IdleCua(config=IdleCuaConfig.load(resolved))
+            try:
+                _app.update_owner_settings(_patch)
+                console.print(f"[green]Profile updated ({len(field)} field(s)) -> {ppath}[/green]")
+                return
+            except ValueError as ve:
+                console.print(f"[red]Validation failed: {ve}[/red]")
+                raise typer.Exit(1)
 
         data = profile.to_dict()
         for f in field:

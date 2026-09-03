@@ -95,11 +95,14 @@ def test_profile_show_edit_validate_cli(tmp_path: Path):
     assert result.exit_code == 0
     assert "Profile is valid" in result.output
 
+    # T3 (spec #23): CLI edit now rejects invalid via Application API (same message as HTTP 400) and does NOT persist invalid values.
+    # Previous test allowed save-invalid-then-validate; updated to expect identical accept/reject per ADR-0003.
     result = runner.invoke(app, ["profile", "edit", "--field", "autonomy_boundaries.allowed_sites=bad domain!!", "--data-dir", str(tmp_path)])
-    assert result.exit_code == 0
-    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert "allowlist" in result.output.lower() and "invalid domain" in result.output.lower()
+    # Invalid not persisted — profile remains valid (tighten-only, no silent clamp)
+    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0
 
     result = runner.invoke(app, ["profile", "edit", "--field", "autonomy_boundaries.allowed_sites=x.com, reddit.com", "--data-dir", str(tmp_path)])
     assert result.exit_code == 0
@@ -107,10 +110,10 @@ def test_profile_show_edit_validate_cli(tmp_path: Path):
     assert result.exit_code == 0
 
     result = runner.invoke(app, ["profile", "edit", "--field", "autonomy_boundaries.session_duration_minutes=999", "--data-dir", str(tmp_path)])
-    assert result.exit_code == 0
-    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
     assert result.exit_code == 1
-    assert "session_duration_minutes" in result.output
+    assert "session_duration_minutes" in result.output or "1..45" in result.output
+    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0
 
     result = runner.invoke(app, ["profile", "edit", "--field", "autonomy_boundaries.session_duration_minutes=30", "--data-dir", str(tmp_path)])
     assert result.exit_code == 0
@@ -118,10 +121,10 @@ def test_profile_show_edit_validate_cli(tmp_path: Path):
     assert result.exit_code == 0
 
     result = runner.invoke(app, ["profile", "edit", "--field", "autonomy_boundaries.allowed_hours=bad", "--data-dir", str(tmp_path)])
-    assert result.exit_code == 0
-    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert "allowed_hours" in result.output
+    result = runner.invoke(app, ["profile", "validate", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0
 
 
 def test_permission_check_reports_remediation(tmp_path: Path):
