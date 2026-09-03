@@ -668,10 +668,14 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             pass
         bundle = idle_app.get_diagnostics(watch_loop=watch)
         # HTTP contract unchanged (shape-preserving): expose only versioned keys, masked.
+        # The bundle's driver dict carries extra structured fields for CLI
+        # renderers (version/accessibility/screen_recording/probe_error) — the
+        # versioned route exposes only {ok, message}.
         secrets = bundle.get("secrets_scan", {})
+        _drv = bundle.get("driver", {"ok": False, "message": ""}) if isinstance(bundle.get("driver"), dict) else {}
         return {
             "permissions": bundle.get("permissions", []),
-            "driver": bundle.get("driver", {"ok": False, "message": ""}),
+            "driver": {"ok": bool(_drv.get("ok", False)), "message": str(_drv.get("message", ""))},
             "profile": bundle.get("profile", {"valid": False, "confirmed": False, "errors": []}),
             "secrets_scan": {"ok": bool(secrets.get("ok", True)), "findings": list(secrets.get("findings") or [])},
             "scheduler_lock": bundle.get("scheduler_lock", {"locked": False, "info": None}),

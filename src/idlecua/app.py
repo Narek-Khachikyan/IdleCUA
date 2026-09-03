@@ -21,6 +21,25 @@ class ProfileNotConfirmedError(RuntimeError):
     """Raised when autonomous action is attempted while profile is unconfirmed/invalid."""
 
 
+# Tighten-only ceilings per ADR-0003 (Config owns safety ceilings; Profile values
+# above ceiling are validation rejections, never silently clamped).
+_MAX_DURATION_MINUTES = 45
+_MAX_ACTIONS = 200
+_MAX_LLM_CALLS_PER_DAY = 150
+
+
+def _effective_limits(
+    session_minutes: int, action_limit: int, llm_limit: int, idle_seconds: int
+) -> dict:
+    """Single tighten-only derivation shared by get/update_owner_settings."""
+    return {
+        "session_duration_minutes": min(int(session_minutes), _MAX_DURATION_MINUTES),
+        "daily_action_limit": min(int(action_limit), _MAX_ACTIONS),
+        "daily_llm_call_limit": min(int(llm_limit), _MAX_LLM_CALLS_PER_DAY),
+        "idle_threshold_seconds": int(idle_seconds),
+    }
+
+
 class IdleCua:
     """Public Application API.
 
@@ -501,50 +520,28 @@ class IdleCua:
             task = task_or_description
         if dry_run:
             return self.dry_run(task.description)
-        # Hard gates before execution (T1: profile gate + idle/screen via single source).
+        # Hard gates before execution (T1: single source via get_readiness).
         # Profile gate first so CLI and HTTP API block identically with the same message.
         self.ensure_profile_confirmed()
-        if not dry_run and self.config.require_idle:
-            # Effective threshold: single source via get_effective_idle_threshold (ADR-0003).
-            _thr = self.get_effective_idle_threshold()
-            ok, reason = self.idle_detector.can_run(_thr)
-            if not ok:
-                # Report as failed like executor does
-                try:
-                    task.transition_to(AgentState.failed)
-                except Exception:
-                    task.state = AgentState.failed
-                self.memory.upsert_task(task.id, task.description, task.state.value, None)
-                import uuid
-                self.memory.record_error(uuid.uuid4().hex, task.id, f"idle gate blocked: {reason}")
-                raise RuntimeError(f"idle gate blocked: {reason}")
-            if self.idle_detector.is_screen_locked():
-                try:
-                    task.transition_to(AgentState.failed)
-                except Exception:
-                    task.state = AgentState.failed
-                self.memory.upsert_task(task.id, task.description, task.state.value, None)
-                import uuid
-                self.memory.record_error(uuid.uuid4().hex, task.id, f"screen locked — {reason}")
-                raise RuntimeError(f"screen locked — {reason}")
-        # Schedule/limits also block identically via get_readiness (T1 single source) while preserving legacy idle/screen/profile messages.
+        # All remaining gates (schedule/idle/screen/limits) decide once inside
+        # get_readiness; run_task only renders/maps the returned verdict so every
+        # caller shares one message text. Legacy phrasing ("idle gate blocked:",
+        # "screen locked —") is preserved inside get_readiness.
         if not dry_run:
             readiness = self.get_readiness()
             if not readiness["can_start"]:
                 fg = readiness.get("failed_gate")
-                if fg in ("schedule", "limits"):
-                    try:
-                        task.transition_to(AgentState.failed)
-                    except Exception:
-                        task.state = AgentState.failed
-                    self.memory.upsert_task(task.id, task.description, task.state.value, None)
-                    import uuid
-                    self.memory.record_error(uuid.uuid4().hex, task.id, readiness["reason"])
-                    raise RuntimeError(readiness["reason"])
-                # profile/idle/screen already handled above with legacy messages; for require_idle False, idle is disabled so no fallback needed.
-                # Keep ProfileNotConfirmedError for profile gate if we somehow reach here without prior raise.
                 if fg == "profile":
+                    # Raise the canonical typed error for the profile gate.
                     self.ensure_profile_confirmed()
+                try:
+                    task.transition_to(AgentState.failed)
+                except Exception:
+                    task.state = AgentState.failed
+                self.memory.upsert_task(task.id, task.description, task.state.value, None)
+                import uuid
+                self.memory.record_error(uuid.uuid4().hex, task.id, readiness["reason"])
+                raise RuntimeError(readiness["reason"])
         profile = self.get_profile()
         executor = self._get_executor()
         return executor.execute_task(task, profile=profile, dry_run=False, is_interactive=is_interactive, confirm_func=confirm_func)
@@ -698,9 +695,9 @@ class IdleCua:
                 if isinstance(minutes, int):
                     idle_sec_profile = minutes * 60
 
-        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
-        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, 200)
-        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, 150)
+        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, _MAX_DURATION_MINUTES)
+        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, _MAX_ACTIONS)
+        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, _MAX_LLM_CALLS_PER_DAY)
         return {
             "profile": {
                 "confirmed": profile.confirmed if profile else False,
@@ -771,23 +768,30 @@ class IdleCua:
         # Only the canonical keys are expected; unknown keys are ignored.
         if "session_duration_minutes" in patch and patch["session_duration_minutes"] is not None:
             val = int(patch["session_duration_minutes"])
-            # Range and ceiling are identical (45); single check covers both. Dead `if val>45` branch removed.
-            if val <= 0 or val > 45:
+            # Range error vs tighten-only ceiling rejection use distinct texts so
+            # callers can tell "invalid range" apart from "above Config ceiling".
+            # The ceiling text keeps the valid range suffix so existing
+            # `match="1..45"` assertions keep passing.
+            if val <= 0:
                 raise ValueError("session_duration_minutes must be 1..45")
+            if val > _MAX_DURATION_MINUTES:
+                raise ValueError(
+                    f"session_duration_minutes above ceiling {_MAX_DURATION_MINUTES} (must be 1..{_MAX_DURATION_MINUTES})"
+                )
             ab.session_duration_minutes = val
         if "daily_action_limit" in patch and patch["daily_action_limit"] is not None:
             val = int(patch["daily_action_limit"])
             if val <= 0 or val > 1000:
                 raise ValueError("daily_action_limit must be 1..1000")
-            if val > 200:
-                raise ValueError("daily_action_limit above ceiling 200")
+            if val > _MAX_ACTIONS:
+                raise ValueError(f"daily_action_limit above ceiling {_MAX_ACTIONS}")
             ab.daily_action_limit = val
         if "daily_llm_call_limit" in patch and patch["daily_llm_call_limit"] is not None:
             val = int(patch["daily_llm_call_limit"])
             if val <= 0 or val > 1000:
                 raise ValueError("daily_llm_call_limit must be 1..1000")
-            if val > 150:
-                raise ValueError("daily_llm_call_limit above ceiling 150")
+            if val > _MAX_LLM_CALLS_PER_DAY:
+                raise ValueError(f"daily_llm_call_limit above ceiling {_MAX_LLM_CALLS_PER_DAY}")
             ab.daily_llm_call_limit = val
         if "allowed_hours" in patch and patch["allowed_hours"] is not None:
             ab.allowed_hours = str(patch["allowed_hours"])
@@ -840,12 +844,12 @@ class IdleCua:
                 pass
 
         # Compute effective the same way as get_owner_settings (tighten-only).
-        eff = {
-            "session_duration_minutes": min(int(ab.session_duration_minutes), 45),
-            "daily_action_limit": min(int(ab.daily_action_limit), 200),
-            "daily_llm_call_limit": min(int(ab.daily_llm_call_limit), 150),
-            "idle_threshold_seconds": int(cu.idle_threshold_seconds),
-        }
+        eff = _effective_limits(
+            ab.session_duration_minutes,
+            ab.daily_action_limit,
+            ab.daily_llm_call_limit,
+            cu.idle_threshold_seconds,
+        )
         return {
             "profile": profile.model_dump(),
             "config": config.to_dict(),
@@ -1053,10 +1057,12 @@ class IdleCua:
             "llm_calls": {"used": llm_today, "limit": max_llm},
             "duration": {"used": 0, "limit": max_duration},
         }
+        # today_usage mirrors daily_usage (same observed counters, kept as a
+        # separate key for HTTP/CLI shape compat — one literal, two keys).
         today_usage = {
-            "actions": {"used": 0, "limit": max_actions},
-            "llm_calls": {"used": llm_today, "limit": max_llm},
-            "duration": {"used": 0, "limit": max_duration},
+            "actions": dict(daily_usage["actions"]),
+            "llm_calls": dict(daily_usage["llm_calls"]),
+            "duration": dict(daily_usage["duration"]),
         }
         last_report = None
         try:
@@ -1084,7 +1090,6 @@ class IdleCua:
         self,
         project_root: Path | str | None = None,
         watch_loop: dict | None = None,
-        include_watch: dict | bool | None = None,
     ) -> dict:
         """Diagnostics decision bundle behind the Application API (T4).
 
@@ -1098,10 +1103,6 @@ class IdleCua:
         (check_profile_confirmed / validate_profile). Imports inside method
         to avoid cycles and hard driver dep.
         """
-        # Normalize watch_loop param (support include_watch as alias).
-        if watch_loop is None and isinstance(include_watch, dict):
-            watch_loop = include_watch
-
         # Effective threshold/limits for context (tighten-only via T3).
         try:
             effective_threshold = int(self.get_effective_idle_threshold())
@@ -1131,13 +1132,19 @@ class IdleCua:
                 {"name": "permissions_check", "granted": None, "remediation": f"check failed: {e}"}
             ]
 
-        # Driver probe (avoid hard dep on cua_driver).
+        # Driver probe (avoid hard dep on cua_driver). Structured fields are the
+        # contract for renderers; `message` stays human-readable and identical.
         driver_ok = False
         driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
+        driver_version: str = "unknown"
+        driver_accessibility: bool | None = None
+        driver_screen_recording: bool | None = None
+        driver_probe_error: str | None = None
         try:
             import cua_driver  # type: ignore
 
             ver = getattr(cua_driver, "__version__", "unknown")
+            driver_version = str(ver)
             driver_ok = True
             driver_msg = f"cua-driver {ver}"
             try:
@@ -1145,13 +1152,27 @@ class IdleCua:
                 acc = getattr(status, "accessibility", "?")
                 scr = getattr(status, "screen_recording", "?")
                 driver_msg += f" — accessibility={acc} screen_recording={scr}"
+                if isinstance(acc, bool):
+                    driver_accessibility = acc
+                elif str(acc).lower().startswith("true"):
+                    driver_accessibility = True
+                elif str(acc).lower().startswith("false"):
+                    driver_accessibility = False
+                if isinstance(scr, bool):
+                    driver_screen_recording = scr
+                elif str(scr).lower().startswith("true"):
+                    driver_screen_recording = True
+                elif str(scr).lower().startswith("false"):
+                    driver_screen_recording = False
             except Exception as e:
+                driver_probe_error = str(e)
                 driver_msg += f" — probe failed: {e}"
         except (ImportError, ModuleNotFoundError):
             driver_ok = False
             driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
         except Exception as e:
             driver_ok = False
+            driver_probe_error = str(e)
             driver_msg = f"cua-driver probe failed: {e}"
 
         # Profile validity via T3 authority (check_profile_confirmed + validate_profile).
@@ -1224,21 +1245,6 @@ class IdleCua:
         except Exception:
             lock_info = None
             locked = False
-            # Fallback direct file check without import.
-            try:
-                import json as _json
-
-                p = Path(self.config.data_dir) / ".scheduler.lock"
-                if p.exists():
-                    lock_info = _json.loads(p.read_text(encoding="utf-8"))
-                    # Consider locked if file exists; liveness check skipped in fallback.
-                    locked = True
-                else:
-                    lock_info = None
-                    locked = False
-            except Exception:
-                lock_info = None
-                locked = False
 
         # Watch loop observed state (never owned by app; passed in or default).
         if isinstance(watch_loop, dict):
@@ -1258,7 +1264,14 @@ class IdleCua:
 
         return {
             "permissions": perms_data,
-            "driver": {"ok": driver_ok, "message": driver_msg},
+            "driver": {
+                "ok": driver_ok,
+                "message": driver_msg,
+                "version": driver_version,
+                "accessibility": driver_accessibility,
+                "screen_recording": driver_screen_recording,
+                "probe_error": driver_probe_error,
+            },
             "profile": {"valid": profile_valid, "confirmed": profile_confirmed, "errors": profile_errors},
             "secrets_scan": {
                 "ok": secrets_ok,
