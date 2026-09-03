@@ -82,15 +82,9 @@ def _resolve_data_dir(data_dir: Path | str | None = None) -> Path:
 
 
 def _get_effective_idle_threshold(data_dir: Path) -> int:
-    """Single source per ADR-0003: Profile idle_threshold_seconds, fallback to Config default."""
+    """Thin caller per ADR-0002: delegate to the Application API single source."""
     try:
-        from ..profile.models import get_effective_idle_threshold_seconds
-        from ..profile.store import load_profile as _lp_thr
-
-        p = _lp_thr(data_dir / "profile.json")
-        if p is not None:
-            # Use Profile's canonical effective value
-            return get_effective_idle_threshold_seconds(p, fallback=600)
+        return int(_get_idle_cua(data_dir).get_effective_idle_threshold())
     except Exception:
         pass
     try:
@@ -105,8 +99,12 @@ def _get_idle_cua(data_dir: Path | None = None) -> IdleCua:
     # Ensure data dir exists (auto-init)
     resolved.mkdir(parents=True, exist_ok=True)
     config = IdleCuaConfig.load(resolved)
-    # Keep scheduler_state threshold in sync with effective Profile threshold (ADR-0003 single source)
-    _scheduler_state["idle_threshold"] = _get_effective_idle_threshold(resolved)
+    # Keep scheduler_state threshold in sync with the Application API single source (ADR-0003).
+    try:
+        _thr = int(IdleCua(config=config).get_effective_idle_threshold())
+    except Exception:
+        _thr = int(getattr(config, "idle_threshold_seconds", 600))
+    _scheduler_state["idle_threshold"] = _thr
     return IdleCua(config=config)
 
 
@@ -263,12 +261,12 @@ def _watch_loop_worker(data_dir: Path, poll_interval: float = 5.0):
         try:
             idle_app = _get_idle_cua(data_dir)
             config = idle_app.config
-            # need_idle check — threshold from Profile (minutes*60) or config
+            # Idle/screen decision owned by the Application API (T1); worker only renders/waits.
             try:
                 idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
             except Exception:
                 idle_secs = 0.0
-            threshold = _get_effective_idle_threshold(data_dir)
+            threshold = idle_app.get_effective_idle_threshold()
             _scheduler_state["idle_threshold"] = threshold
             if idle_secs < threshold or idle_app.idle_detector.is_screen_locked():
                 _time.sleep(poll_interval)
@@ -655,15 +653,25 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             for t in tasks:
                 if t.get("state") in ("running", "planning") and t.get("id") != task_id:
                     raise HTTPException(status_code=409, detail="session already in flight")
-            # Also check idle gate — threshold from Profile (single source)
+            # Also check idle gate — decision owned by the Application API (T1 single source).
+            # Profile gate first so HTTP blocks identically to CLI with the same message.
+            ok_p, reason_p = idle_app.check_profile_confirmed()
+            if not ok_p:
+                raise HTTPException(status_code=423, detail=f"Refused: {reason_p}")
             config = idle_app.config
             if config.require_idle:
-                thr = _get_effective_idle_threshold(data_dir)
+                thr = idle_app.get_effective_idle_threshold()
                 ok, reason = idle_app.idle_detector.can_run(thr)
                 if not ok:
                     raise HTTPException(status_code=423, detail=f"idle gate blocked: {reason}")
                 if idle_app.idle_detector.is_screen_locked():
                     raise HTTPException(status_code=423, detail="screen locked")
+            # Schedule/limits gates also decide inside the Application API; map to 423 with the same reason text.
+            # Idle/screen/profile already mapped above with legacy messages; only surface other gates here
+            # so the explicit idle/screen messages above stay byte-identical.
+            _readiness = idle_app.get_readiness()
+            if not _readiness["can_start"] and _readiness.get("failed_gate") not in ("idle", "screen", "profile"):
+                raise HTTPException(status_code=423, detail=f"Refused: {_readiness['reason']}")
             # Now run — honor queue-time Approve/Skip decisions baked into plan
             try:
                 # Load decisions if previously stored (Approve/Skip per action)

@@ -53,13 +53,10 @@ def validate_bind_host(host: str) -> None:
 
 
 def _effective_idle_threshold_for_cli(data_dir: Path, config: IdleCuaConfig) -> int:
-    """Single source per ADR-0003: Profile seconds, fallback to Config."""
+    """Thin caller per ADR-0002: delegate to the Application API single source."""
     try:
-        from .profile.models import get_effective_idle_threshold_seconds
-        from .profile.store import load_profile as _lp
-
-        p = _lp(data_dir / "profile.json")
-        return get_effective_idle_threshold_seconds(p, fallback=int(getattr(config, "idle_threshold_seconds", 600)))
+        idle = IdleCua(config=config)
+        return int(idle.get_effective_idle_threshold())
     except Exception:
         return int(getattr(config, "idle_threshold_seconds", 600))
 
@@ -93,24 +90,26 @@ def _print_plan(idle: IdleCua, p, title: str, json_output: bool) -> None:
 
 
 def _check_profile_gate(data_dir: Optional[str]) -> tuple[Path, object]:
-    """Return (ppath, profile) or exit with Refused message."""
-    from .profile.store import load_profile as _load_profile
-    from .profile.validate import validate_profile as _validate_profile
-
+    """Thin caller per ADR-0002: decision lives in IdleCua; CLI only renders/maps."""
     _resolved = _resolve_data_dir(data_dir)
     _ppath = _resolved / "profile.json"
-    _profile = _load_profile(_ppath)
-    if _profile is None:
-        console.print(f"[red]Refused: No profile found at {_ppath}. Run `idle-cua profile interview` and confirm.[/red]")
-        console.print("[dim]Hint: run `idle-cua profile interview` and confirm, or `idle-cua profile show` / `validate` to fix.[/dim]")
+    try:
+        from .config import IdleCuaConfig as _Cfg
+
+        _idle = IdleCua(config=_Cfg(data_dir=_resolved))
+        ok, reason = _idle.check_profile_confirmed()
+    except Exception as e:
+        ok, reason = False, str(e)
+    if not ok:
+        console.print(f"[red]Refused: {reason}[/red]")
+        # Preserve the helpful hint for the missing-profile case (byte-identical guidance as before).
+        if "No profile found" in str(reason):
+            console.print("[dim]Hint: run `idle-cua profile interview` and confirm, or `idle-cua profile show` / `validate` to fix.[/dim]")
         raise typer.Exit(1)
-    if not _profile.confirmed:
-        console.print(f"[red]Refused: Profile at {_ppath} is unconfirmed. Complete `idle-cua profile interview` and confirm, or `idle-cua profile show` to inspect. Autonomous runs are blocked until the profile is confirmed.[/red]")
-        raise typer.Exit(1)
-    _errs = _validate_profile(_profile)
-    if _errs:
-        console.print(f"[red]Refused: Profile at {_ppath} is confirmed but invalid: {'; '.join(_errs)}. Run `idle-cua profile validate`.[/red]")
-        raise typer.Exit(1)
+    try:
+        _profile = _idle.get_profile()
+    except Exception:
+        _profile = None
     return _ppath, _profile
 
 
@@ -846,7 +845,7 @@ def start(
 
     # If watch mode: autonomous loop (wait-for-idle → session → wait again)
     if watch or (effective_task and timeout is not None):
-        thr = int(idle_threshold) if idle_threshold is not None else _effective_idle_threshold_for_cli(_resolved, config)
+        thr = int(idle_threshold) if idle_threshold is not None else idle.get_effective_idle_threshold()
         # ADR-0004: exactly one scheduler per data dir enforced by lock — also for CLI Watch loop
         _watch_lock_info = None
         try:
@@ -953,7 +952,8 @@ def start(
 
     # Non-watch path (legacy single check): show status and run if idle, else wait briefly if task given
     st = idle.get_status()
-    _eff_thr = _effective_idle_threshold_for_cli(_resolved, config)
+    _thr_override = int(idle_threshold) if idle_threshold is not None else None
+    _eff_thr = idle.get_effective_idle_threshold() if _thr_override is None else _thr_override
     console.print(f"Agent state: {st.get('agent_state')}")
     console.print(f"Idle: {st.get('idle_time')} (threshold {_eff_thr}s)")
     console.print(f"Screen locked: {st.get('screen_locked')}")
@@ -966,7 +966,7 @@ def start(
     if run_task and float(st.get("idle_seconds", 0)) < _eff_thr:
         if timeout is not None and float(timeout) > 0:
             console.print(f"[yellow]Not idle yet — waiting up to {timeout}s for idle ≥ {_eff_thr}s[/yellow]")
-            ok = idle.wait_for_idle(poll_interval=poll_interval, timeout=float(timeout))
+            ok = idle.wait_for_idle(poll_interval=poll_interval, timeout=float(timeout), threshold_override=_thr_override)
             if not ok:
                 console.print(f"[yellow]Still not idle after {timeout}s — not starting[/yellow]")
                 raise typer.Exit(1)
@@ -1041,9 +1041,8 @@ def resume(
     if active.get("state") != "paused_by_user":
         console.print(f"[yellow]Task {active.get('id','')[:8]} is not paused (state={active.get('state')})[/yellow]")
         raise typer.Exit(1)
-    # Check idle gate — effective Profile threshold (ADR-0003)
-    _eff = _effective_idle_threshold_for_cli(_resolved, config)
-    ok, reason = idle.idle_detector.can_run(_eff)
+    # Check readiness via the Application API (T1: decision inside, CLI only renders).
+    ok, reason = idle.can_start()
     if not ok:
         console.print(f"[yellow]Cannot resume yet: {reason}[/yellow]")
         raise typer.Exit(1)

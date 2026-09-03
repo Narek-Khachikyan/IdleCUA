@@ -359,6 +359,90 @@ class IdleCua:
 
         return load_profile(self.config.data_dir / "profile.json")
 
+    def get_effective_idle_threshold(self) -> int:
+        """Single source per ADR-0003: Profile seconds, fallback to Config.
+
+        T1: all callers (CLI, HTTP API, scheduler, executor) delegate here.
+        """
+        try:
+            from .profile.models import get_effective_idle_threshold_seconds
+
+            p = self.get_profile()
+            return get_effective_idle_threshold_seconds(
+                p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600))
+            )
+        except Exception:
+            return int(getattr(self.config, "idle_threshold_seconds", 600))
+
+    def get_readiness(self, threshold_override: int | None = None) -> dict:
+        """Decide all pre-run gates once inside the Application API (T1).
+
+        Returns dict with effective_threshold, individual gate results
+        (profile/schedule/idle/limits as {ok, reason, gate}), can_start and
+        reason/failed_gate. Callers render; they do not re-implement gates.
+        """
+        from .scheduler import IdleScheduler
+
+        effective = int(threshold_override) if threshold_override is not None else self.get_effective_idle_threshold()
+        scheduler = self.get_scheduler()
+        # Profile gate uses the canonical Application API message (same text CLI prints with "Refused: " prefix).
+        ok_p, reason_p = self.check_profile_confirmed()
+        profile_gate = {"ok": bool(ok_p), "reason": str(reason_p), "gate": "profile"}
+        try:
+            schedule_gate_obj = scheduler.check_schedule_gate()
+            schedule_gate = {"ok": bool(schedule_gate_obj.ok), "reason": str(schedule_gate_obj.reason), "gate": "schedule"}
+        except Exception as e:
+            schedule_gate = {"ok": True, "reason": f"schedule check skipped: {e}", "gate": "schedule"}
+        try:
+            idle_gate_obj = scheduler.check_idle_gate(effective)
+            idle_gate = {"ok": bool(idle_gate_obj.ok), "reason": str(idle_gate_obj.reason), "gate": str(idle_gate_obj.gate)}
+        except Exception as e:
+            idle_gate = {"ok": False, "reason": f"idle check failed: {e}", "gate": "idle"}
+        # require_idle=False disables the idle/screen gate (matches run_task behavior).
+        if not bool(getattr(self.config, "require_idle", True)):
+            idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
+        try:
+            limits_gate_obj = scheduler.check_limits_gate()
+            limits_gate = {"ok": bool(limits_gate_obj.ok), "reason": str(limits_gate_obj.reason), "gate": "limits"}
+        except Exception as e:
+            limits_gate = {"ok": True, "reason": f"limits check skipped: {e}", "gate": "limits"}
+        for g in (profile_gate, schedule_gate, idle_gate, limits_gate):
+            if not g["ok"]:
+                gate = g["gate"]
+                reason = g["reason"]
+                # Preserve legacy user-facing phrasing per gate so CLI/HTTP texts stay byte-identical.
+                if gate == "idle":
+                    combined = f"idle gate blocked: {reason}"
+                elif gate == "screen":
+                    combined = f"screen locked — {reason}"
+                else:
+                    combined = f"{gate}: {reason}" if not reason.startswith(f"{gate}:") else reason
+                return {
+                    "effective_threshold": effective,
+                    "profile": profile_gate,
+                    "schedule": schedule_gate,
+                    "idle": idle_gate,
+                    "limits": limits_gate,
+                    "can_start": False,
+                    "reason": combined,
+                    "failed_gate": gate,
+                }
+        return {
+            "effective_threshold": effective,
+            "profile": profile_gate,
+            "schedule": schedule_gate,
+            "idle": idle_gate,
+            "limits": limits_gate,
+            "can_start": True,
+            "reason": "all gates pass",
+            "failed_gate": None,
+        }
+
+    def can_start(self, threshold_override: int | None = None) -> tuple[bool, str]:
+        """Thin readiness check: (ok, reason) with decision owned by the Application API."""
+        r = self.get_readiness(threshold_override=threshold_override)
+        return bool(r["can_start"]), str(r["reason"])
+
     def get_plan_verdicts(self, plan: Plan) -> list[dict]:
         verdicts: list[dict] = []
         local_kinds = {"save_note", "create_note", "save_link", "close_own_tab", "close_own_app"}
@@ -417,16 +501,12 @@ class IdleCua:
             task = task_or_description
         if dry_run:
             return self.dry_run(task.description)
-        # Hard gates before execution (US14 idle gate, profile confirmed) — threshold single source Profile per ADR-0003
+        # Hard gates before execution (T1: profile gate + idle/screen via single source).
+        # Profile gate first so CLI and HTTP API block identically with the same message.
+        self.ensure_profile_confirmed()
         if not dry_run and self.config.require_idle:
-            # Effective threshold: Profile seconds if available, else Config
-            try:
-                from .profile.models import get_effective_idle_threshold_seconds
-
-                _p = self.get_profile()
-                _thr = get_effective_idle_threshold_seconds(_p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-            except Exception:
-                _thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+            # Effective threshold: single source via get_effective_idle_threshold (ADR-0003).
+            _thr = self.get_effective_idle_threshold()
             ok, reason = self.idle_detector.can_run(_thr)
             if not ok:
                 # Report as failed like executor does
@@ -645,13 +725,7 @@ class IdleCua:
                 poll_interval=poll_interval, timeout=timeout, threshold_override=idle_threshold_override
             )
             if not ok:
-                try:
-                    from .profile.models import get_effective_idle_threshold_seconds
-
-                    _p_eff = self.get_profile()
-                    _thr_msg = idle_threshold_override if idle_threshold_override is not None else get_effective_idle_threshold_seconds(_p_eff, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-                except Exception:
-                    _thr_msg = idle_threshold_override or getattr(self.config, "idle_threshold_seconds", 600)
+                _thr_msg = int(idle_threshold_override) if idle_threshold_override is not None else self.get_effective_idle_threshold()
                 raise RuntimeError(f"Timed out waiting for idle (threshold {_thr_msg}s)")
         ok, reason = scheduler.can_start(threshold_override=idle_threshold_override)
         if not ok:
