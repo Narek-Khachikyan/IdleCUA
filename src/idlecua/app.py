@@ -359,6 +359,90 @@ class IdleCua:
 
         return load_profile(self.config.data_dir / "profile.json")
 
+    def get_effective_idle_threshold(self) -> int:
+        """Single source per ADR-0003: Profile seconds, fallback to Config.
+
+        T1: all callers (CLI, HTTP API, scheduler, executor) delegate here.
+        """
+        try:
+            from .profile.models import get_effective_idle_threshold_seconds
+
+            p = self.get_profile()
+            return get_effective_idle_threshold_seconds(
+                p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600))
+            )
+        except Exception:
+            return int(getattr(self.config, "idle_threshold_seconds", 600))
+
+    def get_readiness(self, threshold_override: int | None = None) -> dict:
+        """Decide all pre-run gates once inside the Application API (T1).
+
+        Returns dict with effective_threshold, individual gate results
+        (profile/schedule/idle/limits as {ok, reason, gate}), can_start and
+        reason/failed_gate. Callers render; they do not re-implement gates.
+        """
+        from .scheduler import IdleScheduler
+
+        effective = int(threshold_override) if threshold_override is not None else self.get_effective_idle_threshold()
+        scheduler = self.get_scheduler()
+        # Profile gate uses the canonical Application API message (same text CLI prints with "Refused: " prefix).
+        ok_p, reason_p = self.check_profile_confirmed()
+        profile_gate = {"ok": bool(ok_p), "reason": str(reason_p), "gate": "profile"}
+        try:
+            schedule_gate_obj = scheduler.check_schedule_gate()
+            schedule_gate = {"ok": bool(schedule_gate_obj.ok), "reason": str(schedule_gate_obj.reason), "gate": "schedule"}
+        except Exception as e:
+            schedule_gate = {"ok": True, "reason": f"schedule check skipped: {e}", "gate": "schedule"}
+        try:
+            idle_gate_obj = scheduler.check_idle_gate(effective)
+            idle_gate = {"ok": bool(idle_gate_obj.ok), "reason": str(idle_gate_obj.reason), "gate": str(idle_gate_obj.gate)}
+        except Exception as e:
+            idle_gate = {"ok": False, "reason": f"idle check failed: {e}", "gate": "idle"}
+        # require_idle=False disables the idle/screen gate (matches run_task behavior).
+        if not bool(getattr(self.config, "require_idle", True)):
+            idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
+        try:
+            limits_gate_obj = scheduler.check_limits_gate()
+            limits_gate = {"ok": bool(limits_gate_obj.ok), "reason": str(limits_gate_obj.reason), "gate": "limits"}
+        except Exception as e:
+            limits_gate = {"ok": True, "reason": f"limits check skipped: {e}", "gate": "limits"}
+        for g in (profile_gate, schedule_gate, idle_gate, limits_gate):
+            if not g["ok"]:
+                gate = g["gate"]
+                reason = g["reason"]
+                # Preserve legacy user-facing phrasing per gate so CLI/HTTP texts stay byte-identical.
+                if gate == "idle":
+                    combined = f"idle gate blocked: {reason}"
+                elif gate == "screen":
+                    combined = f"screen locked — {reason}"
+                else:
+                    combined = f"{gate}: {reason}" if not reason.startswith(f"{gate}:") else reason
+                return {
+                    "effective_threshold": effective,
+                    "profile": profile_gate,
+                    "schedule": schedule_gate,
+                    "idle": idle_gate,
+                    "limits": limits_gate,
+                    "can_start": False,
+                    "reason": combined,
+                    "failed_gate": gate,
+                }
+        return {
+            "effective_threshold": effective,
+            "profile": profile_gate,
+            "schedule": schedule_gate,
+            "idle": idle_gate,
+            "limits": limits_gate,
+            "can_start": True,
+            "reason": "all gates pass",
+            "failed_gate": None,
+        }
+
+    def can_start(self, threshold_override: int | None = None) -> tuple[bool, str]:
+        """Thin readiness check: (ok, reason) with decision owned by the Application API."""
+        r = self.get_readiness(threshold_override=threshold_override)
+        return bool(r["can_start"]), str(r["reason"])
+
     def get_plan_verdicts(self, plan: Plan) -> list[dict]:
         verdicts: list[dict] = []
         local_kinds = {"save_note", "create_note", "save_link", "close_own_tab", "close_own_app"}
@@ -417,16 +501,12 @@ class IdleCua:
             task = task_or_description
         if dry_run:
             return self.dry_run(task.description)
-        # Hard gates before execution (US14 idle gate, profile confirmed) — threshold single source Profile per ADR-0003
+        # Hard gates before execution (T1: profile gate + idle/screen via single source).
+        # Profile gate first so CLI and HTTP API block identically with the same message.
+        self.ensure_profile_confirmed()
         if not dry_run and self.config.require_idle:
-            # Effective threshold: Profile seconds if available, else Config
-            try:
-                from .profile.models import get_effective_idle_threshold_seconds
-
-                _p = self.get_profile()
-                _thr = get_effective_idle_threshold_seconds(_p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-            except Exception:
-                _thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+            # Effective threshold: single source via get_effective_idle_threshold (ADR-0003).
+            _thr = self.get_effective_idle_threshold()
             ok, reason = self.idle_detector.can_run(_thr)
             if not ok:
                 # Report as failed like executor does
@@ -447,6 +527,24 @@ class IdleCua:
                 import uuid
                 self.memory.record_error(uuid.uuid4().hex, task.id, f"screen locked — {reason}")
                 raise RuntimeError(f"screen locked — {reason}")
+        # Schedule/limits also block identically via get_readiness (T1 single source) while preserving legacy idle/screen/profile messages.
+        if not dry_run:
+            readiness = self.get_readiness()
+            if not readiness["can_start"]:
+                fg = readiness.get("failed_gate")
+                if fg in ("schedule", "limits"):
+                    try:
+                        task.transition_to(AgentState.failed)
+                    except Exception:
+                        task.state = AgentState.failed
+                    self.memory.upsert_task(task.id, task.description, task.state.value, None)
+                    import uuid
+                    self.memory.record_error(uuid.uuid4().hex, task.id, readiness["reason"])
+                    raise RuntimeError(readiness["reason"])
+                # profile/idle/screen already handled above with legacy messages; for require_idle False, idle is disabled so no fallback needed.
+                # Keep ProfileNotConfirmedError for profile gate if we somehow reach here without prior raise.
+                if fg == "profile":
+                    self.ensure_profile_confirmed()
         profile = self.get_profile()
         executor = self._get_executor()
         return executor.execute_task(task, profile=profile, dry_run=False, is_interactive=is_interactive, confirm_func=confirm_func)
@@ -543,6 +641,217 @@ class IdleCua:
     def list_reports(self, limit: int = 50) -> list[dict]:
         return self.memory.list_reports(limit=limit)
 
+    def get_owner_settings(self) -> dict:
+        """Owner-settings read behind the Application API (T3).
+
+        Moves server GET /api/v1/settings logic here so Local UI and CLI
+        share one place per ADR-0002/0003. Prefill of unset Profile fields
+        from Config is display-only (never persisted here). Effective limits
+        are tighten-only min(Profile, ceiling). Provider keys are never touched.
+
+        Returns {profile, config, effective} with same keys as the HTTP
+        contract (byte-identical to the previous server handler).
+        """
+        from .config import IdleCuaConfig as _Cfg
+        from .profile.models import Profile as _Profile
+        from .profile.store import load_profile as _load_profile
+
+        data_dir = self.config.data_dir
+        # Reload config from disk so HTTP and CLI see the same persisted value.
+        try:
+            config = _Cfg.load(data_dir)
+            # Keep the instance in sync for callers that reuse self.config.
+            self.config = config
+        except Exception:
+            config = self.config
+        profile = _load_profile(data_dir / "profile.json")
+        if profile is None:
+            profile_dict = _Profile().model_dump()
+        else:
+            profile_dict = profile.model_dump()
+            # One-time prefill for review (display only, not persisted).
+            ab_pref = profile_dict.get("autonomy_boundaries", {})
+            if isinstance(ab_pref, dict) and not ab_pref.get("allowed_sites"):
+                ab_pref["allowed_sites"] = list(config.allowlist)
+            if isinstance(ab_pref, dict) and not ab_pref.get("deny_zones"):
+                ab_pref["deny_zones"] = (
+                    list(config.deny_zones) if ab_pref.get("deny_zones") == [] else ab_pref.get("deny_zones", [])
+                )
+            cu_pref = profile_dict.get("computer_usage", {})
+            if (
+                isinstance(cu_pref, dict)
+                and cu_pref.get("idle_threshold_seconds", 600) == 600
+                and config.idle_threshold_seconds != 600
+            ):
+                cu_pref["idle_threshold_seconds"] = int(config.idle_threshold_seconds)
+                cu_pref["idle_threshold_minutes"] = max(1, (int(config.idle_threshold_seconds) + 59) // 60)
+
+        ab = profile_dict.get("autonomy_boundaries", {}) if isinstance(profile_dict, dict) else {}
+        cu = profile_dict.get("computer_usage", {}) if isinstance(profile_dict, dict) else {}
+        idle_sec_profile = None
+        if isinstance(cu, dict):
+            secs = cu.get("idle_threshold_seconds")
+            if isinstance(secs, int):
+                idle_sec_profile = secs
+            else:
+                minutes = cu.get("idle_threshold_minutes")
+                if isinstance(minutes, int):
+                    idle_sec_profile = minutes * 60
+
+        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
+        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, 200)
+        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, 150)
+        return {
+            "profile": {
+                "confirmed": profile.confirmed if profile else False,
+                "session_duration_minutes": ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45,
+                "daily_action_limit": ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200,
+                "daily_llm_call_limit": ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150,
+                "allowed_hours": ab.get("allowed_hours", "00:00-23:59") if isinstance(ab, dict) else "00:00-23:59",
+                "allowlist": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
+                "deny_zones": ab.get("deny_zones", []) if isinstance(ab, dict) else [],
+                "allowed_sites": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
+                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
+                "idle_threshold_minutes": cu.get("idle_threshold_minutes", 10) if isinstance(cu, dict) else 10,
+                "browser_consent": ab.get("browser_consent", {}) if isinstance(ab, dict) else {},
+            },
+            "config": {
+                "readonly": config.readonly,
+                "require_idle": config.require_idle,
+                "ceilings": {
+                    "max_duration_minutes": 45,
+                    "max_actions": 200,
+                    "max_llm_calls_per_day": 150,
+                },
+                "current": {
+                    "max_duration_minutes": config.max_duration_minutes,
+                    "max_actions": config.max_actions,
+                    "max_llm_calls_per_day": config.max_llm_calls_per_day,
+                    "idle_threshold_seconds": config.idle_threshold_seconds,
+                },
+                "data_dir": str(config.data_dir),
+            },
+            "effective": {
+                "session_duration_minutes": eff_session,
+                "daily_action_limit": eff_actions,
+                "daily_llm_call_limit": eff_llm,
+                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
+            },
+        }
+
+    def update_owner_settings(self, patch: dict) -> dict:
+        """Owner-settings write behind the Application API (T3).
+
+        Owns all validation (range, allowlist domain shape, idle bounds,
+        consent) plus tighten-only ceiling checks, then validate_profile,
+        then persistence to the single authority per setting per ADR-0003.
+        Raises ValueError with a clear user-facing message on any failure;
+        callers map to transport errors with identical text (HTTP 400, CLI).
+
+        Returns {profile, config, effective} on success. Provider keys are
+        untouched and never included in returns/logs/errors.
+        """
+        from .config import IdleCuaConfig as _Cfg
+        from .profile.models import BrowserConsent as _BC
+        from .profile.models import Profile as _Profile
+        from .profile.store import load_profile as _load_profile
+        from .profile.store import save_profile as _save_profile
+        from .profile.validate import _is_valid_domain as _is_valid
+        from .profile.validate import validate_profile as _validate
+
+        data_dir = self.config.data_dir
+        config = _Cfg.load(data_dir)
+        profile = _load_profile(data_dir / "profile.json")
+        if profile is None:
+            profile = _Profile()
+        ab = profile.autonomy_boundaries
+        cu = profile.computer_usage
+
+        # Extract patch values (support both SettingsPatch keys and legacy dotted paths if ever passed).
+        # Only the canonical keys are expected; unknown keys are ignored.
+        if "session_duration_minutes" in patch and patch["session_duration_minutes"] is not None:
+            val = int(patch["session_duration_minutes"])
+            # Range and ceiling are identical (45); single check covers both. Dead `if val>45` branch removed.
+            if val <= 0 or val > 45:
+                raise ValueError("session_duration_minutes must be 1..45")
+            ab.session_duration_minutes = val
+        if "daily_action_limit" in patch and patch["daily_action_limit"] is not None:
+            val = int(patch["daily_action_limit"])
+            if val <= 0 or val > 1000:
+                raise ValueError("daily_action_limit must be 1..1000")
+            if val > 200:
+                raise ValueError("daily_action_limit above ceiling 200")
+            ab.daily_action_limit = val
+        if "daily_llm_call_limit" in patch and patch["daily_llm_call_limit"] is not None:
+            val = int(patch["daily_llm_call_limit"])
+            if val <= 0 or val > 1000:
+                raise ValueError("daily_llm_call_limit must be 1..1000")
+            if val > 150:
+                raise ValueError("daily_llm_call_limit above ceiling 150")
+            ab.daily_llm_call_limit = val
+        if "allowed_hours" in patch and patch["allowed_hours"] is not None:
+            ab.allowed_hours = str(patch["allowed_hours"])
+        if "allowlist" in patch and patch["allowlist"] is not None:
+            allowlist = patch["allowlist"]
+            if not isinstance(allowlist, list):
+                raise ValueError("allowlist must be list")
+            for site in allowlist:
+                if not _is_valid(site):
+                    raise ValueError(f"allowlist: invalid domain '{site}'")
+            ab.allowed_sites = [s.strip().lower() for s in allowlist]
+        if "deny_zones" in patch and patch["deny_zones"] is not None:
+            ab.deny_zones = list(patch["deny_zones"])
+        if "idle_threshold_seconds" in patch and patch["idle_threshold_seconds"] is not None:
+            val = int(patch["idle_threshold_seconds"])
+            if val < 60 or val > 7200:
+                raise ValueError("idle_threshold_seconds must be 60..7200")
+            cu.idle_threshold_seconds = val
+            cu.idle_threshold_minutes = max(1, min(120, (val + 59) // 60))
+        if "browser_consent" in patch and patch["browser_consent"] is not None:
+            granted = bool(patch["browser_consent"])
+            bc = _BC(main_profile_granted=granted, browser="chrome")
+            ab.browser_consent = bc
+            profile.browser_consent = bc
+        if "readonly" in patch and patch["readonly"] is not None:
+            config.readonly = bool(patch["readonly"])
+        if "require_idle" in patch and patch["require_idle"] is not None:
+            config.require_idle = bool(patch["require_idle"])
+
+        errs = _validate(profile)
+        if errs:
+            raise ValueError("; ".join(errs))
+
+        _save_profile(profile, data_dir / "profile.json")
+        config.save()
+        self.config = config
+        # Mirror browser consent to both stores (profile already set; this ensures config mirror and profile alias stay in sync).
+        if "browser_consent" in patch and patch["browser_consent"] is not None:
+            try:
+                from .browser_consent import record_consent as _record
+
+                _record(data_dir, bool(patch["browser_consent"]))
+                # record_consent rewrites config.json and profile.json; reload config to keep in sync
+                try:
+                    self.config = _Cfg.load(data_dir)
+                    config = self.config
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Compute effective the same way as get_owner_settings (tighten-only).
+        eff = {
+            "session_duration_minutes": min(int(ab.session_duration_minutes), 45),
+            "daily_action_limit": min(int(ab.daily_action_limit), 200),
+            "daily_llm_call_limit": min(int(ab.daily_llm_call_limit), 150),
+            "idle_threshold_seconds": int(cu.idle_threshold_seconds),
+        }
+        return {
+            "profile": profile.model_dump(),
+            "config": config.to_dict(),
+            "effective": eff,
+        }
+
     def get_status(self) -> dict:
         """Status view: agent state, idle time, active task, last action, current site/app, limit usage, stop command."""
         # Active task: most recent
@@ -592,6 +901,375 @@ class IdleCua:
             "max_actions": self.config.max_actions,
             "max_duration_minutes": self.config.max_duration_minutes,
             "stop_command": "idle-cua kill  |  idle-cua stop  |  Ctrl-C (SIGINT)",
+        }
+
+    def is_demo_mode(self) -> bool:
+        """Demo badge decision — True when no provider key is configured.
+
+        Reuses ProviderStore + Keychain + env fallback (same as server's
+        _is_demo_mode). Stub output must never be presented as LLM work.
+        Secrets are masked reads only, never leaked.
+        """
+        try:
+            from .keychain import get_default_store
+            from .providers.config import ProviderStore
+
+            store = ProviderStore.load(self.config.data_dir)
+            selected = store.get_selected()
+            if selected is None:
+                return True
+            kc = get_default_store(self.config.data_dir)
+            key = kc.get(selected.name)
+            if not key:
+                import os
+
+                env_map = {
+                    "openrouter": "OPENROUTER_API_KEY",
+                    "opencode-go": "OPENCODE_GO_API_KEY",
+                }
+                env_var = env_map.get(selected.name) or f"{selected.name.upper().replace('-', '_')}_API_KEY"
+                key = os.environ.get(env_var) or os.environ.get("OPENAI_API_KEY")
+            return not bool(key)
+        except Exception:
+            return True
+
+    def get_honest_status(self, watch_running: bool | None = None, idle_seconds: float | None = None) -> dict:
+        """Single status source driving banner, header chip, and hero (T2).
+
+        Precedence: running session → Limited mode (no provider) → Waiting for idle → Ready.
+        Uses self.get_effective_idle_threshold(), self.is_demo_mode(), memory, idle_detector.
+        watch_running is observed live state (never owned by app).
+        """
+        threshold = self.get_effective_idle_threshold()
+        # Check for running session via memory active task
+        try:
+            tasks = self.memory.list_tasks(limit=5)
+            active = None
+            for t in tasks:
+                if t.get("state") in ("running", "planning", "waiting_for_idle", "paused_by_user"):
+                    active = t
+                    break
+            if active and active.get("state") in ("running", "planning"):
+                goal = active.get("description", "")[:50]
+                return {
+                    "text": f"Running — {goal}",
+                    "sub": "Session in progress",
+                    "level": "running",
+                    "dot": "bg-blue-500",
+                    "banner_text": f"Running — {goal}",
+                    "chip_text": "running",
+                    "hero_title": f"Running — {goal}",
+                    "hero_sub": "Session in progress — see inspector",
+                }
+        except Exception:
+            pass
+
+        demo = self.is_demo_mode()
+        if demo:
+            try:
+                demo_idle = float(idle_seconds) if idle_seconds is not None else float(self.idle_detector.seconds_since_last_input())
+            except Exception:
+                demo_idle = float(idle_seconds or 0)
+            return {
+                "text": "Limited mode — stub planner · LLM off",
+                "sub": "Sessions run on stub planner · LLM disabled",
+                "level": "limited",
+                "dot": "bg-amber-400",
+                "banner_text": "Limited mode — stub planner · LLM off",
+                "chip_text": "Limited mode",
+                "hero_title": "Limited mode — stub planner",
+                "hero_sub": f"Idle {demo_idle:.0f}s / {threshold}s · LLM off · threshold {threshold}s",
+            }
+
+        try:
+            secs = float(idle_seconds) if idle_seconds is not None else float(self.idle_detector.seconds_since_last_input())
+        except Exception:
+            secs = float(idle_seconds or 0)
+
+        if secs < threshold:
+            remaining = threshold - secs
+            mins = int(remaining // 60)
+            secs_r = int(remaining % 60)
+            countdown = f"{mins}m {secs_r}s" if mins else f"{secs_r}s"
+            return {
+                "text": f"Waiting for idle {secs:.0f}s / {threshold}s",
+                "sub": f"Starts when you stay idle · {countdown} remaining",
+                "level": "waiting",
+                "dot": "bg-amber-400",
+                "banner_text": f"Waiting for idle {secs:.0f}s / {threshold}s",
+                "chip_text": "Waiting for idle",
+                "hero_title": "Waiting for idle",
+                "hero_sub": f"Idle {secs:.0f}s / {threshold}s · threshold {threshold}s · Watch loop {'Running' if watch_running else 'Stopped'}",
+            }
+
+        return {
+            "text": "Ready — idle threshold met",
+            "sub": "Agent will start at next idle window",
+            "level": "ready",
+            "dot": "bg-emerald-500",
+            "banner_text": "Ready — idle threshold met",
+            "chip_text": "Ready",
+            "hero_title": "Ready — idle threshold met",
+            "hero_sub": f"Idle {secs:.0f}s / {threshold}s · Next session when idle window holds",
+        }
+
+    def get_status_enriched(self, watch_loop: dict | None = None) -> dict:
+        """Enriched status behind the Application API (T2).
+
+        Extends get_status() with idle_threshold_seconds, demo_mode,
+        honest_status, watch_loop passthrough, limits, daily_usage/today_usage
+        duplicates, last_report. Does NOT change existing get_status() keys;
+        callers format the returned data.
+        watch_loop is observed live state (never owned by app).
+        """
+        base = self.get_status()
+        threshold = self.get_effective_idle_threshold()
+        demo = self.is_demo_mode()
+        # Derive watch_running for honest_status
+        watch_running = None
+        if isinstance(watch_loop, dict):
+            watch_running = bool(watch_loop.get("running"))
+        elif isinstance(watch_loop, bool):
+            watch_running = bool(watch_loop)
+        honest = self.get_honest_status(watch_running=watch_running, idle_seconds=base.get("idle_seconds"))
+        from .accounting import get_today_count
+
+        try:
+            llm_today = int(get_today_count(self.config.data_dir))
+        except Exception:
+            llm_today = int(base.get("llm_calls_today", 0) or 0)
+        max_actions = int(getattr(self.config, "max_actions", 200))
+        max_duration = int(getattr(self.config, "max_duration_minutes", 45))
+        max_llm = int(getattr(self.config, "max_llm_calls_per_day", 150))
+        limits = {
+            "actions_used_today": None,
+            "max_actions": max_actions,
+            "max_duration_minutes": max_duration,
+            "llm_calls_today": llm_today,
+            "max_llm_calls_per_day": max_llm,
+        }
+        daily_usage = {
+            "actions": {"used": 0, "limit": max_actions},
+            "llm_calls": {"used": llm_today, "limit": max_llm},
+            "duration": {"used": 0, "limit": max_duration},
+        }
+        today_usage = {
+            "actions": {"used": 0, "limit": max_actions},
+            "llm_calls": {"used": llm_today, "limit": max_llm},
+            "duration": {"used": 0, "limit": max_duration},
+        }
+        last_report = None
+        try:
+            reports = self.list_reports(limit=1)
+            if reports:
+                last_report = reports[0]
+        except Exception:
+            pass
+        enriched = dict(base)
+        enriched.update(
+            {
+                "idle_threshold_seconds": threshold,
+                "demo_mode": demo,
+                "honest_status": honest,
+                "watch_loop": watch_loop,
+                "limits": limits,
+                "daily_usage": daily_usage,
+                "today_usage": today_usage,
+                "last_report": last_report,
+            }
+        )
+        return enriched
+
+    def get_diagnostics(
+        self,
+        project_root: Path | str | None = None,
+        watch_loop: dict | None = None,
+        include_watch: dict | bool | None = None,
+    ) -> dict:
+        """Diagnostics decision bundle behind the Application API (T4).
+
+        Single source for: macOS Permissions checks, ComputerDriver probe,
+        Profile validity, secrets scan, scheduler lock, watch loop observed
+        state, plus effective threshold/limits for context.
+
+        Callers (CLI doctor, HTTP diagnostics) only render; they do not
+        re-implement decisions. Secrets are masked (no snippet, source+pattern
+        only). Profile validity uses T3 settings authority
+        (check_profile_confirmed / validate_profile). Imports inside method
+        to avoid cycles and hard driver dep.
+        """
+        # Normalize watch_loop param (support include_watch as alias).
+        if watch_loop is None and isinstance(include_watch, dict):
+            watch_loop = include_watch
+
+        # Effective threshold/limits for context (tighten-only via T3).
+        try:
+            effective_threshold = int(self.get_effective_idle_threshold())
+        except Exception:
+            effective_threshold = int(getattr(self.config, "idle_threshold_seconds", 600))
+        try:
+            owner = self.get_owner_settings()
+            effective_limits = owner.get("effective", {})
+        except Exception:
+            effective_limits = {
+                "session_duration_minutes": 45,
+                "daily_action_limit": 200,
+                "daily_llm_call_limit": 150,
+                "idle_threshold_seconds": effective_threshold,
+            }
+
+        # Permissions (remediation identical on both surfaces).
+        try:
+            from .profile.permissions import check_permissions
+
+            perms = check_permissions()
+            perms_data = [
+                {"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms
+            ]
+        except Exception as e:
+            perms_data = [
+                {"name": "permissions_check", "granted": None, "remediation": f"check failed: {e}"}
+            ]
+
+        # Driver probe (avoid hard dep on cua_driver).
+        driver_ok = False
+        driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
+        try:
+            import cua_driver  # type: ignore
+
+            ver = getattr(cua_driver, "__version__", "unknown")
+            driver_ok = True
+            driver_msg = f"cua-driver {ver}"
+            try:
+                status = cua_driver.current_mac_os_permission_status()
+                acc = getattr(status, "accessibility", "?")
+                scr = getattr(status, "screen_recording", "?")
+                driver_msg += f" — accessibility={acc} screen_recording={scr}"
+            except Exception as e:
+                driver_msg += f" — probe failed: {e}"
+        except (ImportError, ModuleNotFoundError):
+            driver_ok = False
+            driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
+        except Exception as e:
+            driver_ok = False
+            driver_msg = f"cua-driver probe failed: {e}"
+
+        # Profile validity via T3 authority (check_profile_confirmed + validate_profile).
+        try:
+            from .profile.validate import validate_profile
+
+            profile = self.get_profile()
+            if profile is None:
+                profile_valid = False
+                profile_confirmed = False
+                profile_errors = ["No profile found"]
+            else:
+                errs = validate_profile(profile)
+                profile_confirmed = bool(getattr(profile, "confirmed", False))
+                if not profile_confirmed:
+                    profile_valid = False
+                    profile_errors = list(errs) + ["Profile is unconfirmed"]
+                else:
+                    profile_valid = len(errs) == 0
+                    profile_errors = list(errs)
+        except Exception as e:
+            profile_valid = False
+            profile_confirmed = False
+            profile_errors = [f"profile check failed: {e}"]
+
+        # Secrets scan (masked, never leak snippet or key).
+        try:
+            from .secrets_scan import scan_project
+
+            if project_root is None:
+                # Auto-detect repo root (same logic CLI/server used before).
+                candidates = [Path.cwd(), Path(__file__).resolve().parents[2]]
+                detected = None
+                for cand in candidates:
+                    try:
+                        if (cand / ".git").exists():
+                            detected = cand
+                            break
+                        if (cand / "pyproject.toml").exists() and (cand / "src").exists():
+                            if detected is None:
+                                detected = cand
+                    except Exception:
+                        continue
+                if detected is None:
+                    detected = Path(__file__).resolve().parents[2]
+                proj_root = detected
+            else:
+                proj_root = Path(project_root).expanduser().resolve()
+            scan = scan_project(project_root=proj_root, data_dir=self.config.data_dir)
+            secrets_ok = bool(scan.ok)
+            # Masked: only source + pattern, truncated to contract limit (first 5).
+            secrets_findings = [
+                {"source": f.source, "pattern": f.pattern} for f in scan.findings[:5]
+            ]
+            # Keep counts for CLI detailed report without leaking.
+            secrets_scanned_files = int(getattr(scan, "scanned_files", 0))
+            secrets_scanned_tables = int(getattr(scan, "scanned_db_tables", 0))
+        except Exception as e:
+            secrets_ok = False
+            secrets_findings = [{"source": "scan_failed", "pattern": str(e)}]
+            secrets_scanned_files = 0
+            secrets_scanned_tables = 0
+
+        # Scheduler lock (import inside to avoid cycle).
+        try:
+            from .server.lock import get_lock_info, is_locked
+
+            lock_info = get_lock_info(self.config.data_dir)
+            locked = bool(is_locked(self.config.data_dir))
+        except Exception:
+            lock_info = None
+            locked = False
+            # Fallback direct file check without import.
+            try:
+                import json as _json
+
+                p = Path(self.config.data_dir) / ".scheduler.lock"
+                if p.exists():
+                    lock_info = _json.loads(p.read_text(encoding="utf-8"))
+                    # Consider locked if file exists; liveness check skipped in fallback.
+                    locked = True
+                else:
+                    lock_info = None
+                    locked = False
+            except Exception:
+                lock_info = None
+                locked = False
+
+        # Watch loop observed state (never owned by app; passed in or default).
+        if isinstance(watch_loop, dict):
+            watch = dict(watch_loop)
+            if "idle_threshold" not in watch:
+                watch["idle_threshold"] = effective_threshold
+            for k in ("running", "pid", "started_at", "idle_threshold"):
+                if k not in watch:
+                    watch[k] = None if k != "running" else False
+        else:
+            watch = {
+                "running": False,
+                "pid": lock_info.get("pid") if isinstance(lock_info, dict) else None,
+                "started_at": None,
+                "idle_threshold": effective_threshold,
+            }
+
+        return {
+            "permissions": perms_data,
+            "driver": {"ok": driver_ok, "message": driver_msg},
+            "profile": {"valid": profile_valid, "confirmed": profile_confirmed, "errors": profile_errors},
+            "secrets_scan": {
+                "ok": secrets_ok,
+                "findings": secrets_findings,
+                "scanned_files": secrets_scanned_files,
+                "scanned_db_tables": secrets_scanned_tables,
+            },
+            "scheduler_lock": {"locked": locked, "info": lock_info},
+            "watch_loop": watch,
+            "effective_idle_threshold": effective_threshold,
+            "effective_limits": effective_limits,
         }
 
     # -- config persistence helpers (used by CLI init) --
@@ -645,13 +1323,7 @@ class IdleCua:
                 poll_interval=poll_interval, timeout=timeout, threshold_override=idle_threshold_override
             )
             if not ok:
-                try:
-                    from .profile.models import get_effective_idle_threshold_seconds
-
-                    _p_eff = self.get_profile()
-                    _thr_msg = idle_threshold_override if idle_threshold_override is not None else get_effective_idle_threshold_seconds(_p_eff, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-                except Exception:
-                    _thr_msg = idle_threshold_override or getattr(self.config, "idle_threshold_seconds", 600)
+                _thr_msg = int(idle_threshold_override) if idle_threshold_override is not None else self.get_effective_idle_threshold()
                 raise RuntimeError(f"Timed out waiting for idle (threshold {_thr_msg}s)")
         ok, reason = scheduler.can_start(threshold_override=idle_threshold_override)
         if not ok:

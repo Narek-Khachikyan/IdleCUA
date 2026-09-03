@@ -135,6 +135,77 @@ def edit(
         return
 
     if field:
+        # T3: owner-settings fields delegate to Application API so CLI and HTTP share
+        # identical validation (same accept/reject, same message text). No silent
+        # save of invalid values; ValueError from app.update_owner_settings is
+        # surfaced as `Validation failed: ...` with exit 1, byte-identical to HTTP 400.
+        _patch = {}
+        _is_settings_patch = True
+        for f in field:
+            if "=" not in f:
+                _is_settings_patch = False
+                break
+            dotted, value = f.split("=", 1)
+            if dotted == "autonomy_boundaries.session_duration_minutes":
+                try:
+                    _patch["session_duration_minutes"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.daily_action_limit":
+                try:
+                    _patch["daily_action_limit"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.daily_llm_call_limit":
+                try:
+                    _patch["daily_llm_call_limit"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "autonomy_boundaries.allowed_hours":
+                _patch["allowed_hours"] = value
+            elif dotted in ("autonomy_boundaries.allowed_sites", "autonomy_boundaries.allowlist"):
+                _patch["allowlist"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
+            elif dotted == "autonomy_boundaries.deny_zones":
+                _patch["deny_zones"] = [s.strip() for s in value.split(",") if s.strip()] if value.strip() else []
+            elif dotted in ("computer_usage.idle_threshold_seconds", "autonomy_boundaries.idle_threshold_seconds"):
+                try:
+                    _patch["idle_threshold_seconds"] = int(value)
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted == "computer_usage.idle_threshold_minutes":
+                try:
+                    _patch["idle_threshold_seconds"] = int(value) * 60
+                except ValueError:
+                    console.print(f"[red]Field {dotted} expects integer, got '{value}'[/red]")
+                    raise typer.Exit(1)
+            elif dotted in (
+                "autonomy_boundaries.browser_consent.main_profile_granted",
+                "browser_consent.main_profile_granted",
+            ):
+                _patch["browser_consent"] = value.lower() in ("true", "1", "yes", "y")
+            elif dotted in ("readonly", "config.readonly"):
+                _patch["readonly"] = value.lower() in ("true", "1", "yes", "y")
+            elif dotted in ("require_idle", "config.require_idle"):
+                _patch["require_idle"] = value.lower() in ("true", "1", "yes", "y")
+            else:
+                _is_settings_patch = False
+                break
+        if _is_settings_patch:
+            from .app import IdleCua as _IdleCua
+
+            _app = _IdleCua(config=IdleCuaConfig.load(resolved))
+            try:
+                _app.update_owner_settings(_patch)
+                console.print(f"[green]Profile updated ({len(field)} field(s)) -> {ppath}[/green]")
+                return
+            except ValueError as ve:
+                console.print(f"[red]Validation failed: {ve}[/red]")
+                raise typer.Exit(1)
+
         data = profile.to_dict()
         for f in field:
             if "=" not in f:
@@ -284,22 +355,59 @@ def grant_browser(
     if profile is None:
         console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
         raise typer.Exit(1)
-    bc = BrowserConsent(
-        main_profile_granted=True,
-        granted_at=datetime.now(timezone.utc).isoformat(),
-        browser=browser.lower().strip() or "chrome",
-        grant_method="cli grant-browser",
-    )
-    profile.autonomy_boundaries.browser_consent = bc
-    profile.browser_consent = bc
-    profile.touch()
-    save_profile(profile, ppath)
-    # Mirror to config.json for "profile/config" requirement
+    # T3: delegate through Application API so CLI and HTTP share the same consent path.
+    # We preserve the CLI's richer granted_at/browser metadata after the app call.
     try:
-        cfg = IdleCuaConfig.load(resolved)
-        cfg.record_browser_consent(True, browser=bc.browser, granted_at=bc.granted_at)
+        from .app import IdleCua as _IdleCua
+
+        _app = _IdleCua(config=IdleCuaConfig.load(resolved))
+        _app.update_owner_settings({"browser_consent": True})
+        # Re-load to add granted_at/method without diverging from app's single authority.
+        _profile2 = load_profile(ppath)
+        if _profile2 is not None:
+            bc2 = BrowserConsent(
+                main_profile_granted=True,
+                granted_at=datetime.now(timezone.utc).isoformat(),
+                browser=browser.lower().strip() or "chrome",
+                grant_method="cli grant-browser",
+            )
+            _profile2.autonomy_boundaries.browser_consent = bc2
+            _profile2.browser_consent = bc2
+            _profile2.touch()
+            save_profile(_profile2, ppath)
+            try:
+                cfg = IdleCuaConfig.load(resolved)
+                cfg.record_browser_consent(True, browser=bc2.browser, granted_at=bc2.granted_at)
+            except Exception:
+                pass
+            bc = bc2
+        else:
+            bc = BrowserConsent(
+                main_profile_granted=True,
+                granted_at=datetime.now(timezone.utc).isoformat(),
+                browser=browser.lower().strip() or "chrome",
+                grant_method="cli grant-browser",
+            )
+    except ValueError as ve:
+        console.print(f"[red]Validation failed: {ve}[/red]")
+        raise typer.Exit(1)
     except Exception:
-        pass
+        # Fallback to direct save if app path fails for any other reason.
+        bc = BrowserConsent(
+            main_profile_granted=True,
+            granted_at=datetime.now(timezone.utc).isoformat(),
+            browser=browser.lower().strip() or "chrome",
+            grant_method="cli grant-browser",
+        )
+        profile.autonomy_boundaries.browser_consent = bc
+        profile.browser_consent = bc
+        profile.touch()
+        save_profile(profile, ppath)
+        try:
+            cfg = IdleCuaConfig.load(resolved)
+            cfg.record_browser_consent(True, browser=bc.browser, granted_at=bc.granted_at)
+        except Exception:
+            pass
     console.print(f"[green]Browser main-profile consent GRANTED for {bc.browser} — recorded at {ppath} + config.json[/green]")
     console.print("[dim]Driver grant still required for existing-profile attachment:[/dim]")
     console.print("[dim]  cua-driver serve --grant existing-profile  (Watch loop process)  or  --grant existing-profile on mcp/embedded launch[/dim]")
@@ -320,16 +428,27 @@ def revoke_browser(
     if profile is None:
         console.print(f"[red]No profile found at {ppath}. Run `idle-cua profile interview` first.[/red]")
         raise typer.Exit(1)
-    bc = BrowserConsent(main_profile_granted=False)
-    profile.autonomy_boundaries.browser_consent = bc
-    profile.browser_consent = bc
-    profile.touch()
-    save_profile(profile, ppath)
+    # T3: delegate through Application API for parity.
     try:
-        cfg = IdleCuaConfig.load(resolved)
-        cfg.record_browser_consent(False, browser="chrome", granted_at=None)
+        from .app import IdleCua as _IdleCua
+
+        _app = _IdleCua(config=IdleCuaConfig.load(resolved))
+        _app.update_owner_settings({"browser_consent": False})
+    except ValueError as ve:
+        console.print(f"[red]Validation failed: {ve}[/red]")
+        raise typer.Exit(1)
     except Exception:
-        pass
+        # Fallback direct (keeps output identical if app path unavailable)
+        bc = BrowserConsent(main_profile_granted=False)
+        profile.autonomy_boundaries.browser_consent = bc
+        profile.browser_consent = bc
+        profile.touch()
+        save_profile(profile, ppath)
+        try:
+            cfg = IdleCuaConfig.load(resolved)
+            cfg.record_browser_consent(False, browser="chrome", granted_at=None)
+        except Exception:
+            pass
     console.print(f"[yellow]Browser main-profile consent REVOKED — recorded at {ppath} + config.json[/yellow]")
 
 

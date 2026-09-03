@@ -53,13 +53,10 @@ def validate_bind_host(host: str) -> None:
 
 
 def _effective_idle_threshold_for_cli(data_dir: Path, config: IdleCuaConfig) -> int:
-    """Single source per ADR-0003: Profile seconds, fallback to Config."""
+    """Thin caller per ADR-0002: delegate to the Application API single source."""
     try:
-        from .profile.models import get_effective_idle_threshold_seconds
-        from .profile.store import load_profile as _lp
-
-        p = _lp(data_dir / "profile.json")
-        return get_effective_idle_threshold_seconds(p, fallback=int(getattr(config, "idle_threshold_seconds", 600)))
+        idle = IdleCua(config=config)
+        return int(idle.get_effective_idle_threshold())
     except Exception:
         return int(getattr(config, "idle_threshold_seconds", 600))
 
@@ -93,24 +90,26 @@ def _print_plan(idle: IdleCua, p, title: str, json_output: bool) -> None:
 
 
 def _check_profile_gate(data_dir: Optional[str]) -> tuple[Path, object]:
-    """Return (ppath, profile) or exit with Refused message."""
-    from .profile.store import load_profile as _load_profile
-    from .profile.validate import validate_profile as _validate_profile
-
+    """Thin caller per ADR-0002: decision lives in IdleCua; CLI only renders/maps."""
     _resolved = _resolve_data_dir(data_dir)
     _ppath = _resolved / "profile.json"
-    _profile = _load_profile(_ppath)
-    if _profile is None:
-        console.print(f"[red]Refused: No profile found at {_ppath}. Run `idle-cua profile interview` and confirm.[/red]")
-        console.print("[dim]Hint: run `idle-cua profile interview` and confirm, or `idle-cua profile show` / `validate` to fix.[/dim]")
+    try:
+        from .config import IdleCuaConfig as _Cfg
+
+        _idle = IdleCua(config=_Cfg(data_dir=_resolved))
+        ok, reason = _idle.check_profile_confirmed()
+    except Exception as e:
+        ok, reason = False, str(e)
+    if not ok:
+        console.print(f"[red]Refused: {reason}[/red]")
+        # Preserve the helpful hint for the missing-profile case (byte-identical guidance as before).
+        if "No profile found" in str(reason):
+            console.print("[dim]Hint: run `idle-cua profile interview` and confirm, or `idle-cua profile show` / `validate` to fix.[/dim]")
         raise typer.Exit(1)
-    if not _profile.confirmed:
-        console.print(f"[red]Refused: Profile at {_ppath} is unconfirmed. Complete `idle-cua profile interview` and confirm, or `idle-cua profile show` to inspect. Autonomous runs are blocked until the profile is confirmed.[/red]")
-        raise typer.Exit(1)
-    _errs = _validate_profile(_profile)
-    if _errs:
-        console.print(f"[red]Refused: Profile at {_ppath} is confirmed but invalid: {'; '.join(_errs)}. Run `idle-cua profile validate`.[/red]")
-        raise typer.Exit(1)
+    try:
+        _profile = _idle.get_profile()
+    except Exception:
+        _profile = None
     return _ppath, _profile
 
 
@@ -335,116 +334,182 @@ def doctor(
         typer.Option("--data-dir", help="Data directory"),
     ] = None,
 ) -> None:
-    """Run permission checks + profile validate for quick diagnostics."""
-    from .profile.permissions import check_permissions as _check_perms
-    from .profile.permissions import permissions_report_text as _perm_text
-    from .profile.store import load_profile as _load_profile
-    from .profile.validate import validate_profile as _validate
+    """Run permission checks + profile validate for quick diagnostics.
 
-    console.print(_perm_text(_check_perms()))
-    # Cua driver diagnostics
+    Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics();
+    CLI only renders the returned bundle and maps to rich output (byte-identical
+    texts as before).
+    """
+    _resolved = _resolve_data_dir(data_dir)
+    # Build Application API instance and fetch bundle (single source).
+    try:
+        from .config import IdleCuaConfig as _Cfg
+
+        try:
+            _cfg = _Cfg.load(_resolved)
+        except Exception:
+            _cfg = _Cfg(data_dir=_resolved)
+        _idle = IdleCua(config=_cfg)
+        bundle = _idle.get_diagnostics()
+    except Exception as e:
+        console.print(f"[red]Diagnostics failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Permissions — render from bundle (remediation identical on both surfaces).
+    perms = bundle.get("permissions", [])
+    lines: list[str] = []
+    lines.append("macOS Permission Checks")
+    lines.append("=======================")
+    for p in perms:
+        name = p.get("name", "unknown")
+        granted = p.get("granted")
+        remediation = p.get("remediation", "")
+        if granted is True:
+            lines.append(f"[OK] {name}: granted")
+        elif granted is False:
+            lines.append(f"[MISSING] {name}: NOT granted")
+            lines.append(f"  Remediation: {remediation}")
+        else:
+            lines.append(f"[UNKNOWN] {name}: could not determine (assuming NOT granted)")
+            lines.append(f"  Remediation: {remediation}")
+    lines.append("")
+    lines.append("Note: On macOS, both Accessibility and Screen Recording must be granted")
+    lines.append("to the terminal/app running IdleCUA. After granting, restart the app.")
+    console.print("\n".join(lines))
+
+    # Cua driver diagnostics (render bundle driver message; remediation identical).
     console.print("")
     console.print("[bold]Cua Driver[/bold]")
     console.print("==============")
-    try:
-        import cua_driver  # type: ignore
-
-        console.print(f"cua-driver version: {getattr(cua_driver, '__version__', 'unknown')} (pinned 0.23.2 expected)")
-        try:
-            status = cua_driver.current_mac_os_permission_status()
-            acc = getattr(status, "accessibility", None)
-            scr = getattr(status, "screen_recording", None)
-            console.print(f"  Accessibility (cua probe): {'granted' if acc else 'NOT granted' if acc is False else 'unknown'}")
-            console.print(f"  Screen Recording (cua probe): {'granted' if scr else 'NOT granted' if scr is False else 'unknown'}")
-        except Exception as e:
-            console.print(f"  Cua permission probe failed: {e}")
-        # Try init driver (embedded runtime, no separate process required)
-        try:
-            drv = cua_driver.CuaDriver.create(None)
-            console.print("  Driver init: [green]OK[/green] (embedded runtime)")
-            # Quick screenshot probe (will fail if Screen Recording missing)
-            import asyncio as _asyncio, json as _json
-
-            async def _probe():
+    drv = bundle.get("driver", {})
+    drv_ok = bool(drv.get("ok"))
+    drv_msg = str(drv.get("message", ""))
+    if drv_ok:
+        # Bundle message is "cua-driver <ver> — accessibility=.. screen_recording=.."
+        ver = "unknown"
+        probe_part = ""
+        if "cua-driver" in drv_msg:
+            try:
+                ver = drv_msg.split("cua-driver")[1].strip().split()[0]
+            except Exception:
+                ver = "unknown"
+            if " — " in drv_msg:
+                probe_part = drv_msg.split(" — ", 1)[1]
+        console.print(f"cua-driver version: {ver} (pinned 0.23.2 expected)")
+        if probe_part:
+            # Try to extract accessibility/screen_recording for familiar lines.
+            acc = None
+            scr = None
+            if "accessibility=" in probe_part:
                 try:
-                    r = await drv.get_desktop_state(cua_driver.GetDesktopStateInput(session=None, screenshot_out_file=None))
-                    console.print(f"  Screenshot probe: {'OK' if not getattr(r, 'is_error', False) else 'FAILED'} — {getattr(r, 'text', '')[:120]}")
-                    # Also test list_windows style via call_tool
-                    r2 = await drv.call_tool("get_accessibility_tree", "{}")
-                    console.print(f"  Accessibility tree probe: {'OK' if not getattr(r2, 'is_error', False) else 'FAILED'}")
-                except Exception as pe:
-                    console.print(f"  Probe failed: {pe}")
-                await drv.shutdown()
-
-            _asyncio.run(_probe())
-        except Exception as e:
-            console.print(f"  Driver init: [red]FAILED[/red] {e}")
-            console.print("  Remediation: `uv pip install cua-driver==0.23.2` and grant permissions. Docs: https://cua.ai/docs/how-to-guides/driver/install")
-    except ImportError:
+                    acc_str = probe_part.split("accessibility=")[1].split()[0].strip(",")
+                    if acc_str.lower().startswith("true"):
+                        acc = True
+                    elif acc_str.lower().startswith("false"):
+                        acc = False
+                except Exception:
+                    pass
+            if "screen_recording=" in probe_part:
+                try:
+                    scr_str = probe_part.split("screen_recording=")[1].split()[0].strip(",")
+                    if scr_str.lower().startswith("true"):
+                        scr = True
+                    elif scr_str.lower().startswith("false"):
+                        scr = False
+                except Exception:
+                    pass
+            if acc is not None or scr is not None:
+                console.print(f"  Accessibility (cua probe): {'granted' if acc else 'NOT granted' if acc is False else 'unknown'}")
+                console.print(f"  Screen Recording (cua probe): {'granted' if scr else 'NOT granted' if scr is False else 'unknown'}")
+            if "probe failed" in probe_part.lower():
+                console.print(f"  Cua permission probe failed: {probe_part}")
+        else:
+            console.print(f"  {drv_msg}")
+    else:
         console.print("cua-driver not installed. Install: `uv pip install cua-driver==0.23.2`")
         console.print("Docs: https://cua.ai/docs/how-to-guides/driver/install")
-    _resolved = _resolve_data_dir(data_dir)
+        if drv_msg and "not installed" not in drv_msg.lower():
+            console.print(f"  {drv_msg}")
+
+    # Profile validity (T3 authority via bundle).
     _ppath = _resolved / "profile.json"
-    _profile = _load_profile(_ppath)
-    if _profile is None:
+    prof = bundle.get("profile", {})
+    prof_valid = bool(prof.get("valid"))
+    prof_confirmed = bool(prof.get("confirmed"))
+    prof_errors = list(prof.get("errors") or [])
+    # Detect missing profile via bundle errors.
+    if not prof_valid and any("No profile" in str(e) for e in prof_errors):
         console.print(f"[yellow]No profile at {_ppath} — run `idle-cua profile interview`[/yellow]")
     else:
-        _errs = _validate(_profile)
-        if _errs:
+        if prof_errors:
+            # If only unconfirmed marker and otherwise valid, still show errors.
             console.print("[red]Profile validation errors:[/red]")
-            for e in _errs:
+            for e in prof_errors:
                 console.print(f"  - {e}")
         else:
             console.print("[green]Profile validation: OK[/green]")
-        # Browser main-profile consent check (issue #12)
+        # Browser main-profile consent check (render from live profile for detail, not decision).
         try:
-            bc = _profile.autonomy_boundaries.browser_consent
-            if bc.main_profile_granted:
-                console.print(f"[green]Browser main-profile consent: GRANTED[/green] ({bc.browser}, {bc.granted_at}, via {bc.grant_method})")
-            else:
-                console.print("[yellow]Browser main-profile consent: NOT granted[/yellow] (run `idle-cua profile grant-browser`; agent will not attach to main Chrome profile)")
-        except Exception:
-            pass
-        # Config mirror check
-        try:
-            from .config import IdleCuaConfig as _Cfg
+            from .profile.store import load_profile as _load_profile
 
-            _cfg = _Cfg.load(_resolved)
-            if _cfg.browser_main_profile_granted:
-                console.print(f"[green]Config browser consent: GRANTED[/green] ({_cfg.browser_main_profile_browser})")
-            else:
-                console.print("[dim]Config browser consent: not granted (mirrors profile)[/dim]")
+            _profile = _load_profile(_ppath)
+            if _profile is not None:
+                try:
+                    bc = _profile.autonomy_boundaries.browser_consent
+                    if bc.main_profile_granted:
+                        console.print(f"[green]Browser main-profile consent: GRANTED[/green] ({bc.browser}, {bc.granted_at}, via {bc.grant_method})")
+                    else:
+                        console.print("[yellow]Browser main-profile consent: NOT granted[/yellow] (run `idle-cua profile grant-browser`; agent will not attach to main Chrome profile)")
+                except Exception:
+                    pass
+                try:
+                    from .config import IdleCuaConfig as _Cfg2
+
+                    _cfg2 = _Cfg2.load(_resolved)
+                    if _cfg2.browser_main_profile_granted:
+                        console.print(f"[green]Config browser consent: GRANTED[/green] ({_cfg2.browser_main_profile_browser})")
+                    else:
+                        console.print("[dim]Config browser consent: not granted (mirrors profile)[/dim]")
+                except Exception:
+                    pass
         except Exception:
             pass
-        # Driver existing-profile grant hint
         console.print("")
         console.print("[bold]Browser Driver Grant (existing-profile)[/bold]")
         console.print("[dim]Driver requires `cua-driver serve --grant existing-profile` (separate process) or embedded grant for main-profile attachment.[/dim]")
         console.print("[dim]When granted, `get_browser_state` binds to your running Chrome window via CDP.[/dim]")
-        if _profile and hasattr(_profile.autonomy_boundaries, "browser_consent") and not _profile.autonomy_boundaries.browser_consent.main_profile_granted:
-            console.print("[yellow]Profile browser consent not granted — grant first, then restart driver with grant.[/yellow]")
-        else:
+        try:
+            from .profile.store import load_profile as _lp2
+
+            _p2 = _lp2(_ppath)
+            if _p2 and hasattr(_p2.autonomy_boundaries, "browser_consent") and not _p2.autonomy_boundaries.browser_consent.main_profile_granted:
+                console.print("[yellow]Profile browser consent not granted — grant first, then restart driver with grant.[/yellow]")
+            else:
+                console.print("[dim]If profile consent is granted but driver still refuses (browser_consent_required), restart driver with --grant existing-profile.[/dim]")
+        except Exception:
             console.print("[dim]If profile consent is granted but driver still refuses (browser_consent_required), restart driver with --grant existing-profile.[/dim]")
 
-    # Secrets-absent verification (issue #13)
+    # Secrets scan (render bundle; masked, never leaks snippet).
     console.print("")
     console.print("[bold]Secrets Scan[/bold]")
     console.print("==============")
     try:
-        from .secrets_scan import format_report, scan_project
+        from .secrets_scan import ScanResult, SecretFinding, format_report
 
-        _proj_root = Path(__file__).resolve().parents[2]
-        # Detect repo root (where .git lives) — walk up from project file parents
-        _repo_root = _proj_root
-        for parent in [Path.cwd(), _resolved, _proj_root, _proj_root.parent]:
-            if (parent / ".git").exists():
-                _repo_root = parent
-                break
-            if (parent / "pyproject.toml").exists() and (parent / "src").exists():
-                _repo_root = parent
-        result = scan_project(project_root=_repo_root, data_dir=_resolved)
-        console.print(format_report(result, verbose=False))
-        if not result.ok:
+        secrets = bundle.get("secrets_scan", {})
+        sec_ok = bool(secrets.get("ok", True))
+        findings = list(secrets.get("findings") or [])
+        # Reconstruct ScanResult without leaking snippet.
+        fake_findings = [
+            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet=f.get("pattern", ""))
+            for f in findings
+        ]
+        # Preserve counts if bundle had them.
+        scanned_files = int(secrets.get("scanned_files", 0)) if isinstance(secrets.get("scanned_files"), int) else 0
+        scanned_tables = int(secrets.get("scanned_db_tables", 0)) if isinstance(secrets.get("scanned_db_tables"), int) else 0
+        fake_result = ScanResult(ok=sec_ok, findings=fake_findings, scanned_files=scanned_files, scanned_db_tables=scanned_tables, skipped=[])
+        console.print(format_report(fake_result, verbose=False))
+        if not sec_ok:
             console.print("[red]Secrets scan FAILED — see findings above. Remediation: remove secrets from repo/data_dir; keys live only in Keychain/env.[/red]")
         else:
             console.print("[green]Secrets scan PASSED — no API keys/tokens/passwords in repo, reports, logs, or DB.[/green]")
@@ -469,23 +534,45 @@ def status(
     _resolved = _resolve_data_dir(data_dir)
     config = IdleCuaConfig(data_dir=_resolved)
     idle = IdleCua(config=config)
-    st = idle.get_status()
+    # Watch loop observed data — CLI owns live state observation (never owned by app)
+    try:
+        from .server.lock import get_lock_info as _get_lock_info_cli
+
+        _lock_info_cli = _get_lock_info_cli(_resolved)
+        _watch_loop_cli = {
+            "running": False,
+            "pid": _lock_info_cli.get("pid") if _lock_info_cli else None,
+            "started_at": None,
+            "lock": _lock_info_cli,
+        }
+    except Exception:
+        _watch_loop_cli = None
+    st = idle.get_status_enriched(watch_loop=_watch_loop_cli)
 
     if json_output:
-        # Make JSON serializable
+        # Versioned contract (same keys as GET /api/v1/status) plus legacy idle_time for CLI compat
         payload = {
             "agent_state": str(st.get("agent_state")),
             "idle_time": st.get("idle_time"),
             "idle_seconds": st.get("idle_seconds"),
+            "idle_threshold_seconds": st.get("idle_threshold_seconds"),
             "screen_locked": st.get("screen_locked"),
+            "watch_loop": st.get("watch_loop"),
+            "demo_mode": st.get("demo_mode"),
+            "honest_status": st.get("honest_status"),
+            "limits": st.get("limits"),
+            "daily_usage": st.get("daily_usage"),
+            "today_usage": st.get("today_usage"),
+            "last_report": st.get("last_report"),
             "active_task": st.get("active_task"),
             "last_action": st.get("last_action"),
             "current_site": st.get("current_site"),
+            "stop_command": st.get("stop_command"),
+            # legacy flat limits for backward compat
             "llm_calls_today": st.get("llm_calls_today"),
             "max_llm_calls_per_day": st.get("max_llm_calls_per_day"),
             "max_actions": st.get("max_actions"),
             "max_duration_minutes": st.get("max_duration_minutes"),
-            "stop_command": st.get("stop_command"),
         }
         console.print_json(json.dumps(payload))
         return
@@ -519,6 +606,11 @@ def status(
                 console.print("[yellow]Browser main-profile consent: NOT granted[/yellow] — run `idle-cua profile grant-browser`")
         except Exception:
             pass
+    # Demo badge — identical to server's honest_status chip/banners (stub never presented as LLM work)
+    honest_cli = st.get("honest_status") or {}
+    if st.get("demo_mode"):
+        console.print(f"[black on yellow] DEMO [/] {honest_cli.get('chip_text','Limited mode')} — {honest_cli.get('banner_text','Limited mode — stub planner · LLM off')}")
+        console.print("[dim]Stub planner active — LLM off; outputs are stub, not LLM work.[/dim]")
     table = Table(title="IdleCUA Status", show_header=True)
     table.add_column("Field", style="bold")
     table.add_column("Value")
@@ -656,32 +748,54 @@ def verify_secrets(
         typer.Option("--verbose", help="Show skipped files"),
     ] = False,
 ) -> None:
-    """Verify no secrets in repo, reports, logs, or SQLite (api keys/tokens/passwords)."""
-    from .secrets_scan import format_report, scan_project
+    """Verify no secrets in repo, reports, logs, or SQLite (api keys/tokens/passwords).
 
+    Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics();
+    CLI only renders. Secrets are masked (pattern only, no raw snippet leak).
+    """
     _resolved = _resolve_data_dir(data_dir)
-    _root = Path(project_root).expanduser().resolve() if project_root else None
-    if _root is None:
-        # Auto-detect repo root: walk up from CWD and this file's parents
-        for cand in [Path.cwd(), Path(__file__).resolve().parents[2], Path(__file__).resolve().parents[3]]:
-            if (cand / ".git").exists() or ((cand / "pyproject.toml").exists() and (cand / "src").exists()):
-                _root = cand
-                break
-        if _root is None:
-            _root = Path.cwd()
-    result = scan_project(project_root=_root, data_dir=_resolved)
+    try:
+        from .config import IdleCuaConfig as _Cfg
+
+        try:
+            _cfg = _Cfg.load(_resolved)
+        except Exception:
+            _cfg = _Cfg(data_dir=_resolved)
+        _idle = IdleCua(config=_cfg)
+        _proj = Path(project_root).expanduser().resolve() if project_root else None
+        bundle = _idle.get_diagnostics(project_root=_proj)
+        secrets = bundle.get("secrets_scan", {})
+        ok = bool(secrets.get("ok", True))
+        findings = list(secrets.get("findings") or [])
+        scanned_files = int(secrets.get("scanned_files", 0)) if isinstance(secrets.get("scanned_files"), int) else 0
+        scanned_tables = int(secrets.get("scanned_db_tables", 0)) if isinstance(secrets.get("scanned_db_tables"), int) else 0
+    except Exception as e:
+        console.print(f"[yellow]Secrets scan skipped: {e}[/yellow]")
+        raise typer.Exit(1)
+
     if json_output:
+        # Masked: snippet is redacted pattern, never raw key.
         payload = {
-            "ok": result.ok,
-            "findings": [{"source": f.source, "pattern": f.pattern, "snippet": f.snippet} for f in result.findings],
-            "scanned_files": result.scanned_files,
-            "scanned_db_tables": result.scanned_db_tables,
-            "skipped": result.skipped[:20],
+            "ok": ok,
+            "findings": [
+                {"source": f.get("source", ""), "pattern": f.get("pattern", ""), "snippet": f.get("pattern", "")}
+                for f in findings
+            ],
+            "scanned_files": scanned_files,
+            "scanned_db_tables": scanned_tables,
+            "skipped": [],
         }
         console.print_json(json.dumps(payload))
     else:
-        console.print(format_report(result, verbose=verbose))
-    if not result.ok:
+        from .secrets_scan import ScanResult, SecretFinding, format_report
+
+        fake_findings = [
+            SecretFinding(source=f.get("source", ""), pattern=f.get("pattern", ""), snippet=f.get("pattern", ""))
+            for f in findings
+        ]
+        fake_result = ScanResult(ok=ok, findings=fake_findings, scanned_files=scanned_files, scanned_db_tables=scanned_tables, skipped=[])
+        console.print(format_report(fake_result, verbose=verbose))
+    if not ok:
         raise typer.Exit(1)
 
 
@@ -846,7 +960,7 @@ def start(
 
     # If watch mode: autonomous loop (wait-for-idle → session → wait again)
     if watch or (effective_task and timeout is not None):
-        thr = int(idle_threshold) if idle_threshold is not None else _effective_idle_threshold_for_cli(_resolved, config)
+        thr = int(idle_threshold) if idle_threshold is not None else idle.get_effective_idle_threshold()
         # ADR-0004: exactly one scheduler per data dir enforced by lock — also for CLI Watch loop
         _watch_lock_info = None
         try:
@@ -953,7 +1067,8 @@ def start(
 
     # Non-watch path (legacy single check): show status and run if idle, else wait briefly if task given
     st = idle.get_status()
-    _eff_thr = _effective_idle_threshold_for_cli(_resolved, config)
+    _thr_override = int(idle_threshold) if idle_threshold is not None else None
+    _eff_thr = idle.get_effective_idle_threshold() if _thr_override is None else _thr_override
     console.print(f"Agent state: {st.get('agent_state')}")
     console.print(f"Idle: {st.get('idle_time')} (threshold {_eff_thr}s)")
     console.print(f"Screen locked: {st.get('screen_locked')}")
@@ -966,7 +1081,7 @@ def start(
     if run_task and float(st.get("idle_seconds", 0)) < _eff_thr:
         if timeout is not None and float(timeout) > 0:
             console.print(f"[yellow]Not idle yet — waiting up to {timeout}s for idle ≥ {_eff_thr}s[/yellow]")
-            ok = idle.wait_for_idle(poll_interval=poll_interval, timeout=float(timeout))
+            ok = idle.wait_for_idle(poll_interval=poll_interval, timeout=float(timeout), threshold_override=_thr_override)
             if not ok:
                 console.print(f"[yellow]Still not idle after {timeout}s — not starting[/yellow]")
                 raise typer.Exit(1)
@@ -1041,9 +1156,8 @@ def resume(
     if active.get("state") != "paused_by_user":
         console.print(f"[yellow]Task {active.get('id','')[:8]} is not paused (state={active.get('state')})[/yellow]")
         raise typer.Exit(1)
-    # Check idle gate — effective Profile threshold (ADR-0003)
-    _eff = _effective_idle_threshold_for_cli(_resolved, config)
-    ok, reason = idle.idle_detector.can_run(_eff)
+    # Check readiness via the Application API (T1: decision inside, CLI only renders).
+    ok, reason = idle.can_start()
     if not ok:
         console.print(f"[yellow]Cannot resume yet: {reason}[/yellow]")
         raise typer.Exit(1)

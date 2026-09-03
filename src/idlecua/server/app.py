@@ -82,15 +82,9 @@ def _resolve_data_dir(data_dir: Path | str | None = None) -> Path:
 
 
 def _get_effective_idle_threshold(data_dir: Path) -> int:
-    """Single source per ADR-0003: Profile idle_threshold_seconds, fallback to Config default."""
+    """Thin caller per ADR-0002: delegate to the Application API single source."""
     try:
-        from ..profile.models import get_effective_idle_threshold_seconds
-        from ..profile.store import load_profile as _lp_thr
-
-        p = _lp_thr(data_dir / "profile.json")
-        if p is not None:
-            # Use Profile's canonical effective value
-            return get_effective_idle_threshold_seconds(p, fallback=600)
+        return int(_get_idle_cua(data_dir).get_effective_idle_threshold())
     except Exception:
         pass
     try:
@@ -105,28 +99,19 @@ def _get_idle_cua(data_dir: Path | None = None) -> IdleCua:
     # Ensure data dir exists (auto-init)
     resolved.mkdir(parents=True, exist_ok=True)
     config = IdleCuaConfig.load(resolved)
-    # Keep scheduler_state threshold in sync with effective Profile threshold (ADR-0003 single source)
-    _scheduler_state["idle_threshold"] = _get_effective_idle_threshold(resolved)
+    # Keep scheduler_state threshold in sync with the Application API single source (ADR-0003).
+    try:
+        _thr = int(IdleCua(config=config).get_effective_idle_threshold())
+    except Exception:
+        _thr = int(getattr(config, "idle_threshold_seconds", 600))
+    _scheduler_state["idle_threshold"] = _thr
     return IdleCua(config=config)
 
 
 def _is_demo_mode(data_dir: Path) -> bool:
+    """Thin delegate to Application API — keep name/signature for backward compat."""
     try:
-        store = ProviderStore.load(data_dir)
-        selected = store.get_selected()
-        if selected is None:
-            return True
-        kc = get_default_store(data_dir)
-        key = kc.get(selected.name)
-        if not key:
-            # also check env fallbacks
-            env_map = {
-                "openrouter": "OPENROUTER_API_KEY",
-                "opencode-go": "OPENCODE_GO_API_KEY",
-            }
-            env_var = env_map.get(selected.name) or f"{selected.name.upper().replace('-', '_')}_API_KEY"
-            key = os.environ.get(env_var) or os.environ.get("OPENAI_API_KEY")
-        return not bool(key)
+        return _get_idle_cua(data_dir).is_demo_mode()
     except Exception:
         return True
 
@@ -152,38 +137,11 @@ def _fetch_history_filtered(idle_app: IdleCua, task_id: str | None, limit: int =
 
 
 def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_running: bool | None = None) -> dict:
-    """Single status source driving banner, header chip, and hero. No 'Blocked' for degraded.
-
-    Precedence: running session → Limited mode (no provider) → Waiting for idle → Ready
-    """
-    threshold = _get_effective_idle_threshold(data_dir)
-    # Check for running session via memory active task
+    """Thin delegate to Application API — keep name/signature for backward compat."""
     try:
-        idle_app = _get_idle_cua(data_dir)
-        tasks = idle_app.memory.list_tasks(limit=5)
-        active = None
-        for t in tasks:
-            if t.get("state") in ("running", "planning", "waiting_for_idle", "paused_by_user"):
-                active = t
-                break
-        if active and active.get("state") in ("running", "planning"):
-            goal = active.get("description", "")[:50]
-            return {
-                "text": f"Running — {goal}",
-                "sub": "Session in progress",
-                "level": "running",
-                "dot": "bg-blue-500",
-                "banner_text": f"Running — {goal}",
-                "chip_text": "running",
-                "hero_title": f"Running — {goal}",
-                "hero_sub": "Session in progress — see inspector",
-            }
+        return _get_idle_cua(data_dir).get_honest_status(watch_running=watch_running, idle_seconds=idle_seconds)
     except Exception:
-        pass
-
-    # Demo mode / Limited
-    demo = _is_demo_mode(data_dir)
-    if demo:
+        # Fallback minimal (should not happen in tests)
         return {
             "text": "Limited mode — stub planner · LLM off",
             "sub": "Sessions run on stub planner · LLM disabled",
@@ -192,42 +150,8 @@ def _honest_status(data_dir: Path, idle_seconds: float | None = None, watch_runn
             "banner_text": "Limited mode — stub planner · LLM off",
             "chip_text": "Limited mode",
             "hero_title": "Limited mode — stub planner",
-            "hero_sub": f"Idle {idle_seconds:.0f}s / {threshold}s · LLM off · threshold {threshold}s",
+            "hero_sub": f"Idle {(idle_seconds or 0):.0f}s / 600s · LLM off · threshold 600s",
         }
-
-    # Idle check
-    try:
-        app = _get_idle_cua(data_dir)
-        secs = float(idle_seconds) if idle_seconds is not None else float(app.idle_detector.seconds_since_last_input())
-    except Exception:
-        secs = float(idle_seconds or 0)
-
-    if secs < threshold:
-        remaining = threshold - secs
-        mins = int(remaining // 60)
-        secs_r = int(remaining % 60)
-        countdown = f"{mins}m {secs_r}s" if mins else f"{secs_r}s"
-        return {
-            "text": f"Waiting for idle {secs:.0f}s / {threshold}s",
-            "sub": f"Starts when you stay idle · {countdown} remaining",
-            "level": "waiting",
-            "dot": "bg-amber-400",
-            "banner_text": f"Waiting for idle {secs:.0f}s / {threshold}s",
-            "chip_text": f"Waiting for idle",
-            "hero_title": "Waiting for idle",
-            "hero_sub": f"Idle {secs:.0f}s / {threshold}s · threshold {threshold}s · Watch loop {'Running' if watch_running else 'Stopped'}",
-        }
-
-    return {
-        "text": "Ready — idle threshold met",
-        "sub": "Agent will start at next idle window",
-        "level": "ready",
-        "dot": "bg-emerald-500",
-        "banner_text": "Ready — idle threshold met",
-        "chip_text": "Ready",
-        "hero_title": "Ready — idle threshold met",
-        "hero_sub": f"Idle {secs:.0f}s / {threshold}s · Next session when idle window holds",
-    }
 
 
 def _mask_key(key: str) -> str:
@@ -263,12 +187,12 @@ def _watch_loop_worker(data_dir: Path, poll_interval: float = 5.0):
         try:
             idle_app = _get_idle_cua(data_dir)
             config = idle_app.config
-            # need_idle check — threshold from Profile (minutes*60) or config
+            # Idle/screen decision owned by the Application API (T1); worker only renders/waits.
             try:
                 idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
             except Exception:
                 idle_secs = 0.0
-            threshold = _get_effective_idle_threshold(data_dir)
+            threshold = idle_app.get_effective_idle_threshold()
             _scheduler_state["idle_threshold"] = threshold
             if idle_secs < threshold or idle_app.idle_detector.is_screen_locked():
                 _time.sleep(poll_interval)
@@ -398,74 +322,36 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     # -- API routes under /api/v1 --
 
-    # Status
+    # Status — thin delegate to Application API (T2)
     @app.get("/api/v1/status")
     def api_status():
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        config = idle_app.config
-        # Idle seconds
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-            locked = bool(idle_app.idle_detector.is_screen_locked())
-        except Exception:
-            idle_secs = 0.0
-            locked = False
-        watch = _scheduler_state
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=watch.get("running"))
-        # Limits usage today
-        from ..accounting import get_today_count
-
-        llm_today = get_today_count(data_dir)
-        # Session usage — we use today's counts? For dashboard meters, show actions vs ceilings?
-        # Use get_status from app for active task and site
-        st = idle_app.get_status()
-        last_report = None
-        try:
-            reports = idle_app.list_reports(limit=1)
-            if reports:
-                last_report = reports[0]
-        except Exception:
-            pass
-        # Scheduler lock info
         lock_info = get_lock_info(data_dir)
-        demo = _is_demo_mode(data_dir)
+        watch_loop = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info.get("pid") if lock_info else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info,
+        }
+        enriched = idle_app.get_status_enriched(watch_loop=watch_loop)
+        # Map to versioned contract keys exactly (no breaking change)
         return {
-            "agent_state": st.get("agent_state", "unknown"),
-            "idle_seconds": idle_secs,
-            "idle_threshold_seconds": _get_effective_idle_threshold(data_dir),
-            "screen_locked": locked,
-            "watch_loop": {
-                "running": bool(watch.get("running")),
-                "pid": watch.get("pid") or (lock_info.get("pid") if lock_info else None),
-                "started_at": watch.get("started_at"),
-                "lock": lock_info,
-            },
-            "demo_mode": demo,
-            "honest_status": honest,
-            "limits": {
-                "actions_used_today": None,  # placeholder
-                "max_actions": config.max_actions,
-                "max_duration_minutes": config.max_duration_minutes,
-                "llm_calls_today": llm_today,
-                "max_llm_calls_per_day": config.max_llm_calls_per_day,
-            },
-            "daily_usage": {
-                # For UI meters: show headroom
-                "actions": {"used": 0, "limit": config.max_actions},
-                "llm_calls": {"used": llm_today, "limit": config.max_llm_calls_per_day},
-                "duration": {"used": 0, "limit": config.max_duration_minutes},
-            },
-            "today_usage": {
-                "actions": {"used": 0, "limit": config.max_actions},
-                "llm_calls": {"used": llm_today, "limit": config.max_llm_calls_per_day},
-                "duration": {"used": 0, "limit": config.max_duration_minutes},
-            },
-            "last_report": last_report,
-            "active_task": st.get("active_task"),
-            "last_action": st.get("last_action"),
-            "current_site": st.get("current_site"),
-            "stop_command": st.get("stop_command"),
+            "agent_state": enriched.get("agent_state", "unknown"),
+            "idle_seconds": enriched.get("idle_seconds", 0.0),
+            "idle_threshold_seconds": enriched.get("idle_threshold_seconds", 600),
+            "screen_locked": enriched.get("screen_locked", False),
+            "watch_loop": enriched.get("watch_loop", watch_loop),
+            "demo_mode": enriched.get("demo_mode", False),
+            "honest_status": enriched.get("honest_status", {}),
+            "limits": enriched.get("limits", {}),
+            "daily_usage": enriched.get("daily_usage", {}),
+            "today_usage": enriched.get("today_usage", {}),
+            "last_report": enriched.get("last_report"),
+            "active_task": enriched.get("active_task"),
+            "last_action": enriched.get("last_action"),
+            "current_site": enriched.get("current_site"),
+            "stop_command": enriched.get("stop_command"),
         }
 
     @app.get("/api/v1/tasks")
@@ -655,15 +541,26 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             for t in tasks:
                 if t.get("state") in ("running", "planning") and t.get("id") != task_id:
                     raise HTTPException(status_code=409, detail="session already in flight")
-            # Also check idle gate — threshold from Profile (single source)
-            config = idle_app.config
-            if config.require_idle:
-                thr = _get_effective_idle_threshold(data_dir)
-                ok, reason = idle_app.idle_detector.can_run(thr)
-                if not ok:
-                    raise HTTPException(status_code=423, detail=f"idle gate blocked: {reason}")
-                if idle_app.idle_detector.is_screen_locked():
+            # Single decision via Application API (T1 § get_readiness) — maps legacy 423 messages byte-identically.
+            # Replaces separate can_run/is_screen_locked pre-checks that duplicated the gate logic.
+            readiness = idle_app.get_readiness()
+            if not readiness["can_start"]:
+                fg = readiness.get("failed_gate")
+                if fg == "profile":
+                    raw = readiness.get("profile", {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+                elif fg == "idle":
+                    raw = readiness.get("idle", {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"idle gate blocked: {raw}")
+                elif fg == "screen":
+                    # Legacy HTTP contract returned exactly "screen locked" (no suffix); keep byte-identical.
                     raise HTTPException(status_code=423, detail="screen locked")
+                elif fg in ("schedule", "limits"):
+                    raw = readiness.get(fg, {}).get("reason", readiness.get("reason", ""))
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+                else:
+                    raw = readiness.get("reason", "")
+                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
             # Now run — honor queue-time Approve/Skip decisions baked into plan
             try:
                 # Load decisions if previously stored (Approve/Skip per action)
@@ -760,238 +657,47 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     @app.get("/api/v1/diagnostics")
     def api_diagnostics():
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics()."""
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        # permissions
+        # Watch loop is observed live state (never owned by app); pass current server state.
+        watch = dict(_scheduler_state)
         try:
-            from ..profile.permissions import check_permissions
-
-            perms = check_permissions()
-            perms_data = [{"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms]
-        except Exception as e:
-            perms_data = [{"error": str(e)}]
-        # driver probe
-        try:
-            import cua_driver  # type: ignore
-
-            driver_ok = True
-            driver_msg = f"cua-driver {getattr(cua_driver, '__version__', 'unknown')}"
-            try:
-                status = cua_driver.current_mac_os_permission_status()
-                driver_msg += f" — accessibility={getattr(status, 'accessibility', '?')} screen_recording={getattr(status, 'screen_recording', '?')}"
-            except Exception as e:
-                driver_msg += f" — probe failed: {e}"
-        except ImportError:
-            driver_ok = False
-            driver_msg = "cua-driver not installed — pip install cua-driver==0.23.2"
-        # profile validity
-        profile = load_profile(data_dir / "profile.json")
-        if profile is None:
-            profile_valid = False
-            profile_errors = ["No profile found"]
-        else:
-            errs = validate_profile(profile)
-            profile_valid = len(errs) == 0
-            profile_errors = errs
-            if not profile.confirmed:
-                profile_valid = False
-                profile_errors = profile_errors + ["Profile is unconfirmed"]
-        # secrets scan
-        try:
-            from ..secrets_scan import scan_project
-
-            scan = scan_project(project_root=Path(__file__).resolve().parents[2], data_dir=data_dir)
-            secrets_ok = scan.ok
-            secrets_findings = [{"source": f.source, "pattern": f.pattern} for f in scan.findings[:5]]
-        except Exception as e:
-            secrets_ok = False
-            secrets_findings = [{"error": str(e)}]
-        # scheduler lock
-        lock = get_lock_info(data_dir)
-        lock_ok = not is_locked(data_dir) or lock is not None
+            watch["idle_threshold"] = int(idle_app.get_effective_idle_threshold())
+        except Exception:
+            pass
+        bundle = idle_app.get_diagnostics(watch_loop=watch)
+        # HTTP contract unchanged (shape-preserving): expose only versioned keys, masked.
+        secrets = bundle.get("secrets_scan", {})
         return {
-            "permissions": perms_data,
-            "driver": {"ok": driver_ok, "message": driver_msg},
-            "profile": {"valid": profile_valid, "confirmed": bool(profile.confirmed) if profile else False, "errors": profile_errors},
-            "secrets_scan": {"ok": secrets_ok, "findings": secrets_findings},
-            "scheduler_lock": {"locked": is_locked(data_dir), "info": lock},
-            "watch_loop": _scheduler_state,
+            "permissions": bundle.get("permissions", []),
+            "driver": bundle.get("driver", {"ok": False, "message": ""}),
+            "profile": bundle.get("profile", {"valid": False, "confirmed": False, "errors": []}),
+            "secrets_scan": {"ok": bool(secrets.get("ok", True)), "findings": list(secrets.get("findings") or [])},
+            "scheduler_lock": bundle.get("scheduler_lock", {"locked": False, "info": None}),
+            "watch_loop": bundle.get("watch_loop", watch),
         }
 
     @app.get("/api/v1/settings")
     def api_get_settings():
-        data_dir = resolved_data_dir
-        config = IdleCuaConfig.load(data_dir)
-        profile = load_profile(data_dir / "profile.json")
-        # One-time prefill: unset Profile fields inherit current Config values for review (ADR-0003)
-        # If profile exists and confirmed but has empty allowlist etc., prefill from config without persisting
-        if profile is None:
-            profile_dict = Profile().model_dump()
-        else:
-            profile_dict = profile.model_dump()
-            # Prefill empty owner-intent fields from config for one-time migration display
-            ab_pref = profile_dict.get("autonomy_boundaries", {})
-            if isinstance(ab_pref, dict) and not ab_pref.get("allowed_sites"):
-                ab_pref["allowed_sites"] = list(config.allowlist)
-            if isinstance(ab_pref, dict) and not ab_pref.get("deny_zones"):
-                # Use preseeded deny_zones as default if profile has none
-                ab_pref["deny_zones"] = list(config.deny_zones) if ab_pref.get("deny_zones") == [] else ab_pref.get("deny_zones", [])
-            # idle threshold: one field seconds in Profile; if profile has default seconds but config is non-default, surface for review (do not auto-persist)
-            cu_pref = profile_dict.get("computer_usage", {})
-            if isinstance(cu_pref, dict) and cu_pref.get("idle_threshold_seconds", 600) == 600 and config.idle_threshold_seconds != 600:
-                cu_pref["idle_threshold_seconds"] = int(config.idle_threshold_seconds)
-                # Keep minutes in sync for display
-                cu_pref["idle_threshold_minutes"] = max(1, (int(config.idle_threshold_seconds) + 59) // 60)
-
-        # Extract owner-intent from profile
-        ab = profile_dict.get("autonomy_boundaries", {}) if isinstance(profile_dict, dict) else {}
-        cu = profile_dict.get("computer_usage", {}) if isinstance(profile_dict, dict) else {}
-        # Single authority: idle threshold lives in Profile seconds
-        idle_sec_profile = None
-        if isinstance(cu, dict):
-            secs = cu.get("idle_threshold_seconds")
-            if isinstance(secs, int):
-                idle_sec_profile = secs
-            else:
-                minutes = cu.get("idle_threshold_minutes")
-                if isinstance(minutes, int):
-                    idle_sec_profile = minutes * 60
-
-        # Effective limits: tighten-only min(Profile, ceiling) in one place
-        eff_session = min(ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45, 45)
-        eff_actions = min(ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200, 200)
-        eff_llm = min(ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150, 150)
-        return {
-            "profile": {
-                "confirmed": profile.confirmed if profile else False,
-                "session_duration_minutes": ab.get("session_duration_minutes", 45) if isinstance(ab, dict) else 45,
-                "daily_action_limit": ab.get("daily_action_limit", 200) if isinstance(ab, dict) else 200,
-                "daily_llm_call_limit": ab.get("daily_llm_call_limit", 150) if isinstance(ab, dict) else 150,
-                "allowed_hours": ab.get("allowed_hours", "00:00-23:59") if isinstance(ab, dict) else "00:00-23:59",
-                "allowlist": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
-                "deny_zones": ab.get("deny_zones", []) if isinstance(ab, dict) else [],
-                "allowed_sites": ab.get("allowed_sites", []) if isinstance(ab, dict) else [],
-                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
-                "idle_threshold_minutes": cu.get("idle_threshold_minutes", 10) if isinstance(cu, dict) else 10,
-                "browser_consent": ab.get("browser_consent", {}) if isinstance(ab, dict) else {},
-            },
-            "config": {
-                "readonly": config.readonly,
-                "require_idle": config.require_idle,
-                "ceilings": {
-                    "max_duration_minutes": 45,
-                    "max_actions": 200,
-                    "max_llm_calls_per_day": 150,
-                },
-                "current": {
-                    "max_duration_minutes": config.max_duration_minutes,
-                    "max_actions": config.max_actions,
-                    "max_llm_calls_per_day": config.max_llm_calls_per_day,
-                    "idle_threshold_seconds": config.idle_threshold_seconds,
-                },
-                "data_dir": str(config.data_dir),
-            },
-            "effective": {
-                "session_duration_minutes": eff_session,
-                "daily_action_limit": eff_actions,
-                "daily_llm_call_limit": eff_llm,
-                "idle_threshold_seconds": idle_sec_profile if idle_sec_profile is not None else config.idle_threshold_seconds,
-            },
-        }
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_owner_settings()."""
+        idle_app = _get_idle_cua(resolved_data_dir)
+        return idle_app.get_owner_settings()
 
     @app.patch("/api/v1/settings")
     def api_patch_settings(payload: SettingsPatch):
-        data_dir = resolved_data_dir
-        config = IdleCuaConfig.load(data_dir)
-        profile = load_profile(data_dir / "profile.json")
-        created = False
-        if profile is None:
-            profile = Profile()
-            created = True
-        # Apply Profile owner-intent fields with tighten-only validation
-        ab = profile.autonomy_boundaries
-        cu = profile.computer_usage
-
-        # Session duration — tighten-only vs ceiling 45
-        if payload.session_duration_minutes is not None:
-            val = int(payload.session_duration_minutes)
-            if val <= 0 or val > 45:
-                raise HTTPException(status_code=400, detail="session_duration_minutes must be 1..45")
-            # ceiling check — if profile value above ceiling, reject (not clamp)
-            if val > 45:
-                raise HTTPException(status_code=400, detail="session_duration_minutes above ceiling 45")
-            ab.session_duration_minutes = val
-
-        if payload.daily_action_limit is not None:
-            val = int(payload.daily_action_limit)
-            if val <= 0 or val > 1000:
-                raise HTTPException(status_code=400, detail="daily_action_limit must be 1..1000")
-            if val > 200:
-                raise HTTPException(status_code=400, detail="daily_action_limit above ceiling 200")
-            ab.daily_action_limit = val
-
-        if payload.daily_llm_call_limit is not None:
-            val = int(payload.daily_llm_call_limit)
-            if val <= 0 or val > 1000:
-                raise HTTPException(status_code=400, detail="daily_llm_call_limit must be 1..1000")
-            if val > 150:
-                raise HTTPException(status_code=400, detail="daily_llm_call_limit above ceiling 150")
-            ab.daily_llm_call_limit = val
-
-        if payload.allowed_hours is not None:
-            ab.allowed_hours = str(payload.allowed_hours)
-
-        if payload.allowlist is not None:
-            # Validate domains
-            from ..profile.validate import _is_valid_domain
-
-            for site in payload.allowlist:
-                if not _is_valid_domain(site):
-                    raise HTTPException(status_code=400, detail=f"allowlist: invalid domain '{site}'")
-            ab.allowed_sites = [s.strip().lower() for s in payload.allowlist]
-
-        if payload.deny_zones is not None:
-            # ADR-0003: deny-zones are owner-intent, stored in Profile (not Config). Config keeps preseed defaults immutable.
-            ab.deny_zones = list(payload.deny_zones)
-
-        # Idle threshold — single field seconds in Profile (ADR-0003), no precision loss
-        if payload.idle_threshold_seconds is not None:
-            val = int(payload.idle_threshold_seconds)
-            if val < 60 or val > 7200:
-                raise HTTPException(status_code=400, detail="idle_threshold_seconds must be 60..7200")
-            cu.idle_threshold_seconds = val
-            # Keep minutes in sync for back-compat display
-            cu.idle_threshold_minutes = max(1, min(120, (val + 59) // 60))
-
-        if payload.browser_consent is not None:
-            bc = BrowserConsent(main_profile_granted=bool(payload.browser_consent), browser="chrome")
-            ab.browser_consent = bc
-            profile.browser_consent = bc
-
-        # Config safety toggles
-        if payload.readonly is not None:
-            config.readonly = bool(payload.readonly)
-        if payload.require_idle is not None:
-            config.require_idle = bool(payload.require_idle)
-
-        # Validate profile before saving (tighten-only)
-        errs = validate_profile(profile)
-        if errs:
-            raise HTTPException(status_code=400, detail="; ".join(errs))
-
-        # Save both
-        save_profile(profile, data_dir / "profile.json")
-        config.save()
-        # Mirror browser consent
+        """Thin caller per ADR-0002: validation+write lives in IdleCua.update_owner_settings()."""
+        idle_app = _get_idle_cua(resolved_data_dir)
         try:
-            if payload.browser_consent is not None:
-                from ..browser_consent import record_consent
-
-                record_consent(data_dir, bool(payload.browser_consent))
-        except Exception:
-            pass
-
-        return {"ok": True, "profile": profile.model_dump(), "config": config.to_dict()}
+            try:
+                patch = payload.model_dump(exclude_none=True)
+            except AttributeError:
+                patch = payload.dict(exclude_none=True)
+            result = idle_app.update_owner_settings(patch)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # Keep HTTP contract byte-identical: ok + profile + config (no effective leak in PATCH shape).
+        return {"ok": True, "profile": result["profile"], "config": result["config"]}
 
     # Providers
     @app.get("/api/v1/providers")
@@ -1226,17 +932,21 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
         config = idle_app.config
-        # Status
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-        except Exception:
-            idle_secs = 0.0
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=_scheduler_state.get("running"))
+        # Status — thin delegate to Application API (T2)
+        lock_info_dash = get_lock_info(data_dir)
+        watch_loop_dash = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info_dash.get("pid") if lock_info_dash else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info_dash,
+        }
+        enriched_dash = idle_app.get_status_enriched(watch_loop=watch_loop_dash)
+        honest = enriched_dash.get("honest_status", {})
         # Getting started checklist
         profile = load_profile(data_dir / "profile.json")
         store = ProviderStore.load(data_dir)
-        # Provider key check
-        has_key = not _is_demo_mode(data_dir)
+        # Provider key check — single source via Application API demo badge
+        has_key = not bool(enriched_dash.get("demo_mode", True))
         # perms
         try:
             from ..profile.permissions import check_permissions
@@ -1322,7 +1032,10 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             except Exception:
                 inspector = {"task": inspector_task}
 
-        effective_idle = _get_effective_idle_threshold(data_dir)
+        effective_idle = int(enriched_dash.get("idle_threshold_seconds", 600))
+        # Today meters from enriched limits (single source; mirrors api_status)
+        _limits_dash = enriched_dash.get("limits", {})
+        _daily = enriched_dash.get("daily_usage", {})
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -1330,31 +1043,43 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 "config": config,
                 "effective_idle_threshold": effective_idle,
                 "honest": honest,
-                "demo_mode": _is_demo_mode(data_dir),
+                "demo_mode": bool(enriched_dash.get("demo_mode", False)),
                 "checklist": checklist,
                 "done_count": done_count,
                 "total": len(checklist),
-                "today": {"actions": 0, "actions_limit": config.max_actions, "llm_calls": llm_today, "llm_limit": config.max_llm_calls_per_day, "duration": 0, "duration_limit": config.max_duration_minutes},
-                "watch_loop": _scheduler_state,
+                "today": {
+                    "actions": _daily.get("actions", {}).get("used", 0),
+                    "actions_limit": _daily.get("actions", {}).get("limit", config.max_actions),
+                    "llm_calls": _daily.get("llm_calls", {}).get("used", _limits_dash.get("llm_calls_today", 0)),
+                    "llm_limit": _daily.get("llm_calls", {}).get("limit", config.max_llm_calls_per_day),
+                    "duration": _daily.get("duration", {}).get("used", 0),
+                    "duration_limit": _daily.get("duration", {}).get("limit", config.max_duration_minutes),
+                },
+                "watch_loop": enriched_dash.get("watch_loop", watch_loop_dash),
                 "tasks": tasks_enriched,
                 "inspector": inspector,
-                "lock_info": get_lock_info(data_dir),
+                "lock_info": lock_info_dash,
             },
         )
 
     @app.get("/ui/status", response_class=HTMLResponse)
     def ui_status_fragment(request: Request):
-        # htmx polling fragment — returns honest status banner
+        # htmx polling fragment — thin delegate to Application API status (T2)
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        try:
-            idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-        except Exception:
-            idle_secs = 0.0
-        honest = _honest_status(data_dir, idle_seconds=idle_secs, watch_running=_scheduler_state.get("running"))
+        lock_info_frag = get_lock_info(data_dir)
+        watch_loop_frag = {
+            "running": bool(_scheduler_state.get("running")),
+            "pid": _scheduler_state.get("pid") or (lock_info_frag.get("pid") if lock_info_frag else None),
+            "started_at": _scheduler_state.get("started_at"),
+            "lock": lock_info_frag,
+        }
+        enriched_frag = idle_app.get_status_enriched(watch_loop=watch_loop_frag)
+        honest = enriched_frag.get("honest_status", {})
+        demo_mode = bool(enriched_frag.get("demo_mode", False))
         if templates is None:
-            return HTMLResponse(f"<div>{honest['text']}</div>")
-        return templates.TemplateResponse(request, "partials/status_banner.html", {"honest": honest, "demo_mode": _is_demo_mode(data_dir)})
+            return HTMLResponse(f"<div>{honest.get('text','')}</div>")
+        return templates.TemplateResponse(request, "partials/status_banner.html", {"honest": honest, "demo_mode": demo_mode})
 
     @app.get("/tasks", response_class=HTMLResponse)
     def ui_tasks(request: Request):
@@ -1415,27 +1140,25 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     def ui_diagnostics(request: Request):
+        """Thin caller per ADR-0002: decision lives in IdleCua.get_diagnostics()."""
         if templates is None:
             return HTMLResponse("<html><body>Diagnostics</body></html>")
         data_dir = resolved_data_dir
-        # reuse api diagnostics logic but render html
-        # call api_diagnostics inner? Instead duplicate
+        idle_app = _get_idle_cua(data_dir)
+        watch = dict(_scheduler_state)
         try:
-            from ..profile.permissions import check_permissions
-
-            perms = check_permissions()
-            perms_data = [{"name": p.name, "granted": p.granted, "remediation": p.remediation} for p in perms]
-        except Exception as e:
-            perms_data = [{"error": str(e)}]
-        profile = load_profile(data_dir / "profile.json")
-        if profile is None:
-            profile_valid = False
-            profile_errors = ["No profile"]
-        else:
-            errs = validate_profile(profile)
-            profile_valid = len(errs) == 0 and profile.confirmed
-            profile_errors = errs
-        lock = get_lock_info(data_dir)
-        return templates.TemplateResponse(request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": _scheduler_state})
+            watch["idle_threshold"] = int(idle_app.get_effective_idle_threshold())
+        except Exception:
+            pass
+        bundle = idle_app.get_diagnostics(watch_loop=watch)
+        perms_data = bundle.get("permissions", [])
+        prof = bundle.get("profile", {})
+        profile_valid = bool(prof.get("valid"))
+        profile_errors = list(prof.get("errors") or [])
+        lock = bundle.get("scheduler_lock", {}).get("info")
+        watch_loop = bundle.get("watch_loop", watch)
+        return templates.TemplateResponse(
+            request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": watch_loop}
+        )
 
     return app
