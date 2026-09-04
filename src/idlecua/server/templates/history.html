@@ -1,38 +1,60 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>History — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="p-8 max-w-4xl mx-auto">
-<h1 class="text-2xl font-semibold">History</h1>
-<p class="text-sm text-zinc-500">Actions, queries, urls, findings, errors — filterable by task. Times shown in local format.</p>
-<div class="mt-4 flex items-center gap-3">
+{% extends "layout.html" %}
+{% set title = "History" %}
+{% block content %}
+<p class="text-sm text-zinc-500 mt-1">Queries, pages, findings and runs — filterable by task.</p>
+<div class="mt-4 flex flex-wrap items-center gap-3">
   <label class="text-sm font-medium">Filter by task:</label>
-  <select id="taskFilter" onchange="if(this.value) location.href='/history?task_id='+encodeURIComponent(this.value); else location.href='/history'" class="border rounded px-2 py-1 text-sm">
+  <select id="taskFilter" onchange="if(this.value) location.href='/history?task_id='+encodeURIComponent(this.value); else location.href='/history'" class="border border-zinc-200 bg-white rounded-lg px-2 py-1.5 text-sm max-w-full">
     <option value="">All tasks</option>
-    {% for t in tasks %}<option value="{{ t.id }}" {% if selected_task==t.id %}selected{% endif %}>{{ t.id[:8] }} — {{ t.description[:40] }} [{{ t.state }}]</option>{% endfor %}
+    {% for t in tasks %}<option value="{{ t.id }}" {% if selected_task==t.id %}selected{% endif %}>{{ t.id[:8] }} — {{ t.description[:40] }} ({{ t.state|replace('waiting_for_idle','queued') }})</option>{% endfor %}
   </select>
-  {% if selected_task %}<a href="/history" class="text-sm text-blue-600 underline">Clear filter</a><span class="text-xs text-zinc-500">Showing task {{ selected_task[:8] }}</span>{% endif %}
+  {% if selected_task %}<a href="/history" class="text-sm text-zinc-600 underline">Clear filter</a>{% endif %}
 </div>
-<div class="mt-2 text-xs text-zinc-500">API: <span class="mono bg-zinc-100 px-1 rounded">GET /api/v1/history?task_id=&lt;id&gt;</span> — same filter via API</div>
-<div class="mt-6 space-y-6">
-<h2 class="font-semibold">Queries <span class="text-xs font-normal text-zinc-500">({{ history.queries|length }})</span></h2>
-<ul class="list-disc ml-6 text-sm space-y-1">
-{% for q in history.queries %}<li><span class="font-medium">{{ q.query }}</span> — <span class="text-zinc-500">{{ q.normalized }}</span> <span class="text-xs text-zinc-400">{{ q.created_at[:19].replace('T',' ') if q.created_at else '' }}</span></li>{% else %}<li class="text-zinc-400">No queries</li>{% endfor %}
-</ul>
-<h2 class="font-semibold mt-4">URLs <span class="text-xs font-normal text-zinc-500">({{ history.urls|length }})</span></h2>
-<ul class="list-disc ml-6 text-sm space-y-1">
-{% for u in history.urls %}<li><a href="{{ u.url }}" class="text-blue-600 underline" target="_blank">{{ u.url }}</a> <span class="text-xs text-zinc-400">{{ u.created_at[:19].replace('T',' ') if u.created_at else '' }}</span></li>{% else %}<li class="text-zinc-400">No urls</li>{% endfor %}
-</ul>
-<h2 class="font-semibold mt-4">Findings <span class="text-xs font-normal text-zinc-500">({{ history.findings|length }})</span></h2>
-<ul class="list-disc ml-6 text-sm space-y-1">
-{% for f in history.findings %}<li><span class="font-medium">{{ f.title }}</span> — <a href="{{ f.url }}" class="text-blue-600 underline" target="_blank">{{ f.url }}</a></li>{% else %}<li class="text-zinc-400">No findings</li>{% endfor %}
-</ul>
-<h2 class="font-semibold mt-4">Actions <span class="text-xs font-normal text-zinc-500">({{ history.actions|length }})</span></h2>
-<ul class="list-disc ml-6 text-sm space-y-1">
-{% for a in history.actions %}<li>{{ a.kind }} → {{ a.target_url or '(local)' }} [{{ a.status }}] <span class="text-xs text-zinc-400">{{ a.created_at[:19].replace('T',' ') if a.created_at else '' }}</span></li>{% else %}<li class="text-zinc-400">No actions</li>{% endfor %}
-</ul>
-<h2 class="font-semibold mt-4">Errors</h2>
-<ul class="list-disc ml-6 text-sm space-y-1">
-{% for e in history.errors %}<li class="text-red-600">{{ e.message }} <span class="text-xs text-zinc-400">{{ e.created_at[:19].replace('T',' ') if e.created_at else '' }}</span></li>{% else %}<li class="text-zinc-400">No errors</li>{% endfor %}
-</ul>
+<div class="mt-6 space-y-4">
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">Queries <span class="text-xs font-normal text-zinc-500">({{ history.queries|length }})</span></h2>
+    <ul class="mt-2 text-sm space-y-1.5">
+      {% for q in history.queries %}<li class="flex flex-wrap gap-x-2"><span class="text-xs text-zinc-400 uppercase tracking-wide">search</span><span class="font-medium">{{ q.query }}</span>{% if q.normalized and q.normalized != q.query %}<span class="text-zinc-500">({{ q.normalized }})</span>{% endif %}<span class="text-xs text-zinc-400 whitespace-nowrap tabular-nums" title="{{ q.created_at }}">{{ q.created_at|fmt_dt_s }}</span></li>{% else %}<li class="text-zinc-400">No queries yet</li>{% endfor %}
+    </ul>
+  </div>
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">Pages <span class="text-xs font-normal text-zinc-500">({{ history.urls|length }})</span></h2>
+    <ul class="mt-2 text-sm space-y-1.5">
+      {% for g in history.urls|groupby('url') %}<li class="flex flex-wrap gap-x-2"><a href="{{ g.grouper }}" class="text-zinc-900 underline decoration-zinc-300" target="_blank">{{ g.grouper }}</a>{% if g.list|length > 1 %}<span class="text-xs text-zinc-400">×{{ g.list|length }} visits</span>{% endif %}<span class="text-xs text-zinc-400 whitespace-nowrap tabular-nums" title="{{ g.list[0].created_at }}">{{ g.list[0].created_at|fmt_dt_s }}</span></li>{% else %}<li class="text-zinc-400">No pages visited yet</li>{% endfor %}
+    </ul>
+  </div>
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">Findings <span class="text-xs font-normal text-zinc-500">({{ history.findings|length }})</span></h2>
+    <ul class="mt-2 text-sm space-y-1.5">
+      {% for f in history.findings %}<li class="flex flex-wrap gap-x-2"><span class="font-medium">{{ f.title }}</span><a href="{{ f.url }}" class="text-zinc-900 underline decoration-zinc-300" target="_blank">{{ f.url }}</a></li>{% else %}<li class="text-zinc-400">No findings yet</li>{% endfor %}
+    </ul>
+  </div>
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">Steps <span class="text-xs font-normal text-zinc-500">({{ history.actions|length }})</span></h2>
+    <ul class="mt-2 text-sm space-y-1.5">
+      {% for a in history.actions %}
+      <li class="flex flex-wrap items-center gap-x-2">
+        <span class="mono text-xs text-zinc-400 w-8 shrink-0">#{{ loop.index }}</span>
+        <span class="font-medium">{{ a.kind|human_label(a.target_url) }}</span>
+        <span class="text-zinc-500">{{ a.target_url or 'this computer' }}</span>
+        <span class="inline-flex items-center px-2 py-0.5 rounded-full border text-xs font-medium {{ 'bg-emerald-50 border-emerald-200 text-emerald-800' if a.status=='completed' else 'bg-red-50 border-red-200 text-red-800' }}">{{ '✓' if a.status=='completed' else '✗' }} {{ a.status }}</span>
+        <span class="text-xs text-zinc-400 whitespace-nowrap tabular-nums" title="{{ a.created_at }}">{{ a.created_at|fmt_dt_s }}</span>
+      </li>
+      {% else %}<li class="text-zinc-400">No steps yet</li>{% endfor %}
+    </ul>
+  </div>
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">Notices <span class="text-xs font-normal text-zinc-500">({{ history.errors|length }})</span></h2>
+    <ul class="mt-2 text-sm space-y-1.5">
+      {% for e in history.errors %}
+      <li class="flex flex-wrap items-center gap-x-2 {{ 'text-red-700' if e.level=='error' else 'text-amber-800' if e.level=='warning' else 'text-zinc-600' }}">
+        <span class="inline-flex items-center px-2 py-0.5 rounded-full border text-xs font-medium {{ 'bg-red-50 border-red-200' if e.level=='error' else 'bg-amber-50 border-amber-200' if e.level=='warning' else 'bg-zinc-100 border-zinc-200' }}">{{ '✗' if e.level=='error' else '⚠' if e.level=='warning' else 'ⓘ' }} {{ e.level }}</span>
+        <span>{{ e.message }}</span>
+        <span class="text-xs opacity-60 whitespace-nowrap tabular-nums" title="{{ e.created_at }}">{{ e.created_at|fmt_dt_s }}</span>
+      </li>
+      {% else %}<li class="text-zinc-400">Nothing to report</li>{% endfor %}
+    </ul>
+  </div>
 </div>
-<a href="/" class="underline text-blue-600 mt-6 inline-block">← Dashboard</a>
-</body></html>
+<p class="mt-6 text-xs text-zinc-400">Same data is available via the API: <span class="mono bg-zinc-100 px-1 rounded">GET /api/v1/history?task_id=&lt;id&gt;</span></p>
+{% endblock %}

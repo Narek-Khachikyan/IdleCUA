@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+{# Shared layout — one sidebar and one content width for every secondary page. #}
+{# Expects: title, active, plus the shared sidebar context. #}
+{# Blocks: crumb (default: title), header_action, content, extra_scripts. #}
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} — IdleCUA</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>tailwind.config={theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}</script>
+<style>*{font-family:Inter,sans-serif}.mono{font-family:'JetBrains Mono',monospace}body{font-size:15px}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:9999px}</style>
+<script src="/static/htmx.min.js"></script>
+</head>
+<body class="antialiased bg-white text-zinc-900">
+<div id="sidebar-backdrop" onclick="toggleSidebar(false)" class="hidden fixed inset-0 z-30 bg-black/50 lg:hidden"></div>
+<div class="h-screen flex overflow-hidden">
+  {% include "partials/sidebar.html" %}
+  <div class="flex-1 min-w-0 bg-zinc-50 overflow-auto">
+    <div class="sticky top-0 z-30 bg-zinc-50/95 border-b border-zinc-200 px-3 sm:px-5 py-3 flex items-center gap-3">
+      <button onclick="toggleSidebar()" aria-label="Toggle navigation" class="lg:hidden w-9 h-9 grid place-items-center rounded-full border border-zinc-200 bg-white text-lg">☰</button>
+      <span class="font-semibold text-zinc-900">{% block crumb %}{{ title }}{% endblock %}</span>
+      <span class="ml-auto flex items-center gap-2">{% block header_action %}{% endblock %}</span>
+    </div>
+    <div class="max-w-6xl mx-auto px-3 sm:px-5 py-5 pb-20">
+      {% block content %}{% endblock %}
+    </div>
+  </div>
+</div>
+{% block extra_scripts %}{% endblock %}
+</body>
+</html>

@@ -1,42 +1,270 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Settings — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="p-8 max-w-3xl mx-auto">
-<h1 class="text-2xl font-semibold">Settings</h1>
-<p class="text-sm text-zinc-500">Session duration, daily limits, allowed hours, idle threshold, allowlist, deny-zones, browser consent — one home per setting (the Profile). Ceilings are read-only.</p>
-<div class="mt-6 space-y-4">
-  <div class="border rounded-xl p-4">
-    <h2 class="font-semibold">Profile — owner intent</h2>
-    <div class="text-sm mt-2 space-y-1">
-      <div>Session duration: {{ profile.autonomy_boundaries.session_duration_minutes if profile else 45 }} min (ceiling 45)</div>
-      <div>Daily action limit: {{ profile.autonomy_boundaries.daily_action_limit if profile else 200 }}</div>
-      <div>Daily LLM limit: {{ profile.autonomy_boundaries.daily_llm_call_limit if profile else 150 }} (ceiling 150)</div>
-      <div>Allowed hours: {{ profile.autonomy_boundaries.allowed_hours if profile else '00:00-23:59' }}</div>
-      <div>Idle threshold: {{ profile.computer_usage.idle_threshold_minutes if profile else 10 }} min — single authority in Profile (seconds)</div>
-      <div id="allowlist">Allowlist: {{ (profile.autonomy_boundaries.allowed_sites | join(', ')) if profile and profile.autonomy_boundaries.allowed_sites else (config.allowlist | join(', ')) }}</div>
-      <div>Deny-zones: {{ (profile.autonomy_boundaries.deny_zones | join(', ')) if profile and profile.autonomy_boundaries.deny_zones else (config.deny_zones | join(', ')) }} — preseed defaults, owner mutation via Profile</div>
-      <div>Browser consent: {{ profile.autonomy_boundaries.browser_consent.main_profile_granted if profile and profile.autonomy_boundaries else False }}</div>
+{% extends "layout.html" %}
+{% set title = "Settings" %}
+{% block content %}
+<p class="text-sm text-zinc-500 mt-1">How long the agent may work, where it may go, and when it needs you. Your limits can only tighten the built-in ceilings (45 min · 200 actions · 150 calls/day).</p>
+<nav class="mt-4 flex flex-wrap gap-1.5 text-sm">
+  <a href="#provider" class="px-3 py-1.5 rounded-full border border-zinc-200 bg-white text-zinc-700">Provider</a>
+  <a href="#limits" class="px-3 py-1.5 rounded-full border border-zinc-200 bg-white text-zinc-700">Limits</a>
+  <a href="#schedule" class="px-3 py-1.5 rounded-full border border-zinc-200 bg-white text-zinc-700">Schedule</a>
+  <a href="#access" class="px-3 py-1.5 rounded-full border border-zinc-200 bg-white text-zinc-700">Access</a>
+  <a href="#safety" class="px-3 py-1.5 rounded-full border border-zinc-200 bg-white text-zinc-700">Safety</a>
+</nav>
+<div id="settings-feedback" class="hidden mt-4 text-sm px-3 py-2 rounded-xl"></div>
+
+<div id="provider" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5 scroll-mt-20">
+  <h2 class="font-semibold">AI provider</h2>
+  <p class="text-sm text-zinc-500 mt-0.5">Without a key the agent runs on the demo planner. Keys are stored in your system keychain, never shown back.</p>
+  <div id="providers-list" class="mt-3 text-sm">Loading...</div>
+  <div class="mt-4 border border-zinc-200 rounded-xl p-4">
+    <h3 class="text-sm font-semibold">Add provider</h3>
+    <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
+      <label class="block">Name<input id="p-name" type="text" placeholder="openrouter" class="mt-1 w-full border border-zinc-200 rounded-lg px-2 py-1.5"></label>
+      <label class="block">Base URL<input id="p-base-url" type="text" placeholder="https://openrouter.ai/api/v1" class="mt-1 w-full border border-zinc-200 rounded-lg px-2 py-1.5 mono"></label>
+      <label class="block">Model<input id="p-model" type="text" placeholder="anthropic/claude-3.5-sonnet" class="mt-1 w-full border border-zinc-200 rounded-lg px-2 py-1.5 mono"></label>
+      <label class="block">API key<input id="p-key" type="password" autocomplete="new-password" placeholder="sk-..." class="mt-1 w-full border border-zinc-200 rounded-lg px-2 py-1.5 mono"></label>
     </div>
+    <button onclick="addProvider()" class="mt-3 bg-zinc-900 text-white text-sm px-4 py-2 rounded-full font-medium">Add provider</button>
   </div>
-  <div class="border rounded-xl p-4 bg-zinc-50">
-    <h2 class="font-semibold">Config — safety</h2>
-    <div class="text-sm mt-2 space-y-1">
-      <div>readonly: {{ config.readonly }} — toggleable in UI</div>
-      <div>require_idle: {{ config.require_idle }} — toggleable</div>
-      <div class="text-zinc-500">Hard ceilings (read-only): 45 min / 200 actions / 150 LLM/day</div>
+</div>
+
+<div id="limits" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5 scroll-mt-20">
+  <h2 class="font-semibold">Limits</h2>
+  <div class="text-sm mt-4 space-y-4 max-w-2xl">
+    <div>
+      <label for="f-session-duration" class="block font-medium">Session length</label>
+      <div class="mt-1 flex items-center gap-2">
+        <input id="f-session-duration" type="number" min="1" max="45" value="{{ profile.autonomy_boundaries.session_duration_minutes if profile else 45 }}" class="w-28 border border-zinc-200 rounded-lg px-2 py-1.5">
+        <span class="text-zinc-500">min</span>
+      </div>
+      <p class="text-xs text-zinc-500 mt-1">One run stops after this long. Max 45.</p>
+    </div>
+    <div>
+      <label for="f-action-limit" class="block font-medium">Actions per day</label>
+      <div class="mt-1 flex items-center gap-2">
+        <input id="f-action-limit" type="number" min="1" max="200" value="{{ profile.autonomy_boundaries.daily_action_limit if profile else 200 }}" class="w-28 border border-zinc-200 rounded-lg px-2 py-1.5">
+        <span class="text-zinc-500">clicks &amp; key presses</span>
+      </div>
+      <p class="text-xs text-zinc-500 mt-1">Daily budget across all sessions. Max 200.</p>
+    </div>
+    <div>
+      <label for="f-llm-limit" class="block font-medium">AI calls per day</label>
+      <div class="mt-1 flex items-center gap-2">
+        <input id="f-llm-limit" type="number" min="1" max="150" value="{{ profile.autonomy_boundaries.daily_llm_call_limit if profile else 150 }}" class="w-28 border border-zinc-200 rounded-lg px-2 py-1.5">
+        <span class="text-zinc-500">calls</span>
+      </div>
+      <p class="text-xs text-zinc-500 mt-1">Each model question counts once. Max 150.</p>
     </div>
   </div>
 </div>
-<div class="mt-6">
-  <h2 class="font-semibold">Providers</h2>
-  <p class="text-sm text-zinc-500">API key accepted on write, only masked on read. Test button does one minimal provider call.</p>
-  <div id="providers-list" class="mt-2 text-sm">Loading...</div>
-  <script>
+
+<div id="schedule" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5 scroll-mt-20">
+  <h2 class="font-semibold">Schedule</h2>
+  <div class="text-sm mt-4 space-y-4 max-w-2xl">
+    <div>
+      <span class="block font-medium">Allowed hours</span>
+      <div class="mt-1 flex flex-wrap items-center gap-2">
+        <input id="f-hours-start" type="time" value="00:00" class="border border-zinc-200 rounded-lg px-2 py-1.5 mono">
+        <span class="text-zinc-500">to</span>
+        <input id="f-hours-end" type="time" value="23:59" class="border border-zinc-200 rounded-lg px-2 py-1.5 mono">
+        <button onclick="setRoundTheClock()" class="text-xs border border-zinc-200 bg-white px-3 py-1.5 rounded-full">Round the clock</button>
+      </div>
+      <input id="f-allowed-hours" type="hidden" value="{{ profile.autonomy_boundaries.allowed_hours if profile else '00:00-23:59' }}">
+      <p class="text-xs text-zinc-500 mt-1">Sessions only start inside this window.</p>
+    </div>
+    <div>
+      <label for="f-idle-threshold" class="block font-medium">Start when I'm away for</label>
+      <div class="mt-1 flex flex-wrap items-center gap-2">
+        <input id="f-idle-threshold" type="number" min="1" max="120" value="{{ ((profile.computer_usage.idle_threshold_seconds if profile else 600) // 60) }}" class="w-28 border border-zinc-200 rounded-lg px-2 py-1.5">
+        <span class="text-zinc-500">min</span>
+        <button onclick="setIdlePreset(5)" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">5</button>
+        <button onclick="setIdlePreset(10)" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">10</button>
+        <button onclick="setIdlePreset(15)" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">15</button>
+        <button onclick="setIdlePreset(30)" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">30</button>
+      </div>
+      <p class="text-xs text-zinc-500 mt-1">Between 1 minute and 2 hours. The agent never acts while you are present.</p>
+    </div>
+  </div>
+</div>
+
+<div id="access" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5 scroll-mt-20">
+  <h2 class="font-semibold">Access</h2>
+  <div class="text-sm mt-4 space-y-4 max-w-2xl">
+    <div id="allowlist">
+      <span class="block font-medium">Allowed sites</span>
+      <div id="allowlist-chips" class="mt-1.5 flex flex-wrap gap-1.5"></div>
+      <div class="mt-1.5 flex gap-2">
+        <input id="allowlist-input" type="text" placeholder="add domain, e.g. example.com" class="flex-1 min-w-[200px] border border-zinc-200 rounded-lg px-2 py-1.5 mono text-sm">
+        <button onclick="addChip('allowlist')" class="text-sm border border-zinc-200 bg-white px-3 py-1.5 rounded-full">Add</button>
+      </div>
+      <textarea id="f-allowlist" rows="2" class="hidden">{{ (profile.autonomy_boundaries.allowed_sites | join(', ')) if profile and profile.autonomy_boundaries.allowed_sites else (config.allowlist | join(', ')) }}</textarea>
+      <p class="text-xs text-zinc-500 mt-1">The agent can only open these sites. Only you can extend this list.</p>
+    </div>
+    <div>
+      <span class="block font-medium">Off-limits areas</span>
+      <div id="deny-zones-chips" class="mt-1.5 flex flex-wrap gap-1.5"></div>
+      <div class="mt-1.5 flex gap-2">
+        <input id="deny-zones-input" type="text" placeholder="add path, e.g. /messages" class="flex-1 min-w-[200px] border border-zinc-200 rounded-lg px-2 py-1.5 mono text-sm">
+        <button onclick="addChip('deny-zones')" class="text-sm border border-zinc-200 bg-white px-3 py-1.5 rounded-full">Add</button>
+      </div>
+      <textarea id="f-deny-zones" rows="2" class="hidden">{{ (profile.autonomy_boundaries.deny_zones | join(', ')) if profile and profile.autonomy_boundaries.deny_zones else (config.deny_zones | join(', ')) }}</textarea>
+      <p class="text-xs text-zinc-500 mt-1">Pages inside allowed sites the agent must never open — messages, account and payment pages.</p>
+    </div>
+    <label class="flex items-start gap-2">
+      <input id="f-browser-consent" type="checkbox" {% if profile and profile.autonomy_boundaries.browser_consent.main_profile_granted %}checked{% endif %} class="w-4 h-4 mt-0.5">
+      <span><span class="font-medium">Use my main Chrome profile</span><br><span class="text-zinc-500 text-[13px]">The agent opens only its own tabs and never touches yours.</span></span>
+    </label>
+  </div>
+</div>
+
+<div id="safety" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5 scroll-mt-20">
+  <h2 class="font-semibold">Safety switches</h2>
+  <div class="text-sm mt-3 space-y-3 max-w-2xl">
+    <label class="flex items-start gap-2">
+      <input id="f-readonly" type="checkbox" {% if config.readonly %}checked{% endif %} class="w-4 h-4 mt-0.5">
+      <span><span class="font-medium">Read-only mode</span><br><span class="text-zinc-500 text-[13px]">Look but don't touch: no clicks, typing or submitting.</span></span>
+    </label>
+    <label class="flex items-start gap-2">
+      <input id="f-require-idle" type="checkbox" {% if config.require_idle %}checked{% endif %} class="w-4 h-4 mt-0.5">
+      <span><span class="font-medium">Only run while I'm away</span><br><span class="text-zinc-500 text-[13px]">Pause the moment you return.</span></span>
+    </label>
+    <button onclick="saveConfig()" class="bg-white border border-zinc-300 text-sm px-4 py-2 rounded-full font-medium">Save safety switches</button>
+  </div>
+</div>
+
+<div class="sticky bottom-4 mt-4">
+  <div class="bg-zinc-900 text-white rounded-2xl px-4 py-3 flex items-center gap-3 shadow-xl">
+    <span id="dirty-badge" class="hidden text-xs font-medium bg-amber-400 text-zinc-900 px-2 py-0.5 rounded-full">Unsaved changes</span>
+    <span id="clean-hint" class="text-sm text-zinc-400">All changes saved</span>
+    <button onclick="saveProfile()" class="ml-auto bg-white text-zinc-900 text-sm px-5 py-2 rounded-full font-medium">Save changes</button>
+  </div>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script>
+  function settingsFeedback(msg, ok){
+    const el=document.getElementById('settings-feedback');
+    el.classList.remove('hidden');
+    el.textContent=msg;
+    el.className='mt-4 text-sm px-3 py-2 rounded-xl '+(ok?'bg-emerald-50 border border-emerald-200 text-emerald-800':'bg-red-50 border border-red-200 text-red-800');
+  }
+  async function patchSettings(payload){
+    const r=await fetch('/api/v1/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){settingsFeedback('Saved', true); markClean();}
+    else{settingsFeedback('Save failed: '+(d.detail||r.status), false);}
+    return r.ok;
+  }
+  function markDirty(){
+    document.getElementById('dirty-badge').classList.remove('hidden');
+    document.getElementById('clean-hint').classList.add('hidden');
+  }
+  function markClean(){
+    document.getElementById('dirty-badge').classList.add('hidden');
+    document.getElementById('clean-hint').classList.remove('hidden');
+  }
+  // Allowed hours: two time inputs synced into the HH:MM-HH:MM string the API takes.
+  (function initHours(){
+    const raw=(document.getElementById('f-allowed-hours').value||'00:00-23:59').split('-');
+    if(raw[0]) document.getElementById('f-hours-start').value=raw[0].slice(0,5);
+    if(raw[1]) document.getElementById('f-hours-end').value=raw[1].slice(0,5);
+  })();
+  function syncHours(){
+    document.getElementById('f-allowed-hours').value=document.getElementById('f-hours-start').value+'-'+document.getElementById('f-hours-end').value;
+  }
+  function setRoundTheClock(){
+    document.getElementById('f-hours-start').value='00:00';
+    document.getElementById('f-hours-end').value='23:59';
+    syncHours(); markDirty();
+  }
+  function setIdlePreset(mins){
+    document.getElementById('f-idle-threshold').value=mins;
+    markDirty();
+  }
+  document.querySelectorAll('#f-session-duration,#f-action-limit,#f-llm-limit,#f-idle-threshold,#f-browser-consent,#f-hours-start,#f-hours-end').forEach(el=>el.addEventListener('input', ()=>{syncHours(); markDirty();}));
+  // Chip editors for allowlist / deny-zones (synced into the hidden textareas the save path reads).
+  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');}
+  function chipItems(kind){return document.getElementById(kind==='allowlist'?'f-allowlist':'f-deny-zones').value.split(',').map(x=>x.trim()).filter(Boolean);}
+  function renderChips(kind){
+    const box=document.getElementById(kind+'-chips');
+    box.innerHTML=chipItems(kind).map(v=>'<span class="inline-flex items-center gap-1 text-[13px] mono bg-zinc-100 border border-zinc-200 pl-2.5 pr-1 py-0.5 rounded-full">'+esc(v)+'<button onclick="removeChip(\''+kind+'\',\''+esc(v)+'\')" aria-label="Remove '+esc(v)+'" class="w-6 h-6 grid place-items-center rounded-full text-zinc-500 hover:text-zinc-900 hover:bg-zinc-200">✕</button></span>').join('') || '<span class="text-sm text-zinc-400">Empty — the agent may go nowhere until you add entries.</span>';
+  }
+  function syncChips(kind, items){document.getElementById(kind==='allowlist'?'f-allowlist':'f-deny-zones').value=items.join(', '); renderChips(kind); markDirty();}
+  function addChip(kind){
+    const input=document.getElementById(kind+'-input');
+    const vals=input.value.split(',').map(x=>x.trim()).filter(Boolean);
+    if(!vals.length) return;
+    const items=chipItems(kind);
+    for(const v of vals) if(!items.includes(v)) items.push(v);
+    input.value='';
+    syncChips(kind, items);
+    input.focus();
+  }
+  function removeChip(kind, val){syncChips(kind, chipItems(kind).filter(x=>x!==val));}
+  ['allowlist','deny-zones'].forEach(kind=>{
+    renderChips(kind);
+    document.getElementById(kind+'-input').addEventListener('keydown', e=>{if(e.key==='Enter'||e.key===','){e.preventDefault(); addChip(kind);}});
+  });
+  function splitList(s){return s.split(',').map(x=>x.trim()).filter(Boolean);}
+  async function saveProfile(){
+    syncHours();
+    let idleMins=parseInt(document.getElementById('f-idle-threshold').value,10);
+    if(!idleMins||idleMins<1) idleMins=1;
+    if(idleMins>120) idleMins=120;
+    document.getElementById('f-idle-threshold').value=idleMins;
+    const payload={
+      session_duration_minutes: parseInt(document.getElementById('f-session-duration').value,10),
+      daily_action_limit: parseInt(document.getElementById('f-action-limit').value,10),
+      daily_llm_call_limit: parseInt(document.getElementById('f-llm-limit').value,10),
+      allowed_hours: document.getElementById('f-allowed-hours').value.trim(),
+      idle_threshold_seconds: idleMins*60,
+      allowlist: splitList(document.getElementById('f-allowlist').value),
+      deny_zones: splitList(document.getElementById('f-deny-zones').value),
+      browser_consent: document.getElementById('f-browser-consent').checked
+    };
+    await patchSettings(payload);
+  }
+  async function saveConfig(){
+    await patchSettings({
+      readonly: document.getElementById('f-readonly').checked,
+      require_idle: document.getElementById('f-require-idle').checked
+    });
+  }
+  function loadProviders(){
     fetch('/api/v1/providers').then(r=>r.json()).then(data=>{
       const el=document.getElementById('providers-list');
-      if(!data.providers.length) el.textContent='No providers — add one in settings';
-      else el.innerHTML=data.providers.map(p=>'<div class="border p-2 rounded mt-1">'+p.name+' — '+p.masked_key+' — '+p.model+' '+(p.selected?'★':'')+' <button onclick="fetch(\'/api/v1/providers/'+p.name+'/test\',{method:\'POST\'}).then(r=>r.json()).then(j=>alert(JSON.stringify(j)))" class="ml-2 text-xs border px-2 py-1 rounded">Test</button></div>').join('');
+      if(!data.providers.length) el.innerHTML='<div class="text-zinc-500">No providers — add one below to leave demo mode</div>';
+      else el.innerHTML=data.providers.map(p=>'<div class="border border-zinc-200 bg-white p-2 rounded-lg mt-1 flex flex-wrap items-center gap-2"><span class="font-medium">'+esc(p.name)+'</span><span class="mono text-zinc-500">'+esc(p.masked_key)+'</span><span class="text-zinc-500">'+esc(p.model)+'</span>'+(p.selected?'<span title="selected">★</span>':'')+' <button onclick="testProvider(\''+esc(p.name)+'\')" class="ml-2 text-xs border border-zinc-200 px-2 py-1 rounded-full">Test</button>'+(p.selected?'':' <button onclick="selectProvider(\''+esc(p.name)+'\')" class="text-xs border border-zinc-200 px-2 py-1 rounded-full">Select</button>')+' <button onclick="deleteProvider(\''+esc(p.name)+'\')" class="text-xs border border-red-200 text-red-700 px-2 py-1 rounded-full">Delete</button></div>').join('');
     });
-  </script>
-</div>
-<a href="/" class="underline text-blue-600 mt-6 inline-block">← Dashboard</a>
-</body></html>
+  }
+  async function testProvider(name){
+    const r=await fetch('/api/v1/providers/'+encodeURIComponent(name)+'/test',{method:'POST'});
+    const j=await r.json().catch(()=>({}));
+    alert(JSON.stringify(j));
+  }
+  async function selectProvider(name){
+    const r=await fetch('/api/v1/providers/'+encodeURIComponent(name)+'/select',{method:'POST'});
+    if(r.ok){settingsFeedback('Provider selected: '+name, true); loadProviders();}
+    else{const d=await r.json().catch(()=>({})); settingsFeedback('Select failed: '+(d.detail||r.status), false);}
+  }
+  async function deleteProvider(name){
+    if(!confirm('Delete provider '+name+'?')) return;
+    const r=await fetch('/api/v1/providers/'+encodeURIComponent(name),{method:'DELETE'});
+    if(r.ok){settingsFeedback('Provider deleted', true); loadProviders();}
+    else{const d=await r.json().catch(()=>({})); settingsFeedback('Delete failed: '+(d.detail||r.status), false);}
+  }
+  async function addProvider(){
+    const payload={
+      name: document.getElementById('p-name').value.trim(),
+      base_url: document.getElementById('p-base-url').value.trim(),
+      model: document.getElementById('p-model').value.trim(),
+      api_key: document.getElementById('p-key').value
+    };
+    if(!payload.name||!payload.base_url||!payload.model||!payload.api_key){settingsFeedback('Fill name, base URL, model, and API key', false); return;}
+    const r=await fetch('/api/v1/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){settingsFeedback('Provider added', true); document.getElementById('p-key').value=''; loadProviders();}
+    else{settingsFeedback('Add failed: '+(d.detail||JSON.stringify(d)), false);}
+  }
+  loadProviders();
+</script>
+{% endblock %}

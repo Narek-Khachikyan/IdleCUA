@@ -1,12 +1,18 @@
-<div class="border rounded-2xl p-4 flex gap-3 items-start {{ 'bg-amber-50 border-amber-200' if honest.dot=='bg-amber-400' else 'bg-emerald-50 border-emerald-200' if honest.dot=='bg-emerald-500' else 'bg-blue-50 border-blue-200' }}">
-  <span class="mt-1 w-2.5 h-2.5 rounded-full {{ honest.dot }} shrink-0"></span>
+<div class="border rounded-2xl p-4 flex gap-3 items-center {{ 'bg-amber-50 border-amber-200' if honest.dot=='bg-amber-400' else 'bg-emerald-50 border-emerald-200' if honest.dot=='bg-emerald-500' else 'bg-blue-50 border-blue-200' }}">
+  <span class="w-2.5 h-2.5 rounded-full {{ honest.dot }} shrink-0"></span>
   <div class="flex-1 min-w-0">
-    <div class="text-[15px] font-semibold {{ 'text-amber-900' if honest.dot=='bg-amber-400' else 'text-emerald-900' if honest.dot=='bg-emerald-500' else 'text-blue-900' }}">{{ honest.banner_text }}</div>
-    <div class="text-sm {{ 'text-amber-800' if honest.dot=='bg-amber-400' else 'text-emerald-800' if honest.dot=='bg-emerald-500' else 'text-blue-800' }}">{{ honest.sub }}</div>
+    <span class="text-[15px] font-semibold {{ 'text-amber-900' if honest.dot=='bg-amber-400' else 'text-emerald-900' if honest.dot=='bg-emerald-500' else 'text-blue-900' }}">{{ honest.banner_text|replace('stub planner', 'demo planner') }}</span>
+    {% if not demo_mode %}
+    <span class="text-sm {{ 'text-amber-800' if honest.dot=='bg-amber-400' else 'text-emerald-800' if honest.dot=='bg-emerald-500' else 'text-blue-800' }}"> — {{ honest.sub }}</span>
+    {% endif %}
   </div>
-  {% if demo_mode %}
-    <span class="shrink-0 mono text-xs bg-amber-400 text-zinc-900 px-2.5 py-1 rounded-full font-semibold">Demo mode — stub planner</span>
-  {% elif honest.cta %}
+  {% if not demo_mode and honest.cta %}
     <button onclick="location.href='/settings'" class="shrink-0 bg-zinc-900 text-white px-4 py-2 rounded-full text-sm font-medium">{{ honest.cta }}</button>
+  {% endif %}
+  {% if idle_seconds is defined and idle_threshold %}
+  {% set idle_now = idle_seconds|float(0) %}
+  <span class="shrink-0 mono text-xs text-zinc-500 text-right" title="How long there has been no input vs the idle threshold">
+    {% if idle_now >= idle_threshold %}Away {{ idle_now|fmt_dur }} — past {{ idle_threshold|fmt_dur }}{% else %}{{ idle_now|fmt_dur }} of {{ idle_threshold|fmt_dur }} idle{% endif %}
+  </span>
   {% endif %}
 </div>

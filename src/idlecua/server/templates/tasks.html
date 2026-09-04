@@ -1,15 +1,73 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Tasks — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="p-8">
-<h1 class="text-2xl font-semibold">Tasks</h1>
-<p class="text-sm text-zinc-500 mt-1">Filterable by state — queued, running, completed, failed, stopped</p>
-<table class="mt-4 w-full border text-sm">
-<thead class="bg-zinc-50"><tr><th class="p-2 border">Goal</th><th class="p-2 border">Result</th><th class="p-2 border">State</th><th class="p-2 border">When</th></tr></thead>
-<tbody>
-{% for t in tasks %}
-<tr><td class="p-2 border">{{ t.description }}</td><td class="p-2 border">{{ t.state }}</td><td class="p-2 border">{{ t.state }}</td><td class="p-2 border">{{ t.created_at }}</td></tr>
-{% endfor %}
-</tbody>
-</table>
-<a href="/" class="text-blue-600 underline mt-4 inline-block">← Dashboard</a>
-</body></html>
+{% extends "layout.html" %}
+{% set title = "Tasks" %}
+{% block content %}
+<p class="text-sm text-zinc-500 mt-1">Everything you queued. Click a row to inspect its plan on the Dashboard.</p>
+{% set segs = ["queued","running","completed","skipped","failed","stopped"] %}
+<div class="mt-4 inline-flex flex-wrap gap-1 bg-white border border-zinc-200 rounded-full p-1">
+  <a href="/tasks" class="px-3.5 py-1.5 rounded-full text-sm {{ 'bg-zinc-900 text-white font-medium' if state_filter=='all' else 'text-zinc-600 hover:text-zinc-900' }}">All <span class="mono text-xs opacity-70">{{ total_count }}</span></a>
+  {% for s in segs %}
+  {% if state_counts.get(s) %}
+  <a href="/tasks?state={{ s }}" class="px-3.5 py-1.5 rounded-full text-sm {{ 'bg-zinc-900 text-white font-medium' if state_filter==s else 'text-zinc-600 hover:text-zinc-900' }}">{{ s }} <span class="mono text-xs opacity-70">{{ state_counts.get(s) }}</span></a>
+  {% endif %}
+  {% endfor %}
+</div>
+{% if tasks %}
+<div class="mt-4 bg-white border border-zinc-200 rounded-2xl overflow-hidden">
+  <div class="overflow-x-auto">
+  <table class="w-full min-w-[760px] text-sm">
+    <colgroup><col><col style="width:190px"><col style="width:120px"><col style="width:150px"><col style="width:130px"></colgroup>
+    <thead>
+      <tr class="bg-zinc-50 text-xs mono text-zinc-500 text-left">
+        <th class="px-4 py-2.5 font-medium">Goal</th>
+        <th class="px-4 py-2.5 font-medium">Result</th>
+        <th class="px-4 py-2.5 font-medium">State</th>
+        <th class="px-4 py-2.5 font-medium">When</th>
+        <th class="px-4 py-2.5 font-medium"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-zinc-100">
+      {% for t in tasks %}
+      <tr class="hover:bg-zinc-50 group">
+        <td class="px-4 py-3 font-medium text-zinc-900"><a href="/?inspect={{ t.id }}" class="hover:underline">{{ t.description }} <span class="text-zinc-300 group-hover:text-zinc-500">›</span></a></td>
+        <td class="px-4 py-3 text-zinc-600 mono text-[13px] tabular-nums">{{ t.result_str }}</td>
+        <td class="px-4 py-3">
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-medium whitespace-nowrap {{ 'bg-red-50 border-red-200 text-red-800' if t.ui_state=='failed' else 'bg-blue-50 border-blue-200 text-blue-800' if t.ui_state in ['running','planning'] else 'bg-amber-50 border-amber-200 text-amber-800' if t.ui_state=='queued' else 'bg-zinc-100 border-zinc-200 text-zinc-600' if t.ui_state in ['skipped','stopped'] else 'bg-emerald-50 border-emerald-200 text-emerald-800' }}">
+            {{ '✗' if t.ui_state=='failed' else '●' if t.ui_state in ['running','planning'] else '○' if t.ui_state=='queued' else '⤺' if t.ui_state=='skipped' else '✓' if t.ui_state=='completed' else '•' }} {{ t.ui_state }}
+          </span>
+        </td>
+        <td class="px-4 py-3 text-zinc-500 whitespace-nowrap tabular-nums" title="{{ t.created_at }}">{{ t.created_at|fmt_dt }}</td>
+        <td class="px-4 py-3 text-right whitespace-nowrap">
+          {% if t.ui_state == 'queued' %}
+          <button onclick="cancelTask('{{ t.id }}')" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">Cancel</button>
+          {% elif t.ui_state in ['completed','failed','stopped','skipped'] %}
+          <button onclick="rerunTask({{ t.description|tojson }})" class="text-xs border border-zinc-200 bg-white px-2.5 py-1 rounded-full">Run again</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% else %}
+<div class="mt-4 bg-white border border-zinc-200 rounded-2xl px-4 py-10 text-center">
+  <div class="text-[15px] font-medium">{% if state_filter != 'all' %}No {{ state_filter }} tasks{% else %}No tasks yet{% endif %}</div>
+  <div class="text-sm text-zinc-500 mt-1">{% if state_filter != 'all' %}<a href="/tasks" class="underline">Show all</a>{% else %}Describe a goal on the <a href="/" class="underline">Dashboard</a> and queue it for the next idle window.{% endif %}</div>
+</div>
+{% endif %}
+{% endblock %}
+{% block extra_scripts %}
+<script>
+async function cancelTask(id){
+  if(!confirm('Cancel this queued task? It will never run.')) return;
+  const r=await fetch('/api/v1/tasks/'+id,{method:'DELETE'});
+  const d=await r.json().catch(()=>({}));
+  if(r.ok) location.reload(); else alert('Cancel failed: '+(d.detail||r.status));
+}
+async function rerunTask(goal){
+  const r=await fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});
+  const d=await r.json().catch(()=>({}));
+  if(r.ok) location.href='/?inspect='+d.task.id; else alert('Queue failed: '+(d.detail||r.status));
+}
+</script>
+{% endblock %}

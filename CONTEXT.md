@@ -8,10 +8,10 @@ Single-context glossary for the IdleCUA domain. Use these terms verbatim in code
 - **Application API**: the public Python surface (`IdleCua`, `IdleCuaConfig`). CLI and any embedding call through it; no business logic lives in the CLI.
 - **HTTP API**: versioned local JSON HTTP surface (`/api/v1`) on `127.0.0.1`, started by `idle-cua serve`. A thin caller of the Application API, like the CLI; no business logic. _Avoid_: REST server, MCP server, backend.
 - **Local UI**: the owner-facing web interface served as static assets by the same `idle-cua serve` process; talks only to the HTTP API. _Avoid_: GUI, frontend, web app.
-- **Task**: a user-described goal (e.g., "research X") that becomes a bounded `Plan` and then a sequence of typed `Action`s. Has an `AgentState`.
-- **Plan**: bounded, inspectable structure produced by the Planner before any execution. Fields: `goal`, `target`, `expected_actions`, `max_duration_minutes`, `max_actions`, `risk_level`, `requires_confirmation`. Deterministic in the walking skeleton; LLM-backed later.
-- **Action**: a single typed computer operation (e.g., `navigate`, `search`, `scroll`, `open_link`, `read_extract`, `save_note`, `open_app`, `close_tab`). Vocabulary is closed and grows only on demonstrated need.
-- **AgentState**: lifecycle of a task: `disabled`, `waiting_for_idle`, `planning`, `running`, `paused_by_user`, `paused_for_approval`, `completed`, `failed`, `stopped`. Validated transitions; illegal transitions are rejected.
+- **Task**: an immutable user-described goal (e.g., "research X") that becomes one bounded `Plan`, one Session, and then a sequence of typed `Action`s. An enqueued Task starts in `waiting_for_idle` and may suppress every Action of selected types; once it reaches `completed`, `failed`, or `stopped`, it is never reactivated.
+- **Plan**: bounded, inspectable structure produced by the Planner before any execution. Once persisted for a Task it is immutable for the whole Session; fields: `goal`, `target`, `expected_actions`, `max_duration_minutes`, `max_actions`, `risk_level`, `requires_confirmation`.
+- **Action**: a single typed computer operation (e.g., `navigate`, `search`, `scroll`, `open_link`, `read_extract`, `save_note`, `open_app`, `close_tab`). Vocabulary is closed and grows only on demonstrated need; an Action interrupted after dispatch but before confirmation has `outcome_unknown`, is never retried automatically, and leaves its Task `failed`.
+- **AgentState**: lifecycle of a Task: `waiting_for_idle`, `planning`, `running`, `paused_by_user`, `paused_for_approval`, `completed`, `failed`, `stopped`. Validated transitions; illegal transitions are rejected. `disabled` describes the Agent being off, not a Task.
 - **Profile**: confirmed user configuration covering characteristics, computer usage, and autonomy boundaries. Machine-readable JSON (`profile.json`) plus derived human-readable rendering (no duplication). Must be confirmed before any autonomous action; unconfirmed blocks execution. The single home of owner-intent settings: session duration, daily limits, allowed hours, allowlist, deny-zones, idle threshold, browser consent.
 - **Config**: machine-level and safety settings (`readonly`, `require_idle`, hard ceilings, data dir, dev flags). Never owner-intent limits — those live only in the Profile. _Avoid_: settings file, config as a synonym for Profile.
 - **Confirmed / Unconfirmed**: profile state gate. No autonomous action while unconfirmed. Summary separates confirmed facts (user-provided) from assumptions (defaults).
@@ -21,12 +21,14 @@ Single-context glossary for the IdleCUA domain. Use these terms verbatim in code
 - **ProviderConfig / ProviderStore**: non-secret config (`name`, `base_url`, `model` in `providers.json`); secret `api_key` only in system Keychain (`idlecua` / `provider:<name>`).
 - **LLM accounting**: daily counter in `llm_usage.json` incremented on each real `ModelProvider` call — hook for the 150-call cap.
 - **IdleDetector**: macOS Quartz HID hardware-event idle timer. Synthetic input from the driver must never mask the owner's return.
-- **Watch loop**: the polling cycle that observes idle gates and starts Sessions when they open. Runs in exactly one process per data dir (CLI headless or `idle-cua serve`), never two. _Avoid_: daemon, background service.
+- **Watch loop**: the polling cycle that observes idle gates and starts Sessions when they open. It resumes the oldest paused Task before starting the oldest queued Task, and runs in exactly one process per data dir (CLI headless or `idle-cua serve`), never two. _Avoid_: daemon, background service.
 - **Demo mode**: the state when no provider key is configured; sessions run on the deterministic stub planner and every surface badges it, never presenting stub output as LLM work. _Avoid_: stub mode, fake mode.
 - **Deny-zone**: sensitive area inside an allowed site that is always blocked (DMs/chats, account/settings, password/2FA/billing, re-auth, notifications).
 - **Allowlist**: closed set of sites the agent may visit. Preseeded with `x.com`, `reddit.com`, `youtube.com`, `github.com`, `news.ycombinator.com`, `arxiv.org`, `facebook.com`, `instagram.com`, `linkedin.com`, `tiktok.com`, `bsky.app`, `threads.net`, `mastodon.social`, `google.com`; extendable only by the owner.
 - **Anti-repeat**: 7-day window that suppresses exact duplicate normalized queries, processed URLs, and plan fingerprints.
-- **Session / Report**: one bounded run (≤45 min, ≤200 actions, ≤150 LLM calls/day) that ends with a persisted Markdown report and rows in local SQLite.
+- **Session / Report**: one bounded run for exactly one Task (≤45 min of cumulative active planning and execution, ≤200 actions, ≤150 LLM calls/day) that produces one persisted Markdown report when the Task reaches a terminal state. A resumed Session keeps its existing Plan, continues from the next unexecuted Action, and retains cumulative limits; waiting and paused time do not consume its duration limit.
+- **Cancellation**: an owner request to end a queued or paused Task. It moves the Task to `stopped` without acting on any other Task.
+- **Emergency stop**: an idempotent owner request to disable the Watch loop, halt the active Session, release all held input, and stop Agent-started processes. It moves the active Task to `stopped` when one exists; it is distinct from Cancellation even though both share the terminal state.
 - **Permissions**: macOS Accessibility and Screen Recording grants checked via `profile check-permissions` / `doctor` with remediation steps.
 
 ## States
@@ -36,10 +38,10 @@ Single-context glossary for the IdleCUA domain. Use these terms verbatim in code
 `planning` — building a bounded plan.
 `running` — executing typed actions.
 `paused_by_user` — owner returned; input halted, held keys/buttons released.
-`paused_for_approval` — awaiting interactive y/n for a confirmation-required action.
-`completed` — task finished successfully.
-`failed` — task failed (planning or execution error).
-`stopped` — emergency stop / cancellation (SIGINT/SIGTERM/CLI kill), LLM-independent.
+`paused_for_approval` — active time is paused while an interactive CLI waits for confirmation of an Action; approval resumes execution and refusal skips that Action. Unattended Sessions never enter this state.
+`completed` — terminal; task finished successfully.
+`failed` — terminal; task failed (planning or execution error).
+`stopped` — terminal; Emergency stop or Cancellation (SIGINT/SIGTERM/CLI kill), LLM-independent.
 
 ## Out of scope terms (MVP)
 

@@ -5,6 +5,7 @@ import time
 import json
 import uuid
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,7 +23,7 @@ from ..keychain import get_default_store
 from ..profile.store import load_profile, save_profile
 from ..profile.models import Profile, BrowserConsent
 from ..profile.validate import validate_profile
-from .lock import acquire_lock, release_lock, get_lock_info, is_locked
+from .lock import acquire_lock, get_lock_info, is_locked
 from .humanize import humanize_action
 
 
@@ -53,6 +54,10 @@ class ProviderCreate(BaseModel):
 
     class Config:
         json_schema_extra = {"example": {"name": "openrouter", "base_url": "https://openrouter.ai/api/v1", "model": "anthropic/claude-3.5-sonnet", "api_key": "••••"}}
+
+
+class PlanPreviewRequest(BaseModel):
+    goal: str
 
 
 # Global per-process scheduler state (live, not reconstructed from SQLite)
@@ -164,6 +169,183 @@ def _mask_key(key: str) -> str:
     return "sk-..." + key[-4:] if key.startswith("sk-") else "••••" + key[-4:]
 
 
+def fmt_dt(value: Any) -> str:
+    """Single human date format for the Local UI: `02 Sep 2026 · 17:01`.
+
+    Replaces the three ad-hoc formats (raw ISO with microseconds in Tasks /
+    Reports, sliced ISO in History, date-only on the dashboard) with one.
+    Unparseable input falls back to a truncated readable string, never empty.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "—"
+    s = str(value).strip()
+    try:
+        iso = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%d %b %Y · %H:%M")
+    except Exception:
+        return s[:16].replace("T", " ")
+
+
+def fmt_dt_s(value: Any) -> str:
+    """fmt_dt with seconds — for same-minute histories (`02 Sep · 16:57:40`)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "—"
+    s = str(value).strip()
+    try:
+        iso = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%d %b · %H:%M:%S")
+    except Exception:
+        return s[:19].replace("T", " ")
+
+
+def fmt_dur(seconds: Any) -> str:
+    """One duration vocabulary for the whole UI — minutes, not seconds."""
+    try:
+        total = int(float(seconds or 0))
+    except Exception:
+        return "—"
+    if total < 60:
+        return f"{total} s"
+    mins = total // 60
+    if mins < 60:
+        return f"{mins} min"
+    hours, mins = divmod(mins, 60)
+    return f"{hours} h {mins} min" if mins else f"{hours} h"
+
+
+def human_label(action: str, target: str | None = None) -> str:
+    """Jinja filter — one human action dictionary for Inspector, History, Reports."""
+    return humanize_action(action or "", target)
+
+
+def _notice_level(message: str) -> str:
+    """Classify a history notice so routine notes are not all red errors.
+
+    info: lifecycle notes (agent tabs closed at task end).
+    warning: skipped repeats and retried verifications.
+    error: everything else (genuine failures).
+    """
+    m = (message or "").lower()
+    if m.startswith("closed ") or "tab(s)" in m:
+        return "info"
+    if "skipped repeat" in m or "retry" in m or "verify failed" in m:
+        return "warning"
+    return "error"
+
+
+# Snake_case action kinds that may leak into generated reports, mapped once to the
+# same human labels the Inspector and History use (single UI dictionary).
+_ACTION_LABEL_KEYS: dict[str, str] = {}
+for _k in (
+    "open_allowed_site", "open_link", "read_ui", "extract_public_info",
+    "save_note", "create_note", "save_link", "close_own_tab", "close_own_app",
+    "open_app", "send_message", "submit_form", "form_submit", "edit_document",
+):
+    _ACTION_LABEL_KEYS[_k] = humanize_action(_k)
+
+
+def _render_markdown(md: str) -> str:
+    """Minimal Markdown → HTML for session reports (headings, bold, code, lists).
+
+    Deliberately small: no new dependency, no italic (single underscores appear
+    in raw report spans and URLs). Input is HTML-escaped first.
+    """
+    import html as _html
+    import re as _re
+
+    def _inline(s: str) -> str:
+        s = _html.escape(s)
+        s = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = _re.sub(r"`([^`]+?)`", r"<code class='mono text-[13px] bg-zinc-100 px-1 rounded'>\1</code>", s)
+        # Reports are generated with internal snake_case kinds (read_ui, save_note…).
+        # Render the same human labels the rest of the UI uses (one dictionary).
+        for _key in sorted(_ACTION_LABEL_KEYS, key=len, reverse=True):
+            s = _re.sub(r"\b" + _key + r"\b", _ACTION_LABEL_KEYS[_key], s)
+        return s
+
+    out: list[str] = []
+    in_list = False
+    for ln in (md or "").splitlines() + [""]:
+        st = ln.strip()
+        if st.startswith("### "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h3 class='text-[15px] font-semibold mt-4'>{_inline(st[4:])}</h3>")
+        elif st.startswith("## "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h2 class='text-base font-semibold mt-5'>{_inline(st[3:])}</h2>")
+        elif st.startswith("# "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h1 class='text-lg font-semibold mt-5'>{_inline(st[2:])}</h1>")
+        elif st.startswith("- "):
+            if not in_list:
+                out.append("<ul class='list-disc ml-5 mt-2 space-y-1 text-[15px] leading-relaxed'>")
+                in_list = True
+            _item = st[2:].strip()
+            # Empty report sections say "(none)" — render as quiet None, not content.
+            if _item == "(none)":
+                out.append("<li class='text-zinc-400 italic'>None</li>")
+            elif _item.startswith("(no ") and _item.endswith(")"):
+                out.append(f"<li class='text-zinc-500'>{_inline(_item[1:-1])}</li>")
+            elif _item.startswith("Actions planned:"):
+                # "- Actions planned: open_allowed_site, search, …" — one label per kind.
+                _kinds = [_k.strip().strip("`") for _k in _item[len("Actions planned:"):].split(",")]
+                _labels = [humanize_action(_k) for _k in _kinds if _k]
+                out.append(f"<li>Actions planned: {_inline(', '.join(_labels))}</li>")
+            else:
+                _m = _re.match(r"([a-z][a-z_]+)( — not executed.*)$", _item)
+                if _m and ("_" in _m.group(1)):
+                    out.append(f"<li>{_inline(humanize_action(_m.group(1)) + _m.group(2))}</li>")
+                else:
+                    out.append(f"<li>{_inline(_item)}</li>")
+        elif not st:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+        else:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            # A whole-line _..._ span (report meta line) renders as muted text.
+            if len(st) > 2 and st.startswith("_") and st.endswith("_"):
+                out.append(f"<p class='mt-2 text-sm text-zinc-500'>{_inline(st[1:-1])}</p>")
+            else:
+                out.append(f"<p class='mt-2 text-[15px] leading-relaxed'>{_inline(st)}</p>")
+    return "".join(out)
+
+
+def _sidebar_ctx(data_dir: Path, idle_app: IdleCua) -> dict:
+    """Shared sidebar view-model so every page shows the same agent status."""
+    lock_info = get_lock_info(data_dir)
+    watch_loop = {
+        "running": bool(_scheduler_state.get("running")),
+        "pid": _scheduler_state.get("pid") or (lock_info.get("pid") if lock_info else None),
+        "started_at": _scheduler_state.get("started_at"),
+        "lock": lock_info,
+    }
+    try:
+        demo_mode = bool(idle_app.is_demo_mode())
+    except Exception:
+        demo_mode = True
+    try:
+        threshold = int(idle_app.get_effective_idle_threshold())
+    except Exception:
+        threshold = 600
+    return {
+        "watch_loop": watch_loop,
+        "lock_info": lock_info,
+        "effective_idle_threshold": threshold,
+        "demo_mode": demo_mode,
+    }
+
+
 def _get_masked_provider(store: ProviderStore, name: str) -> dict:
     cfg = store.get(name)
     # Try to get real key length but don't leak
@@ -177,6 +359,89 @@ def _get_masked_provider(store: ProviderStore, name: str) -> dict:
         "masked_key": masked,
         "selected": store.is_selected(name),
     }
+
+
+def _enrich_plan_verdicts(idle_app: IdleCua, plan) -> list[dict]:
+    """Humanize plan verdicts for Local UI rendering (shared by preview endpoints)."""
+    verdicts = idle_app.get_plan_verdicts(plan)
+    for v in verdicts:
+        v["label"] = humanize_action(v["action"], v.get("domain") or plan.target)
+        if v["verdict"] == "blocked" and "allowlist" in v.get("reason", "").lower():
+            v["allowlist_link"] = "/settings#allowlist"
+        if v["verdict"] == "needs-confirmation":
+            v["unattended_action"] = "skipped in unattended runs"
+    return verdicts
+
+
+def _is_plan_skipped(idle_app: IdleCua, task_id: str) -> bool:
+    """A plan-level anti-repeat skip looks completed but ran zero actions.
+
+    Showing it as green `completed` misleads; the UI maps it to `skipped`.
+    """
+    try:
+        errors = idle_app.memory.list_errors(task_id=task_id)
+    except Exception:
+        return False
+    if not any("skipped repeat plan" in (e.get("message") or "") for e in errors):
+        return False
+    try:
+        return len(idle_app.memory.list_actions(task_id=task_id)) == 0
+    except Exception:
+        return False
+
+
+def _ui_state_for_task(idle_app: IdleCua, raw_state: str, task_id: str) -> str:
+    """Map internal AgentState to the one UI vocabulary (queued/running/…/skipped)."""
+    if raw_state == "waiting_for_idle":
+        return "queued"
+    if raw_state == "disabled":
+        return "queued"
+    if raw_state == "completed" and _is_plan_skipped(idle_app, task_id):
+        return "skipped"
+    return raw_state
+
+
+def _enrich_tasks_with_results(idle_app: IdleCua, tasks: list[dict]) -> list[dict]:
+    """Shared task enrichment for the Local UI (dashboard + /tasks).
+
+    Adds `ui_state` (waiting_for_idle/disabled → queued) and `result_str`
+    (findings/urls counts, reused per #32) plus the raw counts. Urls are
+    fetched once and partitioned per task instead of scanned per task.
+    """
+    try:
+        all_urls = idle_app.memory.list_urls(limit=1000)
+    except Exception:
+        all_urls = []
+    urls_by_task: dict[str, int] = {}
+    for u in all_urls:
+        tid = u.get("task_id")
+        if tid:
+            urls_by_task[tid] = urls_by_task.get(tid, 0) + 1
+    enriched = []
+    for t in tasks:
+        tid = t.get("id", "")
+        try:
+            findings = idle_app.memory.list_findings(task_id=tid)
+        except Exception:
+            findings = []
+        n_findings = len(findings) if findings else 0
+        n_urls = urls_by_task.get(tid, 0)
+        state = t.get("state", "unknown")
+        ui_state = _ui_state_for_task(idle_app, state, tid)
+        if ui_state == "skipped":
+            result_str = "skipped — duplicate"
+        elif state in ("waiting_for_idle", "disabled", "queued"):
+            result_str = "—"
+        else:
+            result_str = f"{n_findings} findings · {n_urls} urls"
+        enriched.append({
+            **t,
+            "ui_state": ui_state,
+            "findings_count": n_findings,
+            "urls_count": n_urls,
+            "result_str": result_str,
+        })
+    return enriched
 
 
 def _watch_loop_worker(data_dir: Path, poll_interval: float = 5.0):
@@ -315,6 +580,11 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     templates = Jinja2Templates(directory=str(templates_dir)) if templates_dir.exists() else None
+    if templates is not None:
+        templates.env.filters["fmt_dt"] = fmt_dt
+        templates.env.filters["fmt_dt_s"] = fmt_dt_s
+        templates.env.filters["fmt_dur"] = fmt_dur
+        templates.env.filters["human_label"] = human_label
 
     # Helper to get app instance per request (thin)
     def get_app_instance() -> IdleCua:
@@ -376,13 +646,9 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 findings = []
                 task_urls = []
                 errors = []
-            # Map internal states to UI states: waiting_for_idle -> queued, disabled -> queued?
+            # Map internal states to the one UI vocabulary (queued / skipped / …).
             state = t.get("state", "unknown")
-            ui_state = state
-            if state == "waiting_for_idle":
-                ui_state = "queued"
-            elif state == "disabled":
-                ui_state = "queued"
+            ui_state = _ui_state_for_task(idle_app, state, tid)
             enriched.append({
                 **t,
                 "state": state,
@@ -488,6 +754,35 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             "result_counts": {"findings": len(findings), "urls": len(urls)},
         }
 
+    @app.post("/api/v1/plans/preview")
+    def api_preview_plan(payload: PlanPreviewRequest):
+        """Dry-run plan preview without persisting a task (no side effects)."""
+        goal = (payload.goal or "").strip()
+        if not goal:
+            raise HTTPException(status_code=400, detail="goal must be non-empty")
+        idle_app = _get_idle_cua(resolved_data_dir)
+        try:
+            plan = idle_app.dry_run(goal)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        verdicts = _enrich_plan_verdicts(idle_app, plan)
+        return {
+            "goal": goal,
+            "plan": idle_app.plan_to_dict(plan),
+            "verdicts": verdicts,
+            "human_labels": [humanize_action(a, plan.target) for a in plan.expected_actions],
+            "budget": {
+                "max_duration_minutes": plan.max_duration_minutes,
+                "max_actions": plan.max_actions,
+                "risk_level": plan.risk_level.value,
+                "requires_confirmation": plan.requires_confirmation,
+            },
+            "this_plan_budget": {
+                "max_duration_minutes": plan.max_duration_minutes,
+                "max_actions": plan.max_actions,
+            },
+        }
+
     @app.post("/api/v1/tasks/{task_id}/plan")
     def api_plan_preview(task_id: str):
         idle_app = _get_idle_cua(resolved_data_dir)
@@ -500,14 +795,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             plan = idle_app.dry_run(goal)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
-        verdicts = idle_app.get_plan_verdicts(plan)
-        for v in verdicts:
-            v["label"] = humanize_action(v["action"], v.get("domain") or plan.target)
-            if v["verdict"] == "blocked" and "allowlist" in v.get("reason","").lower():
-                v["allowlist_link"] = "/settings#allowlist"
-            # For needs-confirmation, indicate skipped in unattended
-            if v["verdict"] == "needs-confirmation":
-                v["unattended_action"] = "skipped in unattended runs"
+        verdicts = _enrich_plan_verdicts(idle_app, plan)
         # Ensure no driver calls happened — dry_run already guarantees
         return {
             "task_id": task_id,
@@ -625,6 +913,21 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 except Exception:
                     pass
                 raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/v1/tasks/{task_id}")
+    def api_cancel_task(task_id: str):
+        """Owner cancels a queued task — it will never start (state → stopped)."""
+        idle_app = _get_idle_cua(resolved_data_dir)
+        data = idle_app.memory.get_task(task_id)
+        if not data:
+            raise HTTPException(status_code=404, detail="task not found")
+        if data.get("state") not in ("waiting_for_idle", "disabled", "queued"):
+            raise HTTPException(status_code=409, detail="only queued tasks can be cancelled")
+        try:
+            idle_app.memory.update_task_state(task_id, "stopped")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {"ok": True, "task_id": task_id, "state": "stopped"}
 
     @app.get("/api/v1/history")
     def api_history(task_id: str | None = None, limit: int = 200):
@@ -861,7 +1164,12 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.post("/api/v1/scheduler/start")
     def api_scheduler_start():
         data_dir = resolved_data_dir
-        # Try to acquire lock
+        # Try to acquire lock. Serve already holds the process-level lock
+        # (CLI acquires at startup, then runs uvicorn in-process), so the
+        # self-owned conflict below is the normal path for UI starts
+        # (ADR-0004: serve owns the Watch loop). No blind early-return on
+        # cached running-state: always reconcile with the lock file so a
+        # dead worker is healed and a foreign owner still 409s.
         try:
             info = acquire_lock(data_dir)
             _scheduler_state["running"] = True
@@ -873,17 +1181,35 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             return {"ok": True, "state": _scheduler_state, "lock": info}
         except RuntimeError as e:
             if "already running" in str(e):
+                # Serve holds the process-level lock itself (CLI acquires at
+                # startup, then runs uvicorn in-process): starting the Watch
+                # loop from the UI is self-owned, not a conflict (ADR-0004).
+                existing = get_lock_info(data_dir)
+                try:
+                    owner_pid = int(existing.get("pid")) if existing else None
+                except Exception:
+                    owner_pid = None
+                if owner_pid is not None and owner_pid == os.getpid():
+                    _scheduler_state["running"] = True
+                    _scheduler_state["pid"] = owner_pid
+                    _scheduler_state["started_at"] = existing.get("started_at")
+                    if not test_mode:
+                        _start_watch_worker(data_dir)
+                    return {"ok": True, "state": _scheduler_state, "lock": existing}
                 raise HTTPException(status_code=409, detail=str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/api/v1/scheduler/stop")
     def api_scheduler_stop():
-        data_dir = resolved_data_dir
+        # Stop halts the Watch loop and clears running-state only.
+        # It must NOT release the process-level serve lock: the lock guards
+        # "exactly one serve per data dir" for the lifetime of the process
+        # (acquired in cli.py, released on serve exit). Releasing here would
+        # let a second serve start on the same data dir while this one runs.
         _scheduler_state["running"] = False
         _scheduler_state["pid"] = None
         _scheduler_state["started_at"] = None
         _stop_watch_worker()
-        release_lock(data_dir)
         return {"ok": True, "state": _scheduler_state}
 
     @app.post("/api/v1/emergency-stop")
@@ -967,52 +1293,30 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         except Exception:
             pass
         checklist = [
-            {"id": "profile", "label": "Profile confirmed", "desc": "Conservative defaults — readonly, 45 min, 14 sites", "done": bool(profile and profile.confirmed), "cta": "Confirmed ✓" if profile and profile.confirmed else "Confirm defaults"},
-            {"id": "provider", "label": "Provider key", "desc": "No LLM key — stub planner only" if not has_key else "Provider key configured", "done": has_key, "cta": "Add key" if not has_key else "Configured"},
+            {"id": "profile", "label": "Profile confirmed", "desc": "Safe defaults — read-only, 45 min sessions", "done": bool(profile and profile.confirmed), "cta": "Confirmed ✓" if profile and profile.confirmed else "Confirm defaults"},
+            {"id": "provider", "label": "Provider key", "desc": "No AI key — demo planner only" if not has_key else "AI key configured — full runs enabled", "done": has_key, "cta": "Add key" if not has_key else "Configured"},
             {"id": "permissions", "label": "macOS permissions", "desc": "Accessibility & Screen Recording granted" if perms_ok else "Grant Accessibility & Screen Recording", "done": perms_ok, "cta": "Granted" if perms_ok else "Check"},
-            {"id": "browser", "label": "Browser consent", "desc": "Agent may use main Chrome — own tabs only" if browser_ok else "Grant browser consent", "done": browser_ok, "cta": "Granted" if browser_ok else "Grant"},
+            {"id": "browser", "label": "Browser consent", "desc": "Agent may use its own Chrome tabs" if browser_ok else "Let the agent use its own Chrome tabs", "done": browser_ok, "cta": "Granted" if browser_ok else "Grant"},
         ]
         done_count = sum(1 for c in checklist if c["done"])
         # Today's usage meters
         from ..accounting import get_today_count
 
         llm_today = get_today_count(data_dir)
-        # Tasks
+        # Tasks (shared enrichment: ui_state + result summary)
         tasks = idle_app.memory.list_tasks(limit=20)
-        # Enrich tasks with result counts and ui_state
-        tasks_enriched = []
-        for t in tasks:
-            tid = t["id"]
-            # findings/urls counts
-            try:
-                findings = idle_app.memory.list_findings(task_id=tid)
-                all_urls = idle_app.memory.list_urls(limit=500)
-                task_urls = [u for u in all_urls if u.get("task_id") == tid]
-                errors = idle_app.memory.list_errors(task_id=tid)
-            except Exception:
-                findings = []
-                task_urls = []
-                errors = []
-            state = t.get("state", "unknown")
-            ui_state = state
-            if state == "waiting_for_idle":
-                ui_state = "queued"
-            elif state == "disabled":
-                ui_state = "queued"
-            # result string
-            result_str = f"{len(findings)} findings · {len(task_urls)} urls" if state not in ("queued", "waiting_for_idle", "disabled") else "—"
-            # failure reason for Retry
+        tasks_enriched = _enrich_tasks_with_results(idle_app, tasks)
+        # Failure reason for Retry (failed tasks only)
+        for t in tasks_enriched:
             failure_reason = ""
-            if state == "failed" and errors:
-                failure_reason = errors[0].get("message", "")[:80] if errors else ""
-            tasks_enriched.append({
-                **t,
-                "ui_state": ui_state,
-                "findings_count": len(findings),
-                "urls_count": len(task_urls),
-                "result_str": result_str,
-                "failure_reason": failure_reason,
-            })
+            if t.get("state") == "failed":
+                try:
+                    errors = idle_app.memory.list_errors(task_id=t.get("id", ""))
+                    if errors:
+                        failure_reason = errors[0].get("message", "")[:80]
+                except Exception:
+                    pass
+            t["failure_reason"] = failure_reason
 
         # Inspector for first task? Use most recent
         inspector_task = tasks_enriched[0] if tasks_enriched else None
@@ -1040,12 +1344,23 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         # Today meters from enriched limits (single source; mirrors api_status)
         _limits_dash = enriched_dash.get("limits", {})
         _daily = enriched_dash.get("daily_usage", {})
+        try:
+            _idle_seconds = float(enriched_dash.get("idle_seconds", 0.0) or 0.0)
+        except Exception:
+            _idle_seconds = 0.0
+        # Deep-link from /tasks rows: ?inspect=<id> pre-selects the task.
+        inspect_id = (request.query_params.get("inspect") or "").strip() or None
+        if inspect_id and not any(t.get("id") == inspect_id for t in tasks_enriched):
+            inspect_id = None
         return templates.TemplateResponse(
             request,
             "dashboard.html",
             {
+                "active": "dashboard",
                 "config": config,
                 "effective_idle_threshold": effective_idle,
+                "idle_threshold": effective_idle,
+                "idle_seconds": _idle_seconds,
                 "honest": honest,
                 "demo_mode": bool(enriched_dash.get("demo_mode", False)),
                 "checklist": checklist,
@@ -1062,6 +1377,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 "watch_loop": enriched_dash.get("watch_loop", watch_loop_dash),
                 "tasks": tasks_enriched,
                 "inspector": inspector,
+                "inspect_id": inspect_id,
                 "lock_info": lock_info_dash,
             },
         )
@@ -1083,17 +1399,55 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         demo_mode = bool(enriched_frag.get("demo_mode", False))
         if templates is None:
             return HTMLResponse(f"<div>{honest.get('text','')}</div>")
-        return templates.TemplateResponse(request, "partials/status_banner.html", {"honest": honest, "demo_mode": demo_mode})
+        try:
+            idle_seconds = float(enriched_frag.get("idle_seconds", 0.0) or 0.0)
+        except Exception:
+            idle_seconds = 0.0
+        try:
+            idle_threshold = int(enriched_frag.get("idle_threshold_seconds", 600))
+        except Exception:
+            idle_threshold = 600
+        return templates.TemplateResponse(
+            request,
+            "partials/status_banner.html",
+            {
+                "honest": honest,
+                "demo_mode": demo_mode,
+                "idle_seconds": idle_seconds,
+                "idle_threshold": idle_threshold,
+            },
+        )
 
     @app.get("/tasks", response_class=HTMLResponse)
     def ui_tasks(request: Request):
-        # Simple tasks page
         if templates is None:
             return HTMLResponse("<html><body>Tasks</body></html>")
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        tasks = idle_app.memory.list_tasks(limit=100)
-        return templates.TemplateResponse(request, "tasks.html", {"tasks": tasks})
+        raw_tasks = idle_app.memory.list_tasks(limit=100)
+        # Reuse the dashboard enrichment so Result no longer duplicates State.
+        tasks_enriched = _enrich_tasks_with_results(idle_app, raw_tasks)
+        # Counts for the segmented state filter (over the unfiltered list).
+        state_counts: dict[str, int] = {}
+        for t in tasks_enriched:
+            st = t.get("ui_state", "unknown")
+            state_counts[st] = state_counts.get(st, 0) + 1
+        total_count = len(tasks_enriched)
+        state_filter = (request.query_params.get("state") or "").strip()
+        if state_filter and state_filter != "all":
+            tasks_enriched = [t for t in tasks_enriched if t.get("ui_state") == state_filter]
+        return templates.TemplateResponse(
+            request,
+            "tasks.html",
+            {
+                "active": "tasks",
+                "tasks": tasks_enriched,
+                "state_filter": state_filter or "all",
+                "state_counts": state_counts,
+                "total_count": total_count,
+                **_sidebar_ctx(data_dir, idle_app),
+            },
+        )
 
     @app.get("/history", response_class=HTMLResponse)
     def ui_history(request: Request):
@@ -1103,8 +1457,21 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         task_filter = request.query_params.get("task_id") or request.query_params.get("task")
         # Reuse single helper for API/UI filtering (DRY)
         hist = _fetch_history_filtered(idle_app, task_filter, limit=200)
+        # Classify notices so routine notes are not rendered as red errors.
+        for e in hist.get("errors", []):
+            e["level"] = _notice_level(e.get("message", ""))
         tasks = idle_app.memory.list_tasks(limit=100)
-        return templates.TemplateResponse(request, "history.html", {"history": hist, "tasks": tasks, "selected_task": task_filter})
+        return templates.TemplateResponse(
+            request,
+            "history.html",
+            {
+                "active": "history",
+                "history": hist,
+                "tasks": tasks,
+                "selected_task": task_filter,
+                **_sidebar_ctx(resolved_data_dir, idle_app),
+            },
+        )
 
     @app.get("/reports", response_class=HTMLResponse)
     def ui_reports(request: Request):
@@ -1112,7 +1479,37 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             return HTMLResponse("<html><body>Reports</body></html>")
         idle_app = _get_idle_cua(resolved_data_dir)
         reports = idle_app.list_reports(limit=20)
-        return templates.TemplateResponse(request, "reports.html", {"reports": reports})
+        # Show the task goal instead of a bare hex id so reports are findable,
+        # plus a one-line summary (state · findings · pages) for the list.
+        try:
+            all_urls = idle_app.memory.list_urls(limit=1000)
+        except Exception:
+            all_urls = []
+        urls_by_task: dict[str, int] = {}
+        for u in all_urls:
+            tid = u.get("task_id")
+            if tid:
+                urls_by_task[tid] = urls_by_task.get(tid, 0) + 1
+        for r in reports:
+            tid = r.get("task_id", "")
+            try:
+                task = idle_app.memory.get_task(tid)
+                r["title"] = (task.get("description") or "Untitled task") if task else "Untitled task"
+                raw_state = (task.get("state") or "unknown") if task else "unknown"
+            except Exception:
+                r["title"] = "Untitled task"
+                raw_state = "unknown"
+            r["ui_state"] = _ui_state_for_task(idle_app, raw_state, tid)
+            try:
+                n_findings = len(idle_app.memory.list_findings(task_id=tid))
+            except Exception:
+                n_findings = 0
+            r["summary"] = f"{n_findings} findings · {urls_by_task.get(tid, 0)} pages"
+        return templates.TemplateResponse(
+            request,
+            "reports.html",
+            {"active": "reports", "reports": reports, **_sidebar_ctx(resolved_data_dir, idle_app)},
+        )
 
     @app.get("/reports/{task_id}", response_class=HTMLResponse)
     def ui_report_detail(task_id: str, request: Request):
@@ -1127,11 +1524,46 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 rep = {"markdown": md}
             else:
                 raise HTTPException(status_code=404, detail="report not found")
-        # Render markdown as html? Simple: wrap in <pre>
-        import html as _html
+        md_text = rep.get("markdown", "")
+        try:
+            task = idle_app.memory.get_task(task_id)
+            title = (task.get("description") or "Untitled task") if task else "Untitled task"
+            raw_state = (task.get("state") or "unknown") if task else "unknown"
+        except Exception:
+            title = "Untitled task"
+            raw_state = "unknown"
+        ui_state = _ui_state_for_task(idle_app, raw_state, task_id)
+        # The stored report repeats its own H1 and a raw-ISO Generated line —
+        # the page header already shows the goal and a human date.
+        import re as _re
 
-        md_html = "<pre>" + _html.escape(rep.get("markdown","")) + "</pre>"
-        return templates.TemplateResponse(request, "report_detail.html", {"task_id": task_id, "markdown": rep.get("markdown",""), "markdown_html": md_html})
+        lines = md_text.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines and lines[0].lstrip().startswith("# IdleCUA Session Report"):
+            lines.pop(0)
+        md_text = "\n".join(lines)
+        md_text = _re.sub(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+            lambda m: fmt_dt(m.group(0)),
+            md_text,
+            count=1,
+        )
+        md_html = _render_markdown(md_text)
+        return templates.TemplateResponse(
+            request,
+            "report_detail.html",
+            {
+                "active": "reports",
+                "task_id": task_id,
+                "title": title,
+                "ui_state": ui_state,
+                "created_at": rep.get("created_at", ""),
+                "markdown": md_text,
+                "markdown_html": md_html,
+                **_sidebar_ctx(resolved_data_dir, idle_app),
+            },
+        )
 
     @app.get("/settings", response_class=HTMLResponse)
     def ui_settings(request: Request):
@@ -1140,7 +1572,12 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         data_dir = resolved_data_dir
         config = IdleCuaConfig.load(data_dir)
         profile = load_profile(data_dir / "profile.json")
-        return templates.TemplateResponse(request, "settings.html", {"config": config, "profile": profile})
+        idle_app = _get_idle_cua(data_dir)
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {"active": "settings", "config": config, "profile": profile, **_sidebar_ctx(data_dir, idle_app)},
+        )
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     def ui_diagnostics(request: Request):
@@ -1161,8 +1598,46 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         profile_errors = list(prof.get("errors") or [])
         lock = bundle.get("scheduler_lock", {}).get("info")
         watch_loop = bundle.get("watch_loop", watch)
+        drv = bundle.get("driver", {}) if isinstance(bundle.get("driver"), dict) else {}
+        secrets = bundle.get("secrets_scan", {}) if isinstance(bundle.get("secrets_scan"), dict) else {}
+        # One-line summary for the page header (ok / warnings / errors).
+        ok_count = sum(1 for p in perms_data if p.get("granted") is True)
+        warn_count = sum(1 for p in perms_data if p.get("granted") is not True)
+        if drv.get("ok"):
+            ok_count += 1
+        else:
+            warn_count += 1
+        if profile_valid:
+            ok_count += 1
+        else:
+            warn_count += 1
+        if secrets.get("ok", True):
+            ok_count += 1
+        else:
+            warn_count += 1
+        from datetime import timezone as _tz
+
         return templates.TemplateResponse(
-            request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": watch_loop}
+            request,
+            "diagnostics.html",
+            {
+                "active": "diagnostics",
+                "perms": perms_data,
+                "profile_valid": profile_valid,
+                "profile_errors": profile_errors,
+                "lock": lock,
+                "watch_loop": watch_loop,
+                "driver_ok": bool(drv.get("ok", False)),
+                "driver_message": str(drv.get("message", "")),
+                "driver_version": str(drv.get("version") or ""),
+                "driver_accessibility": drv.get("accessibility"),
+                "driver_screen_recording": drv.get("screen_recording"),
+                "secrets_ok": bool(secrets.get("ok", True)),
+                "secrets_findings": list(secrets.get("findings") or []),
+                "diag_summary": f"{ok_count} OK · {warn_count} need attention" if warn_count else f"{ok_count} OK",
+                "checked_at": datetime.now(_tz.utc).isoformat(),
+                **_sidebar_ctx(data_dir, idle_app),
+            },
         )
 
     return app

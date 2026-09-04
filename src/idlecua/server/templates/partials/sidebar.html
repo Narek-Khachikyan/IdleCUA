@@ -1,0 +1,70 @@
+{# Shared sidebar — single source for Dashboard and all secondary pages. #}
+{# Expects: active, watch_loop, effective_idle_threshold, demo_mode. #}
+{# DEMO lives here and nowhere else in the chrome. #}
+{% set nav = [
+  ('dashboard', '/', '◎', 'Dashboard'),
+  ('tasks', '/tasks', '◧', 'Tasks'),
+  ('history', '/history', '≡', 'History'),
+  ('reports', '/reports', '▭', 'Reports'),
+  ('settings', '/settings', '⚙', 'Settings'),
+  ('diagnostics', '/diagnostics', '⧉', 'Diagnostics'),
+] %}
+<aside id="sidebar" class="hidden lg:flex fixed lg:static inset-y-0 left-0 z-40 w-[260px] shrink-0 bg-zinc-900 border-r border-zinc-800 flex-col">
+  <div class="px-5 py-5 border-b border-zinc-800">
+    <div class="flex items-center gap-2.5">
+      <div class="w-8 h-8 rounded-lg bg-white text-zinc-900 grid place-items-center font-bold text-[13px]">◧</div>
+      <div>
+        <div class="text-[13px] font-semibold leading-none text-white">IdleCUA</div>
+        <div class="text-[11px] text-zinc-500">Local agent</div>
+      </div>
+      {% if demo_mode %}<span class="ml-auto text-[10px] tracking-widest font-semibold bg-amber-400 text-zinc-900 px-1.5 py-0.5 rounded">DEMO</span>{% endif %}
+    </div>
+  </div>
+  <nav class="p-3 space-y-1 text-[14px]">
+    {% for id, href, icon, label in nav %}
+    <a href="{{ href }}" class="flex items-center gap-2.5 px-3 py-2 rounded-lg font-medium {{ 'bg-white text-zinc-900' if active == id else 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800' }}"><span class="w-5 text-center text-[15px]">{{ icon }}</span> {{ label }}</a>
+    {% endfor %}
+  </nav>
+  <div class="mt-auto p-3 space-y-3 border-t border-zinc-800">
+    <div class="bg-zinc-800 rounded-xl p-3">
+      <div class="text-[11px] tracking-widest font-semibold text-zinc-400">IDLE WATCHING</div>
+      <div class="flex items-center gap-2 mt-1.5">
+        <span class="w-2 h-2 rounded-full {{ 'bg-emerald-500 animate-pulse' if watch_loop.running else 'bg-zinc-500' }}"></span>
+        <span class="text-sm font-medium text-white">{{ 'On' if watch_loop.running else 'Off' }}</span>
+        <span class="ml-auto text-xs text-zinc-500">after {{ effective_idle_threshold|fmt_dur }} idle</span>
+      </div>
+      {% if watch_loop.running %}
+      <button onclick="schedulerStop(this)" title="Stop starting queued tasks when you are away" class="mt-2 w-full text-xs bg-zinc-700 text-white px-2.5 py-1.5 rounded-full">Turn off</button>
+      {% else %}
+      <button onclick="schedulerStart(this)" title="Start queued tasks when you are away" class="mt-2 w-full text-xs bg-white text-zinc-900 px-2.5 py-1.5 rounded-full font-medium">Turn on</button>
+      {% endif %}
+    </div>
+    <div>
+      <button onclick="fetch('/api/v1/emergency-stop',{method:'POST'}).then(()=>alert('Emergency stop sent'))" title="Halt a running session right now" class="w-full bg-red-600 hover:bg-red-500 text-white text-sm font-semibold py-2.5 rounded-xl">⬢ Emergency stop</button>
+      <div class="text-[11px] text-zinc-400 text-center mt-1.5">Halts a running session now</div>
+    </div>
+  </div>
+</aside>
+<script>
+async function schedulerToggle(action, btn){
+  const label=action==='start'?'Start':'Stop';
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/v1/scheduler/'+action,{method:'POST'});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){location.reload();return;}
+    alert(label+' failed: '+(d.detail||r.status));
+  }catch(e){alert(label+' failed: '+e);}
+  finally{if(btn) btn.disabled=false;}
+}
+async function schedulerStart(btn){return schedulerToggle('start', btn);}
+async function schedulerStop(btn){return schedulerToggle('stop', btn);}
+function toggleSidebar(force){
+  const sb=document.getElementById('sidebar');
+  const bd=document.getElementById('sidebar-backdrop');
+  const show=(typeof force==='boolean') ? force : sb.classList.contains('hidden');
+  sb.classList.toggle('hidden', !show);
+  sb.classList.toggle('flex', show);
+  if(bd) bd.classList.toggle('hidden', !show);
+}
+</script>

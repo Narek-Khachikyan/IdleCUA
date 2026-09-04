@@ -306,3 +306,69 @@ def test_ui_route_smokes(tmp_path: Path):
     assert "Demo" in client.get("/").text or "IdleCUA" in client.get("/").text
     assert "History" in client.get("/history").text
     assert "Settings" in client.get("/settings").text
+
+
+def test_cancel_queued_task(tmp_path: Path):
+    data_dir = tmp_path / "data7"
+    data_dir.mkdir()
+    _confirmed_profile(data_dir)
+    app = create_app(data_dir=data_dir, test_mode=True)
+    client = TestClient(app)
+
+    r = client.post("/api/v1/tasks", json={"goal": "task to cancel"})
+    assert r.status_code == 200, r.text
+    tid = r.json()["task"]["id"]
+
+    resp = client.delete(f"/api/v1/tasks/{tid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "stopped"
+
+    # Cancelling twice is a conflict, unknown id is 404
+    assert client.delete(f"/api/v1/tasks/{tid}").status_code == 409
+    assert client.delete("/api/v1/tasks/does-not-exist").status_code == 404
+
+    # Cancelled task renders as stopped in the UI
+    ui = client.get("/tasks")
+    assert ui.status_code == 200
+    assert "stopped" in ui.text
+
+
+def test_plan_skip_renders_as_skipped_not_completed(tmp_path: Path):
+    data_dir = tmp_path / "data8"
+    data_dir.mkdir()
+    _confirmed_profile(data_dir)
+    app = create_app(data_dir=data_dir, test_mode=True)
+    client = TestClient(app)
+
+    r = client.post("/api/v1/tasks", json={"goal": "duplicate goal"})
+    assert r.status_code == 200, r.text
+    tid = r.json()["task"]["id"]
+
+    # Simulate an anti-repeat plan skip: completed state, zero actions,
+    # plan-level skip notice recorded as an error.
+    from idlecua.memory import MemoryStore
+
+    mem = MemoryStore(data_dir)
+    mem.update_task_state(tid, "completed")
+    mem.record_error("err-skip-1", tid, "skipped repeat plan abc123")
+
+    ui = client.get("/tasks")
+    assert ui.status_code == 200
+    assert "skipped" in ui.text
+
+    api = client.get("/api/v1/tasks")
+    assert api.status_code == 200
+    states = {t["id"]: t["ui_state"] for t in api.json()["tasks"]}
+    assert states[tid] == "skipped"
+
+
+def test_human_filters_and_durations():
+    from idlecua.server.app import fmt_dt, fmt_dt_s, fmt_dur, human_label
+
+    assert fmt_dt("2026-09-02T17:01:46.709484+00:00") == "02 Sep 2026 · 17:01"
+    assert fmt_dt_s("2026-09-02T16:57:40+00:00") == "02 Sep · 16:57:40"
+    assert fmt_dur(45) == "45 s"
+    assert fmt_dur(600) == "10 min"
+    assert fmt_dur(1000) == "16 min"
+    assert human_label("read_ui", "https://x.com") == "Read page"
+    assert human_label("close_own_tab", None) == "Close tab"
