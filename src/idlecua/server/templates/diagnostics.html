@@ -13,8 +13,29 @@
     </ul>
   </div>
   <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Driver probe</h2>
+    {% if driver_ok %}
+    <div class="text-sm">Ready — {{ driver_message }}</div>
+    {% else %}
+    <div class="text-sm">Not ready — {{ driver_message }}</div>
+    {% endif %}
+  </div>
+  <div class="border rounded-xl p-4">
     <h2 class="font-semibold">Profile</h2>
     <div class="text-sm">Valid: {{ profile_valid }} — errors: {{ profile_errors | join(', ') }}</div>
+  </div>
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Secrets scan</h2>
+    {% if secrets_ok %}
+    <div class="text-sm">Secrets scan PASSED — no secrets found.</div>
+    {% else %}
+    <div class="text-sm">Secrets scan FAILED — check these files (patterns only, values never shown):</div>
+    <ul class="text-sm mt-2">
+      {% for f in secrets_findings %}
+      <li>{{ f.source }} — looks like {{ f.pattern }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
   </div>
   <div class="border rounded-xl p-4">
     <h2 class="font-semibold">Scheduler lock</h2>
