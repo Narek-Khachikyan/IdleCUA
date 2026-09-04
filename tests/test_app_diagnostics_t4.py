@@ -448,3 +448,52 @@ def test_scheduler_lock_and_watch_loop_in_bundle(tmp_path: Path, monkeypatch):
 
     b4 = IdleCua(config=IdleCuaConfig(data_dir=d)).get_diagnostics()
     assert b4["scheduler_lock"]["locked"] is False
+
+
+def test_diagnostics_ui_renders_driver_probe_and_secrets_scan(tmp_path: Path, monkeypatch):
+    """Issue #36: /diagnostics renders the driver probe and secrets-scan verdict."""
+    d = tmp_path / "data"
+    d.mkdir(parents=True)
+    _confirmed_profile(d)
+
+    fake_driver = types.ModuleType("cua_driver")
+    fake_driver.__version__ = "9.9.9-ui"
+
+    class _S:
+        accessibility = True
+        screen_recording = False
+
+    fake_driver.current_mac_os_permission_status = lambda: _S()
+    monkeypatch.setitem(sys.modules, "cua_driver", fake_driver)
+
+    from idlecua.secrets_scan import ScanResult, SecretFinding
+
+    fake_scan = ScanResult(
+        ok=False,
+        findings=[SecretFinding(source="ui-fake.txt", pattern="openai_api_key", snippet="sk-UILEAK-123")],
+        scanned_files=1,
+        scanned_db_tables=0,
+        skipped=[],
+    )
+    monkeypatch.setattr("idlecua.secrets_scan.scan_project", lambda project_root=None, data_dir=None: fake_scan)
+    import idlecua.secrets_scan as ss_mod
+
+    monkeypatch.setattr(ss_mod, "scan_project", lambda project_root=None, data_dir=None: fake_scan)
+
+    srv = create_app(data_dir=d, test_mode=True)
+    client = TestClient(srv)
+    html = client.get("/diagnostics").text
+    assert "Driver probe" in html
+    assert "9.9.9-ui" in html
+    assert "Secrets scan FAILED" in html
+    assert "ui-fake.txt" in html
+    assert "openai_api_key" in html
+    assert "sk-UILEAK-123" not in html
+
+    fake_ok = ScanResult(ok=True, findings=[], scanned_files=1, scanned_db_tables=0, skipped=[])
+    monkeypatch.setattr("idlecua.secrets_scan.scan_project", lambda project_root=None, data_dir=None: fake_ok)
+    monkeypatch.setattr(ss_mod, "scan_project", lambda project_root=None, data_dir=None: fake_ok)
+    html_ok = client.get("/diagnostics").text
+    assert "Secrets scan PASSED" in html_ok
+
+    monkeypatch.delitem(sys.modules, "cua_driver", raising=False)

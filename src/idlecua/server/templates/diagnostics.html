@@ -26,11 +26,11 @@
     </ul>
   </div>
   <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
-    <h2 class="font-semibold">Agent driver</h2>
+    <h2 class="font-semibold">Driver probe</h2>
     <div class="mt-2 text-sm flex items-start gap-2.5">
       {% if driver_ok %}
       <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold">✓</span>
-      <span class="text-zinc-600">cua-driver {{ driver_version or 'installed' }} · Accessibility {{ 'on' if driver_accessibility else 'off' if driver_accessibility is false else 'unknown' }} · Screen Recording {{ 'on' if driver_screen_recording else 'off' if driver_screen_recording is false else 'unknown' }}</span>
+      <span class="text-zinc-600">cua-driver {{ driver_version or 'installed' }} · Accessibility {{ 'on' if driver_accessibility else 'off' if driver_accessibility is false else 'unknown' }} · Screen Recording {{ 'on' if driver_screen_recording else 'off' if driver_screen_recording is false else 'unknown' }} &middot; {{ driver_message }}</span>
       {% else %}
       <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-amber-100 text-amber-800 text-xs font-bold">⚠</span>
       <span class="text-zinc-600">{{ driver_message }}</span>
@@ -68,6 +68,19 @@
         {% if lock %}<br><span class="text-xs text-zinc-400">Server process {{ lock.pid }}{% if lock.started_at %}, started {{ lock.started_at|fmt_dt }}{% endif %}</span>{% endif %}
       </span>
     </div>
+  </div>
+  <div class="border rounded-xl p-4">
+    <h2 class="font-semibold">Secrets scan</h2>
+    {% if secrets_ok %}
+    <div class="text-sm">Secrets scan PASSED &mdash; no secrets found.</div>
+    {% else %}
+    <div class="text-sm">Secrets scan FAILED &mdash; check these files (patterns only, values never shown):</div>
+    <ul class="text-sm mt-2">
+      {% for f in secrets_findings %}
+      <li>{{ f.source }} &mdash; looks like {{ f.pattern }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
   </div>
   {% if not secrets_ok %}
   <div class="bg-amber-50 border border-amber-200 rounded-2xl p-4 sm:p-5">
