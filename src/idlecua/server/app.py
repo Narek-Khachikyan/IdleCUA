@@ -1161,8 +1161,22 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         profile_errors = list(prof.get("errors") or [])
         lock = bundle.get("scheduler_lock", {}).get("info")
         watch_loop = bundle.get("watch_loop", watch)
+        drv = bundle.get("driver", {}) if isinstance(bundle.get("driver"), dict) else {}
+        secrets = bundle.get("secrets_scan", {}) if isinstance(bundle.get("secrets_scan"), dict) else {}
         return templates.TemplateResponse(
-            request, "diagnostics.html", {"perms": perms_data, "profile_valid": profile_valid, "profile_errors": profile_errors, "lock": lock, "watch_loop": watch_loop}
+            request,
+            "diagnostics.html",
+            {
+                "perms": perms_data,
+                "profile_valid": profile_valid,
+                "profile_errors": profile_errors,
+                "lock": lock,
+                "watch_loop": watch_loop,
+                "driver_ok": bool(drv.get("ok", False)),
+                "driver_message": str(drv.get("message", "")),
+                "secrets_ok": bool(secrets.get("ok", True)),
+                "secrets_findings": list(secrets.get("findings") or []),
+            },
         )
 
     return app
