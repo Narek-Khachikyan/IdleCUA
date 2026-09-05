@@ -118,7 +118,7 @@ class IdleCua:
         self.policy: PolicyEngine = policy or PolicyEngine(self.config)
         self._idle_detector = idle_detector
         self._memory = memory
-        self._executor = None
+        self._lifecycle = None
         # If we deferred planner due to Fake check but policy wasn't ready, fixup for Llm case
         if isinstance(self.planner, LlmPlanner):
             # Ensure planner has latest policy/memory refs
@@ -192,52 +192,69 @@ class IdleCua:
     def idle_detector(self, value) -> None:
         self._idle_detector = value
 
-    def _get_executor(self):
-        # Keep LlmPlanner's internal refs in sync (data_dir, policy, memory)
+    @property
+    def lifecycle(self):
+        """Single lifecycle owner behind the Application API (ADR-0006)."""
+        from .task_lifecycle import TaskLifecycle
+
+        # Keep an LLM-backed planner's refs in sync (data_dir, policy, memory).
         if isinstance(self.planner, LlmPlanner):
             try:
                 self.planner.memory = self.memory
                 self.planner.policy_engine = self.policy
-                # Ensure data_dir matches config
                 from pathlib import Path as _P
 
                 self.planner.data_dir = _P(self.config.data_dir).expanduser()
                 self.planner.max_llm_calls_per_day = int(getattr(self.config, "max_llm_calls_per_day", 150) or 150)
             except Exception:
                 pass
-        if self._executor is None:
-            from .executor import TaskExecutor
-
-            self._executor = TaskExecutor(
-                config=self.config,
+        if self._lifecycle is None:
+            self._lifecycle = TaskLifecycle(
+                self.config,
+                self.memory,
                 driver=self.computer,
                 model_provider=self.model_provider,
-                memory=self.memory,
+                planner=self.planner,
                 policy=self.policy,
                 idle_detector=self.idle_detector,
-                planner=self.planner,
             )
         else:
-            # update deps if they changed
-            self._executor.config = self.config
-            self._executor.driver = self.computer
-            self._executor.model_provider = self.model_provider
-            self._executor.memory = self.memory
-            self._executor.policy = self.policy
-            self._executor.idle_detector = self.idle_detector
-            self._executor.planner = self.planner
-        return self._executor
+            self._lifecycle.config = self.config
+            try:
+                self._lifecycle._memory = self.memory
+            except Exception:
+                pass
+            self._lifecycle.driver = self.computer
+            self._lifecycle.model_provider = self.model_provider
+            self._lifecycle.planner = self.planner
+            self._lifecycle.policy = self.policy
+            self._lifecycle.idle_detector = self.idle_detector
+        return self._lifecycle
 
     # -- task model --
 
-    def create_task(self, description: str) -> Task:
-        task = Task(description=description)
-        # Persist disabled task
-        try:
-            self.memory.upsert_task(task.id, task.description, task.state.value, None)
-        except Exception:
-            pass
-        return task
+    def create_task(
+        self,
+        description: str,
+        *,
+        skip_action_types: list[str] | tuple[str, ...] | None = None,
+        approvals: list[str] | tuple[str, ...] | None = None,
+    ) -> Task:
+        """Enqueue via the lifecycle seam: immutable goal, waiting_for_idle."""
+        from .task_lifecycle import Enqueue, OutcomeCategory
+
+        out = self.lifecycle.handle(
+            Enqueue(
+                goal=description,
+                skip_action_types=tuple(skip_action_types or ()),
+                approvals=tuple(approvals or ()),
+            )
+        )
+        if out.category == OutcomeCategory.invalid_request:
+            raise ValueError(out.message)
+        if out.category != OutcomeCategory.ok or not out.task_id:
+            raise RuntimeError(out.message or "enqueue failed")
+        return Task(description=description.strip(), id=out.task_id, state=AgentState(out.state or "waiting_for_idle"))
 
     async def acreate_task(self, description: str) -> Task:
         return self.create_task(description)
@@ -394,67 +411,37 @@ class IdleCua:
             return int(getattr(self.config, "idle_threshold_seconds", 600))
 
     def get_readiness(self, threshold_override: int | None = None) -> dict:
-        """Decide all pre-run gates once inside the Application API (T1).
+        """One readiness path owned by the lifecycle seam (ADR-0006).
 
-        Returns dict with effective_threshold, individual gate results
-        (profile/schedule/idle/limits as {ok, reason, gate}), can_start and
-        reason/failed_gate. Callers render; they do not re-implement gates.
+        Shape-preserving delegate: CLI/HTTP texts stay byte-identical.
         """
-        from .scheduler import IdleScheduler
-
-        effective = int(threshold_override) if threshold_override is not None else self.get_effective_idle_threshold()
-        scheduler = self.get_scheduler()
-        # Profile gate uses the canonical Application API message (same text CLI prints with "Refused: " prefix).
-        ok_p, reason_p = self.check_profile_confirmed()
-        profile_gate = {"ok": bool(ok_p), "reason": str(reason_p), "gate": "profile"}
-        try:
-            schedule_gate_obj = scheduler.check_schedule_gate()
-            schedule_gate = {"ok": bool(schedule_gate_obj.ok), "reason": str(schedule_gate_obj.reason), "gate": "schedule"}
-        except Exception as e:
-            schedule_gate = {"ok": True, "reason": f"schedule check skipped: {e}", "gate": "schedule"}
-        try:
-            idle_gate_obj = scheduler.check_idle_gate(effective)
-            idle_gate = {"ok": bool(idle_gate_obj.ok), "reason": str(idle_gate_obj.reason), "gate": str(idle_gate_obj.gate)}
-        except Exception as e:
-            idle_gate = {"ok": False, "reason": f"idle check failed: {e}", "gate": "idle"}
-        # require_idle=False disables the idle/screen gate (matches run_task behavior).
-        if not bool(getattr(self.config, "require_idle", True)):
-            idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
-        try:
-            limits_gate_obj = scheduler.check_limits_gate()
-            limits_gate = {"ok": bool(limits_gate_obj.ok), "reason": str(limits_gate_obj.reason), "gate": "limits"}
-        except Exception as e:
-            limits_gate = {"ok": True, "reason": f"limits check skipped: {e}", "gate": "limits"}
-        for g in (profile_gate, schedule_gate, idle_gate, limits_gate):
-            if not g["ok"]:
-                gate = g["gate"]
-                reason = g["reason"]
-                # Preserve legacy user-facing phrasing per gate so CLI/HTTP texts stay byte-identical.
-                if gate == "idle":
-                    combined = f"idle gate blocked: {reason}"
-                elif gate == "screen":
-                    combined = f"screen locked — {reason}"
-                else:
-                    combined = f"{gate}: {reason}" if not reason.startswith(f"{gate}:") else reason
-                return {
-                    "effective_threshold": effective,
-                    "profile": profile_gate,
-                    "schedule": schedule_gate,
-                    "idle": idle_gate,
-                    "limits": limits_gate,
-                    "can_start": False,
-                    "reason": combined,
-                    "failed_gate": gate,
-                }
+        r = self.lifecycle._readiness()
+        effective = int(threshold_override) if threshold_override is not None else int(r.get("threshold", 600))
+        # Re-evaluate idle text with override when provided (same gate, same path).
+        if threshold_override is not None:
+            try:
+                ig = self.get_scheduler().check_idle_gate(effective)
+                idle_gate = {"ok": bool(ig.ok), "reason": str(ig.reason), "gate": str(ig.gate)}
+                if not bool(getattr(self.config, "require_idle", True)):
+                    idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
+                r = dict(r)
+                r["idle"] = idle_gate
+                r["threshold"] = effective
+                if not idle_gate["ok"]:
+                    r["can_start"] = False
+                    r["reason"] = f"idle gate blocked: {idle_gate['reason']}" if idle_gate["gate"] == "idle" else f"screen locked — {idle_gate['reason']}"
+                    r["failed_gate"] = idle_gate["gate"]
+            except Exception:
+                pass
         return {
             "effective_threshold": effective,
-            "profile": profile_gate,
-            "schedule": schedule_gate,
-            "idle": idle_gate,
-            "limits": limits_gate,
-            "can_start": True,
-            "reason": "all gates pass",
-            "failed_gate": None,
+            "profile": r.get("profile", {}),
+            "schedule": r.get("schedule", {}),
+            "idle": r.get("idle", {}),
+            "limits": r.get("limits", {}),
+            "can_start": bool(r.get("can_start")),
+            "reason": str(r.get("reason", "")),
+            "failed_gate": r.get("failed_gate"),
         }
 
     def can_start(self, threshold_override: int | None = None) -> tuple[bool, str]:
@@ -513,38 +500,47 @@ class IdleCua:
         confirm_func: Callable | None = None,
         dry_run: bool = False,
     ):
-        """Run a task end-to-end (sync). Accepts Task or description string."""
+        """Run a task end-to-end via the lifecycle seam (ADR-0006)."""
+        from .task_lifecycle import OutcomeCategory, Start
+
         if isinstance(task_or_description, str):
             task = self.create_task(task_or_description)
         else:
             task = task_or_description
         if dry_run:
             return self.dry_run(task.description)
-        # Hard gates before execution (T1: single source via get_readiness).
-        # Profile gate first so CLI and HTTP API block identically with the same message.
-        self.ensure_profile_confirmed()
-        # All remaining gates (schedule/idle/screen/limits) decide once inside
-        # get_readiness; run_task only renders/maps the returned verdict so every
-        # caller shares one message text. Legacy phrasing ("idle gate blocked:",
-        # "screen locked —") is preserved inside get_readiness.
-        if not dry_run:
-            readiness = self.get_readiness()
-            if not readiness["can_start"]:
-                fg = readiness.get("failed_gate")
-                if fg == "profile":
-                    # Raise the canonical typed error for the profile gate.
-                    self.ensure_profile_confirmed()
-                try:
-                    task.transition_to(AgentState.failed)
-                except Exception:
-                    task.state = AgentState.failed
-                self.memory.upsert_task(task.id, task.description, task.state.value, None)
-                import uuid
-                self.memory.record_error(uuid.uuid4().hex, task.id, readiness["reason"])
-                raise RuntimeError(readiness["reason"])
-        profile = self.get_profile()
-        executor = self._get_executor()
-        return executor.execute_task(task, profile=profile, dry_run=False, is_interactive=is_interactive, confirm_func=confirm_func)
+        # Resolve the lifecycle identity: a Task object that was never enqueued
+        # (legacy caller shape) is claimed by id when present, else enqueued.
+        task_id = task.id
+        try:
+            existing = self.memory.get_task(task_id)
+        except Exception:
+            existing = None
+        if existing is None:
+            try:
+                fresh = self.create_task(task.description)
+                task_id = fresh.id
+            except Exception:
+                pass
+        out = self.lifecycle.handle(
+            Start(
+                task_id=task_id,
+                trigger="explicit",
+                mode="interactive" if is_interactive else "unattended",
+                confirm_func=confirm_func,
+            )
+        )
+        if out.category in (OutcomeCategory.not_ready, OutcomeCategory.already_active):
+            if out.failed_gate == "profile":
+                self.ensure_profile_confirmed()
+            raise RuntimeError(out.message or "cannot start")
+        if out.category == OutcomeCategory.not_found:
+            raise RuntimeError(out.message or "task not found")
+        if out.category in (OutcomeCategory.invalid_request, OutcomeCategory.invalid_transition):
+            raise RuntimeError(out.message or "invalid task transition")
+        if out.category == OutcomeCategory.execution_failed and out.state not in ("failed", "paused_by_user", "stopped", "completed"):
+            raise RuntimeError(out.message or "execution failed")
+        return self._execution_result_from_lifecycle(out.task_id or task_id)
 
     async def arun_task(
         self,
@@ -557,66 +553,165 @@ class IdleCua:
         # For MVP, async delegates to sync (no real async I/O)
         return self.run_task(task_or_description, is_interactive=is_interactive, confirm_func=confirm_func, dry_run=dry_run)
 
+    def _execution_result_from_lifecycle(self, task_id: str):
+        """Shape-preserving bridge: lifecycle snapshot -> legacy ExecutionResult."""
+        from pathlib import Path as _P
+
+        from .executor import ExecutionResult
+        from .models.plan import Plan
+        from .models.plan import RiskLevel as _RL
+        from .models.state import AgentState as _AS
+
+        row = self.memory.get_task(task_id) or {}
+        state_v = str(row.get("state", "failed"))
+        try:
+            state = _AS(state_v)
+        except Exception:
+            state = _AS.failed
+        plan = None
+        try:
+            if row.get("plan_json"):
+                pj = json.loads(row["plan_json"])
+                plan = Plan(
+                    goal=pj.get("goal", row.get("description", "")),
+                    target=pj.get("target", "google.com"),
+                    expected_actions=list(pj.get("expected_actions", ["search"])),
+                    expected_result=pj.get("expected_result", ""),
+                    max_duration_minutes=int(pj.get("max_duration_minutes", 45)),
+                    max_actions=int(pj.get("max_actions", 50)),
+                    risk_level=_RL(pj.get("risk_level", "low")),
+                    requires_confirmation=bool(pj.get("requires_confirmation", False)),
+                )
+        except Exception:
+            plan = None
+        if plan is None:
+            try:
+                plan = self.dry_run(row.get("description", "task"))
+            except Exception:
+                plan = Plan(goal=row.get("description", "task"), target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
+        try:
+            actions = self.memory.list_actions(task_id=task_id)
+        except Exception:
+            actions = []
+        # Cleanup closes ("cleanup: ...") are tab discipline, not plan work.
+        n_completed = sum(
+            1
+            for a in actions
+            if a.get("status") == "completed" and not str(a.get("error") or "").startswith("cleanup:")
+        )
+        try:
+            queries = [q for q in self.memory.list_queries(limit=1000) if q.get("task_id") == task_id]
+        except Exception:
+            queries = []
+        try:
+            urls = [u for u in self.memory.list_urls(limit=1000) if u.get("task_id") == task_id]
+        except Exception:
+            urls = []
+        try:
+            findings = self.memory.list_findings(task_id=task_id)
+        except Exception:
+            findings = []
+        try:
+            errs = self.memory.list_errors(task_id=task_id)
+        except Exception:
+            errs = []
+        try:
+            rep = self.memory.get_report(task_id)
+            md = rep.get("markdown", "") if rep else ""
+        except Exception:
+            md = ""
+        if not md:
+            try:
+                rp = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
+                if rp.exists():
+                    md = rp.read_text(encoding="utf-8")
+            except Exception:
+                md = ""
+        # Rebuild skipped_repeats view from persisted skips/blocks for CLI parity.
+        # The lifecycle persists every skip as an action row (blocked/skipped)
+        # and/or an error row; surface both so approval/queue-skip/no-mapping
+        # and plan-repeat decisions stay visible through the legacy shape.
+        skipped_view: list[dict] = []
+        for a in actions:
+            st = str(a.get("status", ""))
+            if st in ("blocked", "skipped"):
+                err = str(a.get("error", "") or "")
+                skipped_view.append({"type": "action", "value": str(a.get("kind", "")), "reason": err or st})
+        for e in errs:
+            m = str(e.get("message", ""))
+            low = m.lower()
+            if "skipped repeat plan" in low:
+                skipped_view.append({"type": "plan", "value": m.split()[-1] if m.split() else "", "reason": m})
+            elif "skipped repeat" in low or "skipped confirmation" in low or "queue-time skip" in low or "no typed driver mapping" in low or "owner declined" in low or "llm cap" in low:
+                if not any(s.get("reason") == m for s in skipped_view):
+                    skipped_view.append({"type": "action", "value": task_id[:8], "reason": m})
+        report_path = None
+        try:
+            cand = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
+            report_path = cand if cand.exists() else None
+        except Exception:
+            report_path = None
+        stopped_reason = None
+        if errs:
+            stopped_reason = str(errs[-1].get("message", "")) or None
+        try:
+            from .accounting import get_today_count as _cnt
+
+            llm_c = int(_cnt(self.config.data_dir))
+        except Exception:
+            llm_c = 0
+        limits = {
+            "actions_used": n_completed,
+            "max_actions": int(getattr(self.config, "max_actions", 200)),
+            "duration_minutes": 0,
+            "max_duration_minutes": int(getattr(self.config, "max_duration_minutes", 45)),
+            "llm_calls_today": llm_c,
+            "max_llm_calls_per_day": int(getattr(self.config, "max_llm_calls_per_day", 150)),
+        }
+        return ExecutionResult(
+            task_id=task_id, state=state, plan=plan, actions_executed=n_completed,
+            queries=queries, urls=urls, findings=findings, errors=errs,
+            skipped_repeats=skipped_view, report_markdown=md, report_path=report_path,
+            stopped_reason=stopped_reason, limits=limits,
+        )
+
     async def create_task_async(self, description: str) -> Task:
         return self.create_task(description)
 
-    async def pause_task(self, task_id: str) -> Task | None:
-        # Find task and transition to paused_by_user
-        data = self.memory.get_task(task_id)
-        if not data:
-            return None
-        from .models.state import validate_transition
-
-        cur = AgentState(data["state"])
-        # Try to transition
-        try:
-            # Create Task object for validation
-            t = Task(description=data["description"], id=data["id"], state=cur)
-            t.transition_to(AgentState.paused_by_user)
-            self.memory.update_task_state(task_id, AgentState.paused_by_user.value)
-            return t
-        except Exception:
-            return None
-
     async def cancel_task(self, task_id: str, reason: str = "cancelled") -> Task | None:
+        from .task_lifecycle import Cancel, OutcomeCategory
+
+        out = self.lifecycle.handle(Cancel(task_id=task_id, reason=reason))
+        if out.category == OutcomeCategory.not_found:
+            return None
+        if out.category not in (OutcomeCategory.stopped, OutcomeCategory.ok):
+            return None
         data = self.memory.get_task(task_id)
         if not data:
             return None
-        t = Task(description=data["description"], id=data["id"], state=AgentState(data["state"]))
-        try:
-            t.transition_to(AgentState.stopped)
-        except Exception:
-            t.state = AgentState.stopped
-        self.memory.update_task_state(task_id, t.state.value)
-        self.memory.record_error(str(uuid.uuid4()), task_id, f"cancelled: {reason}")
-        # Release input + terminate agent processes
-        try:
-            if hasattr(self.computer, "release_all_inputs"):
-                self.computer.release_all_inputs()
-            if hasattr(self.computer, "terminate_agent_processes"):
-                self.computer.terminate_agent_processes()  # type: ignore
-        except Exception:
-            pass
-        return t
+        return Task(description=data["description"], id=data["id"], state=AgentState(data["state"]))
 
     def request_emergency_stop(self, reason: str = "emergency stop") -> None:
-        """LLM-independent stop — releases input synchronously and records reason."""
-        from .executor import request_emergency_stop
+        """LLM-independent stop routed through the lifecycle owner."""
+        from .task_lifecycle import EmergencyStop
 
-        request_emergency_stop(reason)
-        # Also release via driver synchronously
         try:
-            if hasattr(self.computer, "release_all_inputs"):
-                self.computer.release_all_inputs()
-            if hasattr(self.computer, "terminate_agent_processes"):
-                self.computer.terminate_agent_processes()  # type: ignore
+            self.lifecycle.handle(EmergencyStop(reason=reason or "emergency stop"))
         except Exception:
-            pass
-        # Persist reason in kv for status
-        try:
-            self.memory.kv_set("last_stop_reason", reason)
-        except Exception:
-            pass
+            from .executor import request_emergency_stop as _req
+
+            _req(reason)
+            try:
+                if hasattr(self.computer, "release_all_inputs"):
+                    self.computer.release_all_inputs()
+                if hasattr(self.computer, "terminate_agent_processes"):
+                    self.computer.terminate_agent_processes()  # type: ignore
+            except Exception:
+                pass
+            try:
+                self.memory.kv_set("last_stop_reason", reason)
+            except Exception:
+                pass
 
     def clear_emergency_stop(self) -> None:
         from .executor import clear_emergency_stop
@@ -1314,6 +1409,40 @@ class IdleCua:
             on_tick=on_tick,
         )
 
+    def start_task_lifecycle(
+        self,
+        task_id: str | None = None,
+        *,
+        trigger: str = "explicit",
+        mode: str = "unattended",
+        confirm_func: Callable | None = None,
+    ):
+        """Thin delegate: submit one Start command to the lifecycle owner."""
+        from .task_lifecycle import Start
+
+        return self.lifecycle.handle(
+            Start(task_id=task_id, trigger=trigger, mode=mode, confirm_func=confirm_func)
+        )
+
+    def cancel_task_sync(self, task_id: str, reason: str = "cancelled"):
+        """Thin delegate: submit one Cancel command to the lifecycle owner."""
+        from .task_lifecycle import Cancel
+
+        return self.lifecycle.handle(Cancel(task_id=task_id, reason=reason))
+
+    def get_task_result(self, task_id: str) -> dict:
+        """Stable per-task result view for HTTP/CLI adapters (reads only)."""
+        res = self._execution_result_from_lifecycle(task_id)
+        return {
+            "task_id": task_id,
+            "state": res.state.value if hasattr(res.state, "value") else str(res.state),
+            "actions_executed": res.actions_executed,
+            "findings": res.findings,
+            "urls": res.urls,
+            "errors": res.errors,
+            "report_path": str(res.report_path) if res.report_path else None,
+        }
+
     def run_idle_session(
         self,
         task_description: str,
@@ -1325,11 +1454,13 @@ class IdleCua:
         confirm_func: Callable | None = None,
         wait: bool = True,
     ):
-        """Wait for idle (if wait=True) then run one autonomous session.
+        """Wait for idle (if wait=True) then run one idle-triggered session.
 
-        End-to-end: idle auto-start → plan → policy → driver → history → daily report
-        → graceful stop on return/limits/emergency stop.
+        The description is enqueued once; the lifecycle owner selects and
+        claims work (oldest paused before oldest queued) under one decision path.
         """
+        from .task_lifecycle import OutcomeCategory
+
         scheduler = self.get_scheduler()
         if wait:
             ok = scheduler.wait_for_idle(
@@ -1338,16 +1469,24 @@ class IdleCua:
             if not ok:
                 _thr_msg = int(idle_threshold_override) if idle_threshold_override is not None else self.get_effective_idle_threshold()
                 raise RuntimeError(f"Timed out waiting for idle (threshold {_thr_msg}s)")
-        ok, reason = scheduler.can_start(threshold_override=idle_threshold_override)
-        if not ok:
-            raise RuntimeError(f"Cannot start idle session — gate failed: {reason}")
-        return scheduler.run_one_session(
-            task_description, is_interactive=is_interactive, confirm_func=confirm_func
+        task = self.create_task(task_description)
+        out = self.start_task_lifecycle(
+            task.id,
+            trigger="idle",
+            mode="interactive" if is_interactive else "unattended",
+            confirm_func=confirm_func,
         )
+        if out.category in (OutcomeCategory.not_ready, OutcomeCategory.already_active):
+            if out.failed_gate == "profile":
+                self.ensure_profile_confirmed()
+            raise RuntimeError(out.message or "cannot start")
+        if out.category in (OutcomeCategory.not_found, OutcomeCategory.invalid_request, OutcomeCategory.invalid_transition):
+            raise RuntimeError(out.message or "invalid task transition")
+        return self._execution_result_from_lifecycle(out.task_id or task.id)
 
     def run_idle_loop(
         self,
-        task_description: str,
+        task_description: str | None = None,
         *,
         poll_interval: float = 5.0,
         idle_threshold_override: int | None = None,
@@ -1358,16 +1497,30 @@ class IdleCua:
         is_interactive: bool = False,
         confirm_func: Callable | None = None,
     ) -> list[Any]:
+        """Watch loop behind the Application API: poll, then idle-triggered Starts.
+
+        An explicit description is enqueued once up front; every window submits
+        `Start(task_id=None, trigger="idle")` so the owner resumes the oldest
+        paused Task before starting the oldest queued one.
+        """
+        if task_description:
+            try:
+                self.create_task(task_description)
+            except Exception:
+                pass
+        mode = "interactive" if is_interactive else "unattended"
+
+        def _start():
+            return self.start_task_lifecycle(task_id=None, trigger="idle", mode=mode, confirm_func=confirm_func)
+
         return self.get_scheduler().run_loop(
-            task_description,
+            start_fn=_start,
             poll_interval=poll_interval,
             idle_threshold_override=idle_threshold_override,
             max_sessions=max_sessions,
             once=once,
             timeout_per_wait=timeout_per_wait,
             on_event=on_event,
-            is_interactive=is_interactive,
-            confirm_func=confirm_func,
         )
 
     def plan_to_dict(self, plan: Plan) -> dict:

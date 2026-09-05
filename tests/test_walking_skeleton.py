@@ -182,46 +182,41 @@ def test_plan_is_bounded():
 # -- State transitions validated; illegal rejected --
 
 def test_state_transitions_valid_path():
+    # ADR-0006: new Tasks begin waiting_for_idle; `disabled` is Agent-level.
     t = Task(description="demo")
-    assert t.state == AgentState.disabled
-    t.transition_to(AgentState.waiting_for_idle)
+    assert t.state == AgentState.waiting_for_idle
     t.transition_to(AgentState.planning)
     t.transition_to(AgentState.running)
     t.transition_to(AgentState.completed)
-    # completed -> waiting_for_idle is allowed (next cycle)
-    t.transition_to(AgentState.waiting_for_idle)
 
 
 def test_state_illegal_transitions_rejected():
-    # disabled -> running is illegal
+    # waiting_for_idle default -> completed is illegal (must plan/run first)
     t = Task(description="demo")
-    with pytest.raises(ValueError, match="Illegal transition"):
-        t.transition_to(AgentState.running)
     with pytest.raises(ValueError, match="Illegal transition"):
         t.transition_to(AgentState.completed)
 
-    # waiting_for_idle -> running illegal (must go through planning)
+    # waiting_for_idle -> running is allowed for resume-shaped starts
+    # (lifecycle-owned); planning remains the fresh-start path.
     t2 = Task(description="demo2")
-    t2.transition_to(AgentState.waiting_for_idle)
-    with pytest.raises(ValueError, match="Illegal transition"):
-        t2.transition_to(AgentState.running)
+    assert t2.can_transition_to(AgentState.planning)
 
-    # running -> disabled illegal (must stop or complete/fail/pause first)
+    # running -> disabled illegal (disabled is Agent-level, not a Task state)
     t3 = Task(description="demo3")
-    t3.transition_to(AgentState.waiting_for_idle)
     t3.transition_to(AgentState.planning)
     t3.transition_to(AgentState.running)
     with pytest.raises(ValueError, match="Illegal transition"):
         t3.transition_to(AgentState.disabled)
 
-    # completed -> running illegal
+    # terminal states never reactivate (ADR-0006 supersedes walking skeleton)
     t4 = Task(description="demo4")
-    t4.transition_to(AgentState.waiting_for_idle)
     t4.transition_to(AgentState.planning)
     t4.transition_to(AgentState.running)
     t4.transition_to(AgentState.completed)
     with pytest.raises(ValueError, match="Illegal transition"):
         t4.transition_to(AgentState.running)
+    with pytest.raises(ValueError, match="Illegal transition"):
+        t4.transition_to(AgentState.waiting_for_idle)
 
 
 def test_is_valid_transition_helper():
@@ -232,12 +227,12 @@ def test_is_valid_transition_helper():
 
 
 def test_task_string_state_coercion():
-    t = Task(description="demo", state="disabled")
-    assert t.state == AgentState.disabled
-    t.transition_to("waiting_for_idle")
+    t = Task(description="demo", state="waiting_for_idle")
     assert t.state == AgentState.waiting_for_idle
-    assert t.can_transition_to("planning")
-    assert not t.can_transition_to("running")
+    t.transition_to("planning")
+    assert t.state == AgentState.planning
+    assert t.can_transition_to("running")
+    assert not t.can_transition_to("disabled")
 
 
 # -- Config and contracts present --

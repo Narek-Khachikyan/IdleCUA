@@ -85,7 +85,25 @@ CREATE TABLE IF NOT EXISTS kv (
 CREATE INDEX IF NOT EXISTS idx_queries_normalized_created ON queries(normalized, created_at);
 CREATE INDEX IF NOT EXISTS idx_urls_fingerprint_created ON urls(fingerprint, created_at);
 CREATE INDEX IF NOT EXISTS idx_urls_normalized_created ON urls(normalized, created_at);
+CREATE TABLE IF NOT EXISTS active_session (
+    task_id TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    acquired_at TEXT NOT NULL
+);
 """
+
+# TaskLifecycle persistence version. v2 adds checkpoint columns + lease table
+# plus safety-preserving legacy-state conversion.
+LIFECYCLE_SCHEMA_VERSION = 2
+
+_TASK_CHECKPOINT_COLUMNS: dict[str, str] = {
+    "plan_progress": "INTEGER NOT NULL DEFAULT 0",
+    "active_duration_s": "REAL NOT NULL DEFAULT 0",
+    "skipped_types": "TEXT NOT NULL DEFAULT '[]'",
+    "last_outcome": "TEXT",
+    "stop_cause": "TEXT",
+    "failure_cause": "TEXT",
+}
 
 
 class MemoryStore:
@@ -112,8 +130,68 @@ class MemoryStore:
             try:
                 conn.executescript(SCHEMA)
                 conn.commit()
+                self._migrate(conn)
             finally:
                 conn.close()
+
+    def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        return {str(r["name"]) for r in cur.fetchall()}
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Additive transactional migration to LIFECYCLE_SCHEMA_VERSION.
+
+        Safety-preserving legacy conversion; failure rolls back so partially
+        migrated state never controls the computer (caller blocks execution).
+        """
+        try:
+            cur = conn.execute("PRAGMA user_version")
+            row = cur.fetchone()
+            version = int(row[0]) if row else 0
+        except Exception:
+            version = 0
+        if version >= LIFECYCLE_SCHEMA_VERSION:
+            return
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cols = self._table_columns(conn, "tasks")
+            for name, ddl in _TASK_CHECKPOINT_COLUMNS.items():
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS active_session (
+                    task_id TEXT PRIMARY KEY,
+                    pid INTEGER NOT NULL,
+                    acquired_at TEXT NOT NULL
+                )"""
+            )
+            # Legacy-state conversion (only once, from version 0).
+            if version == 0:
+                # `disabled` Tasks never start without renewed intent.
+                conn.execute(
+                    "UPDATE tasks SET state='stopped', stop_cause='legacy_not_queued', updated_at=? "
+                    "WHERE state='disabled'",
+                    (_now_iso(),),
+                )
+                # Stale in-flight Tasks cannot be resumed safely.
+                conn.execute(
+                    "UPDATE tasks SET state='failed', failure_cause='interrupted_unknown', updated_at=? "
+                    "WHERE state IN ('planning','running')",
+                    (_now_iso(),),
+                )
+                # Pre-ADR UI alias.
+                conn.execute(
+                    "UPDATE tasks SET state='waiting_for_idle', updated_at=? WHERE state='queued'",
+                    (_now_iso(),),
+                )
+            conn.execute(f"PRAGMA user_version={LIFECYCLE_SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     # -- tasks --
 
@@ -148,6 +226,113 @@ class MemoryStore:
             finally:
                 conn.close()
 
+    def update_task_checkpoint(
+        self,
+        task_id: str,
+        *,
+        plan_progress: int | None = None,
+        active_duration_s: float | None = None,
+        skipped_types: list[str] | None = None,
+        last_outcome: str | None = None,
+        stop_cause: str | None = None,
+        failure_cause: str | None = None,
+        plan_json: str | None = None,
+    ) -> None:
+        """Fail-closed checkpoint write — caller must stop before next Action on error."""
+        now = _now_iso()
+        sets: list[str] = ["updated_at=?"]
+        vals: list[Any] = [now]
+        if plan_progress is not None:
+            sets.append("plan_progress=?")
+            vals.append(int(plan_progress))
+        if active_duration_s is not None:
+            sets.append("active_duration_s=?")
+            vals.append(float(active_duration_s))
+        if skipped_types is not None:
+            sets.append("skipped_types=?")
+            vals.append(json.dumps(sorted(set(skipped_types))))
+        if last_outcome is not None:
+            sets.append("last_outcome=?")
+            vals.append(str(last_outcome))
+        if stop_cause is not None:
+            sets.append("stop_cause=?")
+            vals.append(str(stop_cause))
+        if failure_cause is not None:
+            sets.append("failure_cause=?")
+            vals.append(str(failure_cause))
+        if plan_json is not None:
+            sets.append("plan_json=?")
+            vals.append(plan_json)
+        vals.append(task_id)
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
+                if cur.rowcount == 0:
+                    raise KeyError(f"task not found: {task_id}")
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_task_plan_if_absent(self, task_id: str, plan_json: str) -> bool:
+        """Persist the immutable Plan exactly once. Returns True if stored."""
+        now = _now_iso()
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("SELECT plan_json FROM tasks WHERE id=?", (task_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise KeyError(f"task not found: {task_id}")
+                if row["plan_json"]:
+                    return False
+                conn.execute(
+                    "UPDATE tasks SET plan_json=?, updated_at=? WHERE id=?",
+                    (plan_json, now, task_id),
+                )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+
+    # -- active-Session lease (singleton per data dir) --
+
+    def lease_get(self) -> dict | None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("SELECT * FROM active_session LIMIT 1")
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def lease_acquire(self, task_id: str, pid: int) -> None:
+        now = _now_iso()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM active_session")
+                conn.execute(
+                    "INSERT INTO active_session(task_id, pid, acquired_at) VALUES(?,?,?)",
+                    (task_id, int(pid), now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def lease_release(self, task_id: str | None = None) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                if task_id is None:
+                    conn.execute("DELETE FROM active_session")
+                else:
+                    conn.execute("DELETE FROM active_session WHERE task_id=?", (task_id,))
+                conn.commit()
+            finally:
+                conn.close()
+
     def get_task(self, task_id: str) -> dict | None:
         with self._lock:
             conn = self._connect()
@@ -163,6 +348,22 @@ class MemoryStore:
             conn = self._connect()
             try:
                 cur = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,))
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def list_tasks_fifo(self, states: list[str], limit: int = 100) -> list[dict]:
+        """Oldest-first listing for deterministic Watch-loop selection."""
+        if not states:
+            return []
+        marks = ",".join("?" for _ in states)
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    f"SELECT * FROM tasks WHERE state IN ({marks}) ORDER BY created_at ASC LIMIT ?",
+                    (*states, limit),
+                )
                 return [dict(r) for r in cur.fetchall()]
             finally:
                 conn.close()
@@ -200,6 +401,20 @@ class MemoryStore:
                 else:
                     cur = conn.execute("SELECT * FROM actions ORDER BY created_at DESC LIMIT 200")
                 return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def update_action_status(self, action_id: str, status: str, error: str | None = None) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE actions SET status=?, error=? WHERE id=?",
+                    (status, error, action_id),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"action not found: {action_id}")
+                conn.commit()
             finally:
                 conn.close()
 
@@ -444,7 +659,7 @@ class MemoryStore:
         with self._lock:
             conn = self._connect()
             try:
-                for tbl in ["tasks", "actions", "queries", "urls", "findings", "errors", "reports", "kv"]:
+                for tbl in ["tasks", "actions", "queries", "urls", "findings", "errors", "reports", "kv", "active_session"]:
                     conn.execute(f"DELETE FROM {tbl}")
                 conn.commit()
             finally:

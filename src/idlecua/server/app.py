@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import time
-import json
-import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -67,10 +65,6 @@ _scheduler_state = {
     "started_at": None,
     "idle_threshold": 600,
 }
-
-# Global in-flight session guard (one session at a time per data dir)
-_session_lock = threading.Lock()
-_active_session: dict[str, Any] = {}  # data_dir -> task_id or None
 
 # Watch-loop background worker (serve owns watch loop per ADR-0004)
 _watch_thread: threading.Thread | None = None
@@ -445,76 +439,39 @@ def _enrich_tasks_with_results(idle_app: IdleCua, tasks: list[dict]) -> list[dic
 
 
 def _watch_loop_worker(data_dir: Path, poll_interval: float = 5.0):
-    """Background worker for ADR-0004: serve owns watch loop — pick queued tasks at next idle window."""
+    """Background worker for ADR-0004/ADR-0006: serve owns the Watch loop.
+
+    Thin idle-trigger adapter: polls the idle window, then submits one
+    idle-triggered Start per window. The lifecycle owner selects and claims
+    eligible work (oldest paused before oldest queued) under one gate path.
+    No storage inspection, no gate evaluation, no state mutation here.
+    """
     import time as _time
+
+    from ..executor import is_emergency_stop_requested
 
     while not _watch_stop_event.is_set() and _scheduler_state.get("running"):
         try:
+            if is_emergency_stop_requested():
+                # Emergency stop disables the Watch loop; an explicit
+                # scheduler start re-enables it (and clears the latch).
+                _scheduler_state["running"] = False
+                break
             idle_app = _get_idle_cua(data_dir)
-            config = idle_app.config
-            # Idle/screen decision owned by the Application API (T1); worker only renders/waits.
-            try:
-                idle_secs = float(idle_app.idle_detector.seconds_since_last_input())
-            except Exception:
-                idle_secs = 0.0
             threshold = idle_app.get_effective_idle_threshold()
             _scheduler_state["idle_threshold"] = threshold
-            if idle_secs < threshold or idle_app.idle_detector.is_screen_locked():
+            got_idle = idle_app.get_scheduler().wait_for_idle(
+                poll_interval=poll_interval, timeout=poll_interval, threshold_override=threshold
+            )
+            if not got_idle:
+                continue
+            if is_emergency_stop_requested():
+                _scheduler_state["running"] = False
+                break
+            outcome = idle_app.start_task_lifecycle(task_id=None, trigger="idle", mode="unattended")
+            if getattr(outcome, "category", None) == "already_active":
                 _time.sleep(poll_interval)
                 continue
-            # Find next queued task (waiting_for_idle)
-            tasks = idle_app.memory.list_tasks(limit=50)
-            queued = None
-            for t in tasks:
-                if t.get("state") in ("waiting_for_idle", "queued", "disabled"):
-                    queued = t
-                    break
-            if queued is None:
-                _time.sleep(poll_interval)
-                continue
-            # One-session-in-flight guard
-            with _session_lock:
-                # Re-check nothing running
-                cur = idle_app.memory.list_tasks(limit=20)
-                if any(x.get("state") in ("running", "planning") for x in cur):
-                    _time.sleep(poll_interval)
-                    continue
-                tid = queued["id"]
-                goal = queued.get("description", "")
-                try:
-                    # Mark running
-                    idle_app.memory.update_task_state(tid, "running")
-                    _active_session[str(data_dir)] = tid
-                    from ..models.task import Task as _Task
-                    from ..models.state import AgentState as _AS
-
-                    task_obj = _Task(description=goal, id=tid, state=_AS.running)
-                    # Honor queue-time decisions (Approve/Skip) baked into plan — unattended but pre-decided
-                    dec_raw = idle_app.memory.kv_get(f"task_decisions:{tid}")
-                    dec = json.loads(dec_raw) if dec_raw else {}
-                    has_approvals = any(v == "approve" for v in dec.values()) if isinstance(dec, dict) else False
-
-                    def _decide(action):
-                        kind = getattr(action, "kind", "")
-                        d = dec.get(kind) if isinstance(dec, dict) else None
-                        if d == "approve":
-                            return True
-                        if d == "skip":
-                            return False
-                        return False
-
-                    if has_approvals:
-                        result = idle_app.run_task(task_obj, is_interactive=True, confirm_func=_decide)
-                    else:
-                        result = idle_app.run_task(task_obj, is_interactive=False)
-                    _active_session[str(data_dir)] = None
-                except Exception as e:
-                    try:
-                        idle_app.memory.update_task_state(tid, "failed")
-                        idle_app.memory.record_error(str(uuid.uuid4()), tid, str(e))
-                    except Exception:
-                        pass
-                    _active_session[str(data_dir)] = None
         except Exception:
             pass
         # sleep before next poll if not stopped
@@ -664,16 +621,20 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         if not payload.goal or not payload.goal.strip():
             raise HTTPException(status_code=400, detail="goal must be non-empty")
         idle_app = _get_idle_cua(resolved_data_dir)
-        task = idle_app.create_task(payload.goal.strip())
-        # Mark as queued (waiting_for_idle) for idle window — update state to valid enum
+        # Queue-time decisions: "skip" maps to lifecycle skip types;
+        # "approve" is rejected in v1 with a safe client error.
+        skip_types: list[str] = []
+        approvals: list[str] = []
+        if payload.decisions:
+            for kind, decision in payload.decisions.items():
+                if decision == "skip":
+                    skip_types.append(kind)
+                elif decision == "approve":
+                    approvals.append(kind)
         try:
-            idle_app.memory.update_task_state(task.id, "waiting_for_idle")
-            # Also try to store decisions if provided (queue-time verdicts)
-            if payload.decisions:
-                # Persist decisions as kv for this plan
-                idle_app.memory.kv_set(f"task_decisions:{task.id}", json.dumps(payload.decisions))
-        except Exception:
-            pass
+            task = idle_app.create_task(payload.goal.strip(), skip_action_types=skip_types, approvals=approvals)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         # Return with verdicts preview for immediate UI
         try:
             plan = idle_app.dry_run(task.description)
@@ -819,114 +780,53 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     def api_run_task(task_id: str):
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        data = idle_app.memory.get_task(task_id)
-        if not data:
+        # One lifecycle owner: no session guard, gate evaluation, or state
+        # reconstruction here — the seam returns structured outcomes.
+        outcome = idle_app.start_task_lifecycle(task_id, trigger="explicit", mode="unattended")
+        cat = getattr(outcome, "category", None)
+        cat_v = getattr(cat, "value", cat)
+        if cat_v == "not_found":
             raise HTTPException(status_code=404, detail="task not found")
-        # Guard: one session in flight
-        with _session_lock:
-            # Check if any task is currently running/planning
-            tasks = idle_app.memory.list_tasks(limit=20)
-            for t in tasks:
-                if t.get("state") in ("running", "planning") and t.get("id") != task_id:
-                    raise HTTPException(status_code=409, detail="session already in flight")
-            # Single decision via Application API (T1 § get_readiness) — maps legacy 423 messages byte-identically.
-            # Replaces separate can_run/is_screen_locked pre-checks that duplicated the gate logic.
-            readiness = idle_app.get_readiness()
-            if not readiness["can_start"]:
-                fg = readiness.get("failed_gate")
-                if fg == "profile":
-                    raw = readiness.get("profile", {}).get("reason", readiness.get("reason", ""))
-                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
-                elif fg == "idle":
-                    raw = readiness.get("idle", {}).get("reason", readiness.get("reason", ""))
-                    raise HTTPException(status_code=423, detail=f"idle gate blocked: {raw}")
-                elif fg == "screen":
-                    # Legacy HTTP contract returned exactly "screen locked" (no suffix); keep byte-identical.
-                    raise HTTPException(status_code=423, detail="screen locked")
-                elif fg in ("schedule", "limits"):
-                    raw = readiness.get(fg, {}).get("reason", readiness.get("reason", ""))
-                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
-                else:
-                    raw = readiness.get("reason", "")
-                    raise HTTPException(status_code=423, detail=f"Refused: {raw}")
-            # Now run — honor queue-time Approve/Skip decisions baked into plan
-            try:
-                # Load decisions if previously stored (Approve/Skip per action)
-                decisions_raw = idle_app.memory.kv_get(f"task_decisions:{task_id}")
-                decisions = json.loads(decisions_raw) if decisions_raw else {}
-
-                # Build confirm func from decisions: approved actions run even unattended
-                def _confirm_from_decisions(action):
-                    kind = getattr(action, "kind", "")
-                    # decisions maps action kind -> "approve" or "skip"
-                    decision = decisions.get(kind) if isinstance(decisions, dict) else None
-                    if decision == "approve":
-                        return True
-                    if decision == "skip":
-                        return False
-                    # default unattended behavior: skip needs-confirmation
-                    return False
-
-                # If any Approve decisions exist, run in interactive mode with decisions; otherwise unattended (skip)
-                has_approvals = any(v == "approve" for v in decisions.values()) if isinstance(decisions, dict) else False
-                is_interactive = bool(has_approvals)
-                confirm_fn = _confirm_from_decisions if is_interactive else None
-
-                # Set state to running
-                idle_app.memory.update_task_state(task_id, "running")
-                # Use run_task with description
-                goal = data.get("description", "")
-                # Need to create Task object? Use app.run_task which creates new task — but we want to run existing task id
-                # Instead we will use executor directly with existing task
-                from ..models.task import Task
-                from ..models.state import AgentState
-
-                raw_state = data.get("state", "disabled")
-                # Map UI queued to valid enum waiting_for_idle
-                if raw_state == "queued":
-                    raw_state = "waiting_for_idle"
-                try:
-                    state_enum = AgentState(raw_state)
-                except ValueError:
-                    state_enum = AgentState.waiting_for_idle
-                task_obj = Task(description=goal, id=task_id, state=state_enum)
-                # Run with decisions: approved confirmation actions will now be included via interactive path
-                result = idle_app.run_task(task_obj, is_interactive=is_interactive, confirm_func=confirm_fn) if is_interactive else idle_app.run_task(task_obj, is_interactive=False)
-                # Update active session tracking
-                _active_session[str(data_dir)] = None
-                return {
-                    "task_id": task_id,
-                    "state": result.state.value if hasattr(result.state, "value") else str(result.state),
-                    "actions_executed": result.actions_executed,
-                    "findings": result.findings,
-                    "urls": result.urls,
-                    "errors": result.errors,
-                    "report_path": str(result.report_path) if result.report_path else None,
-                }
-            except HTTPException:
-                raise
-            except Exception as e:
-                # Mark as failed
-                try:
-                    idle_app.memory.update_task_state(task_id, "failed")
-                    idle_app.memory.record_error(str(uuid.uuid4()), task_id, str(e))
-                except Exception:
-                    pass
-                raise HTTPException(status_code=500, detail=str(e))
+        if cat_v == "already_active":
+            raise HTTPException(status_code=409, detail="session already in flight")
+        if cat_v == "invalid_transition":
+            raise HTTPException(status_code=409, detail=str(getattr(outcome, "message", "invalid transition")))
+        if cat_v == "invalid_request":
+            raise HTTPException(status_code=400, detail=str(getattr(outcome, "message", "invalid request")))
+        if cat_v == "not_ready":
+            fg = getattr(outcome, "failed_gate", None)
+            if fg == "profile":
+                raw = str(getattr(outcome, "message", ""))
+                raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+            elif fg == "idle":
+                raw = str(getattr(outcome, "message", ""))
+                raise HTTPException(status_code=423, detail=f"idle gate blocked: {raw}")
+            elif fg == "screen":
+                # Legacy HTTP contract returned exactly "screen locked" (no suffix); keep byte-identical.
+                raise HTTPException(status_code=423, detail="screen locked")
+            elif fg in ("schedule", "limits"):
+                raw = str(getattr(outcome, "message", ""))
+                raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+            else:
+                raw = str(getattr(outcome, "message", ""))
+                raise HTTPException(status_code=423, detail=f"Refused: {raw}")
+        if cat_v == "execution_failed" and getattr(outcome, "state", None) not in ("failed", "paused_by_user", "stopped", "completed"):
+            raise HTTPException(status_code=500, detail=str(getattr(outcome, "message", "execution failed")))
+        # Safe structured result view (no raw provider/driver/SQLite errors).
+        return idle_app.get_task_result(task_id)
 
     @app.delete("/api/v1/tasks/{task_id}")
     def api_cancel_task(task_id: str):
-        """Owner cancels a queued task — it will never start (state → stopped)."""
+        """Owner cancels a queued or paused task — it will never start (state → stopped)."""
         idle_app = _get_idle_cua(resolved_data_dir)
-        data = idle_app.memory.get_task(task_id)
-        if not data:
+        outcome = idle_app.cancel_task_sync(task_id)
+        cat = getattr(getattr(outcome, "category", None), "value", getattr(outcome, "category", None))
+        if cat == "not_found":
             raise HTTPException(status_code=404, detail="task not found")
-        if data.get("state") not in ("waiting_for_idle", "disabled", "queued"):
-            raise HTTPException(status_code=409, detail="only queued tasks can be cancelled")
-        try:
-            idle_app.memory.update_task_state(task_id, "stopped")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        if cat == "invalid_transition":
+            raise HTTPException(status_code=409, detail="only queued or paused tasks can be cancelled")
+        if cat not in ("stopped", "ok"):
+            raise HTTPException(status_code=500, detail=str(getattr(outcome, "message", "cancel failed")))
         return {"ok": True, "task_id": task_id, "state": "stopped"}
 
     @app.get("/api/v1/history")
@@ -1164,6 +1064,12 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.post("/api/v1/scheduler/start")
     def api_scheduler_start():
         data_dir = resolved_data_dir
+        # An explicit scheduler start clears a latched Emergency stop so
+        # autonomous work can resume on renewed owner intent.
+        try:
+            _get_idle_cua(data_dir).clear_emergency_stop()
+        except Exception:
+            pass
         # Try to acquire lock. Serve already holds the process-level lock
         # (CLI acquires at startup, then runs uvicorn in-process), so the
         # self-owned conflict below is the normal path for UI starts
@@ -1230,25 +1136,12 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         except Exception:
             pass
         idle_app = _get_idle_cua(data_dir)
+        # Routed through the lifecycle owner: idempotent, releases input,
+        # stops Agent-started processes, records a distinct stop cause.
         try:
             idle_app.request_emergency_stop(reason)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-        # Also set kv
-        try:
-            idle_app.memory.kv_set("last_stop_reason", reason)
-        except Exception:
-            pass
-        # Mark active task as stopped if any
-        try:
-            st = idle_app.get_status()
-            active = st.get("active_task")
-            if active:
-                tid = active.get("id")
-                idle_app.memory.update_task_state(tid, "stopped")
-                idle_app.memory.record_error(str(uuid.uuid4()), tid, f"emergency stop: {reason}")
-        except Exception:
-            pass
         # Stop scheduler as well?
         _scheduler_state["running"] = False
         return {"ok": True, "reason": reason}

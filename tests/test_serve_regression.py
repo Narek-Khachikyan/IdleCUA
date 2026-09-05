@@ -270,20 +270,24 @@ def test_queue_time_decisions_baked(tmp_path: Path):
     app = create_app(data_dir=data_dir, test_mode=True)
     client = TestClient(app)
 
-    # Create task with decisions
-    resp = client.post("/api/v1/tasks", json={"goal": "research decisions test", "decisions": {"like": "approve", "post": "skip"}})
+    # Queue-time skip is stored on the Task checkpoint and suppresses
+    # every matching Action type.
+    resp = client.post("/api/v1/tasks", json={"goal": "research decisions test", "decisions": {"post": "skip"}})
     assert resp.status_code == 200, resp.text
     tid = resp.json()["task"]["id"]
-    # Verify decisions stored in kv via subsequent run (decisions affect interactive flag)
-    # We can check via memory directly
     from idlecua.memory import MemoryStore
 
     mem = MemoryStore(data_dir)
-    raw = mem.kv_get(f"task_decisions:{tid}")
-    assert raw is not None
-    dec = json.loads(raw)
-    assert dec["like"] == "approve"
-    assert dec["post"] == "skip"
+    row = mem.get_task(tid)
+    assert row is not None and row["state"] == "waiting_for_idle"
+    import json as _json
+
+    assert "post" in _json.loads(row.get("skipped_types") or "[]")
+
+    # Queue-time approval is rejected in v1 with a safe client error.
+    bad = client.post("/api/v1/tasks", json={"goal": "research decisions test", "decisions": {"like": "approve"}})
+    assert bad.status_code == 400, bad.text
+    assert "approve" in bad.text.lower() or "approval" in bad.text.lower()
 
     # UI composer should allow decisions: fetch dashboard and check that JS contains pendingDecisions and Approve/Skip handlers
     dash = client.get("/")
