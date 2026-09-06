@@ -73,3 +73,33 @@ def snapshot_for_verify(driver: Any, kind: str | None = None) -> str | None:
         return json.dumps(driver.get_accessibility_tree())
     except Exception:
         return None
+
+
+def run_prepared_action(
+    action_kind: str,
+    driver: Any,
+    task_description: str,
+    target_url: str | None,
+    before_snapshot: str | None,
+) -> tuple[ActionOutcome, str | None]:
+    """Dispatch one prepared Action and verify it as a single typed outcome.
+
+    ADR-0006: the ``ActionRunner`` owns dispatch+verify; ``TaskLifecycle``
+    only persists the returned outcome (completed after verification, failed
+    otherwise) and never confirms before verification. ``KeyboardInterrupt``
+    / ``SystemExit`` propagate so the caller maps the dispatch↔confirmation
+    crash window to ``outcome_unknown``. Dispatch errors and verify failures
+    both return a failed outcome — never completed.
+    """
+    _kind, fn, url_rec = dispatch_one(action_kind, driver, task_description, target_url)
+    # fn() runs here: normal errors become failed outcomes, crashes propagate.
+    try:
+        fn()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        return ActionOutcome(kind=action_kind, status="failed", error=str(e) or type(e).__name__, target_url=url_rec, verdict="allowed"), url_rec
+    verr = verify_significant(driver, action_kind, target_url, before_snapshot)
+    if verr:
+        return ActionOutcome(kind=action_kind, status="failed", error=f"verify failed: {verr}", target_url=url_rec, verdict="allowed"), url_rec
+    return ActionOutcome(kind=action_kind, status="completed", error=None, target_url=url_rec, verdict="allowed"), url_rec

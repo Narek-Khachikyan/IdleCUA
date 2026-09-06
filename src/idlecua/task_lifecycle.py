@@ -92,8 +92,14 @@ class TaskSnapshot:
     cumulative: dict = field(default_factory=dict)
     skipped_types: tuple[str, ...] = ()
     stop_or_failure_cause: str | None = None
+    stop_cause: str | None = None
+    failure_cause: str | None = None
+    plan_progress: int = 0
+    active_duration_s: float = 0.0
     last_outcome: str | None = None
     report_markdown: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "stopped"})
@@ -224,23 +230,40 @@ class TaskLifecycle:
         except Exception:
             plan = None
         completed: list[dict] = []
+        n_failed = 0
         try:
             for a in self.memory.list_actions(task_id=row["id"]):
+                # Cleanup closes ("cleanup: ...") are tab discipline, not plan
+                # work — excluded here just like in actions_executed.
+                if str(a.get("error") or "").startswith("cleanup:"):
+                    continue
                 if a.get("status") == "completed":
                     completed.append(
                         {"kind": a.get("kind"), "target_url": a.get("target_url"), "status": "completed"}
                     )
+                elif str(a.get("status", "")) in ("failed", "outcome_unknown"):
+                    n_failed += 1
         except Exception:
             completed = []
+            n_failed = 0
         try:
             skipped = tuple(json.loads(row.get("skipped_types") or "[]"))
         except Exception:
             skipped = ()
         cause = row.get("stop_cause") or row.get("failure_cause")
+        try:
+            snap_progress = int(row.get("plan_progress") or 0)
+        except Exception:
+            snap_progress = 0
+        try:
+            snap_duration = float(row.get("active_duration_s") or 0)
+        except Exception:
+            snap_duration = 0.0
         cumulative = {
             "active_duration_s": float(row.get("active_duration_s") or 0),
             "plan_progress": int(row.get("plan_progress") or 0),
             "actions_completed": len(completed),
+            "actions_failed": n_failed,
         }
         try:
             rep = self.memory.get_report(row["id"])
@@ -256,8 +279,14 @@ class TaskLifecycle:
             cumulative=cumulative,
             skipped_types=skipped,
             stop_or_failure_cause=cause,
+            stop_cause=row.get("stop_cause"),
+            failure_cause=row.get("failure_cause"),
+            plan_progress=snap_progress,
+            active_duration_s=snap_duration,
             last_outcome=row.get("last_outcome"),
             report_markdown=md,
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
         )
 
     def _inspect_one(self, task_id: str) -> TaskSnapshot | None:
@@ -357,19 +386,65 @@ class TaskLifecycle:
                 "only queued or paused tasks can be cancelled", False,
             )
         cause = f"cancelled:{cmd.reason}" if cmd.reason else "cancelled"
+        # Exactly one final Report per Task: persist it BEFORE the terminal
+        # transition. A failed report fails the cancel (fail-closed,
+        # retryable) instead of leaving a stopped Task without a Report.
         try:
-            self.memory.update_task_state(cmd.task_id, "stopped")
-            self.memory.update_task_checkpoint(cmd.task_id, stop_cause=cause, last_outcome="cancelled")
-            self.memory.record_error(str(uuid.uuid4()), cmd.task_id, cause)
-            # A paused task holds no lease; a queued task never held one. Be safe anyway.
+            cancel_plan = None
+            if row.get("plan_json"):
+                try:
+                    from .models.plan import Plan as _CPlan
+                    from .models.plan import RiskLevel as _CRL
+
+                    _pj = json.loads(row["plan_json"])
+                    cancel_plan = _CPlan(
+                        goal=_pj["goal"], target=_pj["target"],
+                        expected_actions=list(_pj.get("expected_actions", [])),
+                        expected_result=_pj.get("expected_result", ""),
+                        max_duration_minutes=int(_pj.get("max_duration_minutes", 45)),
+                        max_actions=int(_pj.get("max_actions", 50)),
+                        risk_level=_CRL(_pj.get("risk_level", "low")),
+                        requires_confirmation=bool(_pj.get("requires_confirmation", False)),
+                    )
+                except Exception:
+                    cancel_plan = None
             try:
-                lease = self.memory.lease_get()
-                if lease and lease.get("task_id") == cmd.task_id:
-                    self.memory.lease_release(cmd.task_id)
+                _cq = [q for q in self.memory.list_queries(limit=1000) if q.get("task_id") == cmd.task_id]
             except Exception:
-                pass
+                _cq = []
+            try:
+                _cu = [u for u in self.memory.list_urls(limit=1000) if u.get("task_id") == cmd.task_id]
+            except Exception:
+                _cu = []
+            try:
+                _cf = self.memory.list_findings(task_id=cmd.task_id)
+            except Exception:
+                _cf = []
+            try:
+                _ce = self.memory.list_errors(task_id=cmd.task_id)
+            except Exception:
+                _ce = []
+            _md = self._write_report_best_effort(
+                cmd.task_id, row.get("description", ""), cancel_plan,
+                _cq, _cu, _cf, _ce + [{"message": cause}], [], self._load_profile(),
+            )
+        except Exception:
+            _md = None
+        if _md is None:
+            return LifecycleOutcome(OutcomeCategory.execution_failed, cmd.task_id, state, "cancel report persistence failed", True)
+        try:
+            # Atomic single-statement stopped transition (ADR-0006 fail-closed).
+            self.memory.update_task_terminal(cmd.task_id, "stopped", stop_cause=cause, last_outcome="cancelled")
+            self.memory.record_error(str(uuid.uuid4()), cmd.task_id, cause)
         except Exception:
             return LifecycleOutcome(OutcomeCategory.execution_failed, cmd.task_id, state, "cancel persistence failed", True)
+        # A paused task holds no lease; a queued task never held one. Be safe anyway.
+        try:
+            lease = self.memory.lease_get()
+            if lease and lease.get("task_id") == cmd.task_id:
+                self.memory.lease_release(cmd.task_id)
+        except Exception:
+            pass
         return LifecycleOutcome(OutcomeCategory.stopped, cmd.task_id, "stopped", cause, False)
 
     def _handle_emergency_stop(self, cmd: EmergencyStop) -> LifecycleOutcome:
@@ -413,14 +488,29 @@ class TaskLifecycle:
             except Exception:
                 active_id = None
         if active_id is not None:
+            terminal_ok = False
             try:
                 row = self.memory.get_task(active_id)
                 if row and row.get("state") not in TERMINAL_STATES:
-                    self.memory.update_task_state(active_id, "stopped")
-                    self.memory.update_task_checkpoint(active_id, stop_cause=cause, last_outcome="emergency_stop")
+                    # ADR-0006 fail-closed: the stopped report is honest only
+                    # when the atomic terminal write lands. On failure the
+                    # lease is kept so no new Session can start while the old
+                    # Task still reads active; the in-process latch plus the
+                    # session's own latch check still halt dispatch.
+                    self.memory.update_task_terminal(active_id, "stopped", stop_cause=cause, last_outcome="emergency_stop")
                     self.memory.record_error(str(uuid.uuid4()), active_id, cause)
+                    terminal_ok = True
+                else:
+                    terminal_ok = True  # already terminal: nothing to persist.
             except Exception:
-                pass
+                terminal_ok = False
+            if not terminal_ok:
+                try:
+                    cur = self.memory.get_task(active_id)
+                    cur_state = cur.get("state") if cur else None
+                except Exception:
+                    cur_state = None
+                return LifecycleOutcome(OutcomeCategory.execution_failed, active_id, cur_state, "stop persistence failed; emergency latch held, retry stop", True)
             try:
                 self.memory.lease_release(active_id)
             except Exception:
@@ -555,24 +645,27 @@ class TaskLifecycle:
             "failed_gate": None,
         }
 
-    def _recover_stale_lease(self) -> None:
+    def _recover_stale_lease(self) -> bool:
         """New-process recovery: dead lease -> outcome_unknown + terminal fail.
 
         Preserves confirmed findings/history; never retries the uncertain Action.
         Releases held input. Live leases block regardless of elapsed time.
+        Returns True when no recovery was needed or it landed; False when the
+        terminal write failed — the lease is then KEPT so no new Session can
+        start while the old Task still reads active (fail-closed).
         """
         try:
             lease = self.memory.lease_get()
         except Exception:
-            return
+            return False
         if not lease or not lease.get("task_id"):
-            return
+            return True
         try:
             pid = int(lease.get("pid", -1))
         except Exception:
             pid = -1
         if _is_pid_alive(pid):
-            return
+            return True
         task_id = str(lease["task_id"])
         # Mark in-flight started-but-unconfirmed Actions as outcome_unknown.
         try:
@@ -595,20 +688,18 @@ class TaskLifecycle:
         try:
             row = self.memory.get_task(task_id)
             if row and row.get("state") not in TERMINAL_STATES:
-                self.memory.update_task_state(task_id, "failed")
-                self.memory.update_task_checkpoint(
-                    task_id, failure_cause="interrupted_unknown", last_outcome="outcome_unknown"
-                )
+                self.memory.update_task_terminal(task_id, "failed", failure_cause="interrupted_unknown", last_outcome="outcome_unknown")
                 msg = "interrupted_unknown: action dispatched before confirmation; never retried automatically"
                 if not marked:
                     msg = "interrupted_unknown: stale lease with dead PID; confirmed progress preserved"
                 self.memory.record_error(str(uuid.uuid4()), task_id, msg)
         except Exception:
-            pass
+            return False
         try:
             self.memory.lease_release(task_id)
         except Exception:
-            pass
+            return False
+        return True
 
     def _select_next(self) -> dict | None:
         """Oldest paused before oldest queued; FIFO within each group."""
@@ -634,11 +725,15 @@ class TaskLifecycle:
             # Idle-triggered Starts are always unattended; interactive needs a live owner.
             return LifecycleOutcome(OutcomeCategory.invalid_request, cmd.task_id, None, "idle-triggered start cannot be interactive", False)
 
-        # Crash recovery runs before any new claim.
+        # Crash recovery runs before any new claim. A failed recovery keeps
+        # the lease and blocks the claim (fail-closed) instead of letting a
+        # new Session start while the old Task still reads active.
         try:
-            self._recover_stale_lease()
+            recovered = self._recover_stale_lease()
         except Exception:
-            pass
+            recovered = False
+        if not recovered:
+            return LifecycleOutcome(OutcomeCategory.execution_failed, cmd.task_id, None, "stale lease recovery failed", True)
 
         # Resolve target.
         try:
@@ -678,10 +773,13 @@ class TaskLifecycle:
                 if _is_pid_alive(other_pid):
                     return LifecycleOutcome(OutcomeCategory.already_active, task_id, state, "another session is active", True)
                 # Dead lease for another task: recover it, then continue.
+                # A failed recovery keeps the lease and blocks (fail-closed).
                 try:
-                    self._recover_stale_lease()
+                    recovered_other = self._recover_stale_lease()
                 except Exception:
-                    pass
+                    recovered_other = False
+                if not recovered_other:
+                    return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, state, "stale lease recovery failed", True)
         except LifecycleOutcomeError:
             raise
         except Exception:
@@ -713,8 +811,58 @@ class TaskLifecycle:
                 pass
         try:
             self.memory.lease_acquire(task_id, os.getpid())
-        except Exception:
-            return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, state, "lease acquire failed", True)
+        except Exception as e:
+            # Atomic singleton gate: a concurrent Start won the race. Any
+            # existing lease — even for the same task_id — blocks, because a
+            # task_id alone does not prove call ownership.
+            try:
+                from .memory import LeaseBusyError as _Busy
+            except Exception:
+                _Busy = ()  # type: ignore
+            is_busy = (bool(_Busy) and isinstance(e, _Busy)) or "another session is active" in str(e)
+            if is_busy:
+                # A dead lease may have landed concurrently: recover once and
+                # retry once; a live lease still blocks.
+                try:
+                    recovered_race = self._recover_stale_lease()
+                except Exception:
+                    recovered_race = False
+                if not recovered_race:
+                    return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, state, "stale lease recovery failed", True)
+                try:
+                    self.memory.lease_acquire(task_id, os.getpid())
+                except Exception as e2:
+                    return LifecycleOutcome(OutcomeCategory.already_active, task_id, state, "another session is active", True)
+                # The recovery may have transitioned OUR task to terminal
+                # (stale same-task lease): re-read instead of running the
+                # pre-recovery row, so a terminal Task can never reactivate.
+                try:
+                    fresh = self.memory.get_task(task_id)
+                except Exception:
+                    fresh = None
+                if fresh is None:
+                    try:
+                        self.memory.lease_release(task_id)
+                    except Exception:
+                        pass
+                    return LifecycleOutcome(OutcomeCategory.not_found, task_id, None, "task not found", False)
+                fresh_state = str(fresh.get("state", ""))
+                if fresh_state in TERMINAL_STATES:
+                    try:
+                        self.memory.lease_release(task_id)
+                    except Exception:
+                        pass
+                    return LifecycleOutcome(OutcomeCategory.invalid_transition, task_id, fresh_state, f"terminal task cannot start (state={fresh_state}); create a new task", False)
+                if fresh_state in ("running", "planning"):
+                    try:
+                        self.memory.lease_release(task_id)
+                    except Exception:
+                        pass
+                    return LifecycleOutcome(OutcomeCategory.already_active, task_id, fresh_state, "session already active", False)
+                row = fresh
+                state = fresh_state
+            else:
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, state, "lease acquire failed", True)
 
         try:
             return self._run_session(task_id, row, cmd, readiness)
@@ -729,7 +877,7 @@ class TaskLifecycle:
     def _run_session(self, task_id: str, row: dict, cmd: Start, readiness: dict) -> LifecycleOutcome:
         import time as _time
 
-        from .action_runner import dispatch_one, snapshot_for_verify, verify_significant
+        from .action_runner import run_prepared_action, snapshot_for_verify
         from .dedup import normalize_query, normalize_url, plan_fingerprint, url_fingerprint
         from .models.plan import Plan
         from .models.plan import RiskLevel as _RL
@@ -769,7 +917,11 @@ class TaskLifecycle:
         if is_resume:
             raw = row.get("plan_json")
             if not raw:
-                return self._fail_task(task_id, "failed", "interrupted_unknown", "resume without persisted plan", {})
+                # Stable structured outcome on the recovery path: fail-closed
+                # with a persisted Report, never a bare None.
+                landed = self._fail_task(task_id, "failed", "interrupted_unknown", "resume without persisted plan", {})
+                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": "resume without persisted plan"}], [], profile)
+                return self._fail_outcome_honest(task_id, landed, "resume without persisted plan; confirmed progress retained")
             try:
                 pj = json.loads(raw)
                 plan = Plan(
@@ -783,7 +935,10 @@ class TaskLifecycle:
                     requires_confirmation=bool(pj.get("requires_confirmation", False)),
                 )
             except Exception as e:
-                return self._fail_task(task_id, "failed", "interrupted_unknown", f"resume plan unreadable: {e}", {})
+                msg = f"resume plan unreadable: {e}"
+                landed = self._fail_task(task_id, "failed", "interrupted_unknown", msg, {})
+                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": msg}], [], profile)
+                return self._fail_outcome_honest(task_id, landed, f"{msg}; confirmed progress retained")
             # Resume passes the same gates (already checked) and continues after last confirmed Action.
             try:
                 self.memory.update_task_state(task_id, "running")
@@ -819,9 +974,9 @@ class TaskLifecycle:
                 plan_error = plan_error or str(e)
                 plan = None
             if plan is None:
-                self._fail_task(task_id, "failed", "planning_failed", plan_error or "planning failed", {})
+                landed = self._fail_task(task_id, "failed", "planning_failed", plan_error or "planning failed", {})
                 self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": plan_error or "planning failed"}], [], profile)
-                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", plan_error or "planning failed", False)
+                return self._fail_outcome_honest(task_id, landed, plan_error or "planning failed")
             # Tighten caps from profile when stricter.
             try:
                 if profile is not None:
@@ -837,14 +992,24 @@ class TaskLifecycle:
             except Exception:
                 pass
             # Anti-repeat: identical plan within 7 days never re-executes.
+            # ADR-0006: Report persisted before the Task becomes `completed`.
             try:
                 fp = plan_fingerprint(plan)
                 if self.memory.has_plan_fingerprint_within_days(fp, days=7):
-                    self.memory.update_task_state(task_id, "completed")
-                    self.memory.update_task_checkpoint(task_id, last_outcome="skipped_repeat_plan")
-                    self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat plan {fp}")
-                    md = self._write_report_best_effort(task_id, row.get("description", ""), plan, [], [], [], [{"message": f"skipped repeat plan {fp}"}], [{"type": "plan", "value": fp, "reason": "plan identical to recent session within 7 days — skipped repeat"}], profile)
+                    repeat_errors = [{"message": f"skipped repeat plan {fp}"}]
+                    repeat_skipped = [{"type": "plan", "value": fp, "reason": "plan identical to recent session within 7 days — skipped repeat"}]
+                    md = self._write_report_best_effort(task_id, row.get("description", ""), plan, [], [], [], repeat_errors, repeat_skipped, profile)
+                    if md is None:
+                        landed = self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {})
+                        return self._fail_outcome_honest(task_id, landed, "report persistence failed; confirmed progress retained")
+                    try:
+                        self.memory.update_task_terminal(task_id, "completed", last_outcome="skipped_repeat_plan")
+                        self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat plan {fp}")
+                    except Exception:
+                        return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "planning", "completion persistence failed", True)
                     return LifecycleOutcome(OutcomeCategory.ok, task_id, "completed", f"skipped repeat plan {fp}", False)
+            except LifecycleOutcomeError:
+                raise
             except Exception:
                 pass
             # Persist the immutable Plan before the first Action.
@@ -881,7 +1046,51 @@ class TaskLifecycle:
         if progress > len(expected):
             progress = len(expected)
 
-        # Pre-snapshot dedup sets (avoid self-blocking intra-session).
+        # Confirmation-aware resume (ADR-0006): a slot is done only with a
+        # completed/skipped/blocked row. Failed (dispatch/verify) slots are
+        # NOT confirmed: resume re-runs them instead of skipping. The scalar
+        # plan_progress only tracks the confirmed prefix ("progress advanced
+        # after confirmation"); the per-slot action rows are the authority.
+        CONFIRMED_SLOT_STATUSES = frozenset({"completed", "skipped", "blocked"})
+        try:
+            _prior_actions = self.memory.list_actions(task_id=task_id)
+        except Exception:
+            _prior_actions = []
+        confirmed_slots: set[int] = set()
+        has_slotted_rows = False
+        for _a in _prior_actions:
+            try:
+                _slot = _a.get("slot_index")
+            except Exception:
+                _slot = None
+            if _slot is None:
+                continue
+            has_slotted_rows = True
+            try:
+                if str(_a.get("status", "")) in CONFIRMED_SLOT_STATUSES:
+                    confirmed_slots.add(int(_slot))
+            except Exception:
+                continue
+        confirmed_prefix = 0
+        while confirmed_prefix < len(expected) and confirmed_prefix in confirmed_slots:
+            confirmed_prefix += 1
+        # Slots with any prior attempt row: a failed slot's own earlier
+        # attempt must not block its retry as an anti-repeat "repeat".
+        attempted_slots: set[int] = set()
+        for _a in _prior_actions:
+            try:
+                _slot2 = _a.get("slot_index")
+            except Exception:
+                _slot2 = None
+            if _slot2 is None:
+                continue
+            try:
+                attempted_slots.add(int(_slot2))
+            except Exception:
+                continue
+
+        # Pre-snapshot dedup sets (other tasks' history blocks repeats; the
+        # retry bypass below handles this task's own failed attempts).
         try:
             existing_url_fps = {r["fingerprint"] for r in self.memory.list_urls(limit=1000)}
             existing_query_norms = {r["normalized"] for r in self.memory.list_queries(limit=1000)}
@@ -922,12 +1131,52 @@ class TaskLifecycle:
         def _cumulative_s() -> float:
             return float(cumulative_base) + _active_s()
 
-        def _checkpoint(progress_v: int, outcome: str) -> bool:
+        def _record_query_url_attempt(kind: str) -> None:
+            """Persist one attempt's issued query + visited URL (single helper
+            for verified completions and failed attempts alike; findings stay
+            verified-only so unverified work is never claimed)."""
             try:
-                self.memory.update_task_checkpoint(task_id, plan_progress=progress_v, active_duration_s=_cumulative_s(), last_outcome=outcome)
+                if kind == "search":
+                    qn = normalize_query(row.get("description", ""))
+                    qid = uuid.uuid4().hex
+                    self.memory.record_query(qid, task_id, row.get("description", ""), qn)
+                    queries.append({"id": qid, "query": row.get("description", ""), "normalized": qn})
+                    if action.target_url:
+                        fpu = url_fingerprint(action.target_url)
+                        nu = normalize_url(action.target_url)
+                        uid = uuid.uuid4().hex
+                        self.memory.record_url(uid, task_id, action.target_url, nu, fpu)
+                        urls.append({"id": uid, "url": action.target_url, "normalized": nu, "fingerprint": fpu})
+                elif kind in ("open_allowed_site", "open_link"):
+                    if action.target_url:
+                        fpu = url_fingerprint(action.target_url)
+                        nu = normalize_url(action.target_url)
+                        uid = uuid.uuid4().hex
+                        self.memory.record_url(uid, task_id, action.target_url, nu, fpu)
+                        urls.append({"id": uid, "url": action.target_url, "normalized": nu, "fingerprint": fpu})
+            except Exception:
+                pass
+
+        def _checkpoint(progress_v: int | None, outcome: str) -> bool:
+            """Persist duration/outcome; plan_progress advances only for
+            confirmed slots (progress_v=None keeps the persisted prefix)."""
+            try:
+                if progress_v is None:
+                    self.memory.update_task_checkpoint(task_id, active_duration_s=_cumulative_s(), last_outcome=outcome)
+                else:
+                    self.memory.update_task_checkpoint(task_id, plan_progress=progress_v, active_duration_s=_cumulative_s(), last_outcome=outcome)
                 return True
             except Exception:
                 return False
+
+        def _confirm_slot(slot: int) -> int:
+            """Mark a slot confirmed-or-definitively-skipped; returns the
+            new confirmed prefix for persistence."""
+            nonlocal confirmed_prefix
+            confirmed_slots.add(slot)
+            while confirmed_prefix < len(expected) and confirmed_prefix in confirmed_slots:
+                confirmed_prefix += 1
+            return confirmed_prefix
 
         # Schedule gate re-check uses profile; allowed-hours block fails fast.
         try:
@@ -937,19 +1186,26 @@ class TaskLifecycle:
             ok_h, _ = is_within_allowed_hours(allowed)
             if not ok_h:
                 msg = f"schedule blocks execution: allowed_hours {allowed}"
-                self._fail_task(task_id, "failed", "schedule_blocked", msg, {"active_duration_s": _cumulative_s(), "plan_progress": progress})
+                landed = self._fail_task(task_id, "failed", "schedule_blocked", msg, {"active_duration_s": _cumulative_s(), "plan_progress": progress})
                 self._write_report_best_effort(task_id, row.get("description", ""), plan, queries, urls, findings, errors + [{"message": msg}], skipped, profile)
-                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", msg, False)
+                return self._fail_outcome_honest(task_id, landed, msg)
         except Exception:
             pass
 
-        i = progress
+        if has_slotted_rows:
+            # Rewind to the first unconfirmed slot; failed slots re-run.
+            i = 0
+            while i < len(expected) and i in confirmed_slots:
+                i += 1
+        else:
+            i = progress
         paused_for_user = False
         stopped_terminal: str | None = None
         stop_detail: str | None = None
         while i < len(expected):
             kind = expected[i]
-            # Emergency latch first — LLM-independent.
+            # Emergency latch first — LLM-independent (no detector polling,
+            # so resume fast-forwards over confirmed slots deterministically).
             if _ex.is_emergency_stop_requested():
                 stopped_terminal = "stopped"
                 stop_detail = _ex.get_emergency_stop_reason() or "emergency stop"
@@ -966,7 +1222,15 @@ class TaskLifecycle:
                     pass
                 errors.append({"message": f"stopped: {stop_detail}"})
                 break
+            # Already-confirmed slots (completed/skipped/blocked in a prior
+            # session) fast-forward silently: no detector polling, no
+            # re-dispatch, no duplicate history. Failed slots re-execute below.
+            if i in confirmed_slots:
+                i += 1
+                continue
             # Owner return -> pause the same Session, release input, checkpoint.
+            # Atomic pause transition (ADR-0006 fail-closed); the persisted
+            # progress is the confirmed prefix, never past unconfirmed slots.
             if self._owner_returned():
                 try:
                     if self._driver is not None and hasattr(self._driver, "release_all_inputs"):
@@ -974,8 +1238,7 @@ class TaskLifecycle:
                 except Exception:
                     pass
                 try:
-                    self.memory.update_task_state(task_id, "paused_by_user")
-                    self.memory.update_task_checkpoint(task_id, plan_progress=i, active_duration_s=_cumulative_s(), last_outcome="paused_by_user")
+                    self.memory.update_task_terminal(task_id, "paused_by_user", plan_progress=confirmed_prefix, active_duration_s=_cumulative_s(), last_outcome="paused_by_user")
                     self.memory.record_error(str(uuid.uuid4()), task_id, "paused_by_user: hardware input detected")
                 except Exception:
                     return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "running", "pause persistence failed", True)
@@ -998,11 +1261,11 @@ class TaskLifecycle:
                 skipped.append({"type": "queue_skip", "value": kind, "reason": f"queue-time skip suppresses every '{kind}' action"})
                 try:
                     aid = uuid.uuid4().hex
-                    self.memory.record_action(aid, task_id, kind, None, "skipped", "skipped", f"queue-time skip: {kind}")
+                    self.memory.record_action(aid, task_id, kind, None, "skipped", "skipped", f"queue-time skip: {kind}", slot_index=i)
                 except Exception:
                     pass
                 i += 1
-                if not _checkpoint(i, f"skipped:{kind}"):
+                if not _checkpoint(_confirm_slot(i - 1), f"skipped:{kind}"):
                     return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                 continue
             # Build the typed action.
@@ -1012,30 +1275,34 @@ class TaskLifecycle:
             else:
                 action = TypedAction(kind=kind, target_url=f"https://{plan.target}", description=row.get("description", ""))
             # Query/URL anti-repeat against pre-session snapshot only.
+            # Repeat skips are definitive: a skipped row pins the slot so
+            # resume never re-executes it.
             if kind == "search":
                 qn = normalize_query(row.get("description", ""))
-                if qn in existing_query_norms:
+                if qn in existing_query_norms and i not in attempted_slots:
                     skipped.append({"type": "query", "value": row.get("description", ""), "reason": f"normalized query '{qn}' seen within 7 days"})
                     try:
+                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, "skipped", "skipped", f"repeat query: {qn}", slot_index=i)
                         self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat query: {row.get('description','')}")
                     except Exception:
                         pass
                     errors.append({"message": f"skipped repeat query: {row.get('description','')}"})
                     i += 1
-                    if not _checkpoint(i, "skipped_repeat_query"):
+                    if not _checkpoint(_confirm_slot(i - 1), "skipped_repeat_query"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
             if kind in ("open_allowed_site", "open_link") and action.target_url:
                 fpu = url_fingerprint(action.target_url)
-                if fpu in existing_url_fps:
+                if fpu in existing_url_fps and i not in attempted_slots:
                     skipped.append({"type": "url", "value": action.target_url, "reason": f"url fingerprint {fpu} seen within 7 days"})
                     try:
+                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, "skipped", "skipped", f"repeat url: {fpu}", slot_index=i)
                         self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat url: {action.target_url}")
                     except Exception:
                         pass
                     errors.append({"message": f"skipped repeat url: {action.target_url}"})
                     i += 1
-                    if not _checkpoint(i, "skipped_repeat_url"):
+                    if not _checkpoint(_confirm_slot(i - 1), "skipped_repeat_url"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
             # Policy gate.
@@ -1048,20 +1315,22 @@ class TaskLifecycle:
                 if cmd.mode != "interactive":
                     skipped.append({"type": "action", "value": kind, "reason": f"confirmation-required '{kind}' skipped in unattended mode"})
                     try:
-                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", f"needs_confirmation: {result.reason if result else 'unattended'}")
+                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", f"needs_confirmation: {result.reason if result else 'unattended'}", slot_index=i)
                         self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped confirmation-required action '{kind}' (unattended)")
                     except Exception:
                         pass
                     errors.append({"message": f"skipped confirmation-required: {kind}"})
                     i += 1
-                    if not _checkpoint(i, f"skipped_confirmation:{kind}"):
+                    if not _checkpoint(_confirm_slot(i - 1), f"skipped_confirmation:{kind}"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
                 # Interactive: pause active-duration accounting while the owner decides.
+                # ADR-0006 fail-closed: a failed critical state write stops
+                # before the confirmed Action can run at the wrong DB state.
                 try:
                     self.memory.update_task_state(task_id, "paused_for_approval")
                 except Exception:
-                    pass
+                    return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed entering approval")
                 appr_start = _time.monotonic()
                 confirmed = False
                 try:
@@ -1075,15 +1344,15 @@ class TaskLifecycle:
                 try:
                     self.memory.update_task_state(task_id, "running")
                 except Exception:
-                    pass
+                    return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed leaving approval")
                 if not confirmed:
                     try:
-                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", "owner declined confirmation")
+                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", "owner declined confirmation", slot_index=i)
                     except Exception:
                         pass
                     skipped.append({"type": "action", "value": kind, "reason": "owner declined confirmation"})
                     i += 1
-                    if not _checkpoint(i, "declined_confirmation"):
+                    if not _checkpoint(_confirm_slot(i - 1), "declined_confirmation"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
                 # Confirmed but MVP has no typed driver mapping -> skip-and-surface, never claim completed.
@@ -1093,48 +1362,33 @@ class TaskLifecycle:
                     _SDK = {"open_allowed_site", "open_link", "search", "read_ui", "scroll", "extract_public_info", "save_note", "close_own_tab", "open_app"}
                 if classify_action(kind) == ActionClass.confirmation_required and kind not in _SDK and kind not in ("open_allowed_site", "open_link", "search", "read_ui", "scroll", "extract_public_info", "save_note", "close_own_tab", "open_app"):
                     try:
-                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "skipped", f"no typed driver mapping for '{kind}' in MVP")
+                        self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "skipped", f"no typed driver mapping for '{kind}' in MVP", slot_index=i)
                         self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped confirmation-required '{kind}': no driver mapping in MVP")
                     except Exception:
                         pass
                     skipped.append({"type": "action", "value": kind, "reason": f"no typed driver mapping for '{kind}' in MVP (confirmed but not executed — surfaced in report)"})
                     errors.append({"message": f"skipped confirmation-required '{kind}': no driver mapping"})
                     i += 1
-                    if not _checkpoint(i, "skipped_no_mapping"):
+                    if not _checkpoint(_confirm_slot(i - 1), "skipped_no_mapping"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
             if verdict == PolicyVerdict.blocked:
                 try:
-                    self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", result.reason if result else "blocked")
+                    self.memory.record_action(uuid.uuid4().hex, task_id, kind, action.target_url, verdict.value, "blocked", result.reason if result else "blocked", slot_index=i)
                     self.memory.record_error(str(uuid.uuid4()), task_id, f"blocked {kind}: {result.reason if result else 'blocked'}")
                 except Exception:
                     pass
                 errors.append({"message": f"blocked {kind}: {result.reason if result else 'blocked'}"})
                 i += 1
-                if not _checkpoint(i, f"blocked:{kind}"):
+                if not _checkpoint(_confirm_slot(i - 1), f"blocked:{kind}"):
                     return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                 continue
             # Two-phase checkpoint: started before dispatch.
             action_id = uuid.uuid4().hex
             try:
-                self.memory.record_action(action_id, task_id, kind, action.target_url, verdict.value, "started", None)
+                self.memory.record_action(action_id, task_id, kind, action.target_url, verdict.value, "started", None, slot_index=i)
             except Exception:
                 return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before dispatch")
-            # Dispatch one prepared Action.
-            before = snapshot_for_verify(self._driver, kind)
-            try:
-                _k, fn, url_rec = dispatch_one(kind, self._driver, row.get("description", ""), action.target_url)
-            except Exception as e:
-                try:
-                    self.memory.update_action_status(action_id, "failed", str(e))
-                    self.memory.record_error(str(uuid.uuid4()), task_id, f"action {kind} failed: {e}")
-                except Exception:
-                    pass
-                errors.append({"message": f"action {kind} failed: {e}"})
-                i += 1
-                if not _checkpoint(i, f"failed:{kind}"):
-                    return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
-                continue
             # No-mapping honesty for confirmation-required kinds even when policy allowed.
             try:
                 from .executor import SUPPORTED_DRIVER_KINDS as _SUP
@@ -1148,21 +1402,24 @@ class TaskLifecycle:
                     skipped.append({"type": "action", "value": kind, "reason": f"no typed driver mapping for '{kind}' in MVP (confirmed but not executed — surfaced in report)"})
                     errors.append({"message": f"skipped confirmation-required '{kind}': no driver mapping"})
                     i += 1
-                    if not _checkpoint(i, "skipped_no_mapping"):
+                    if not _checkpoint(_confirm_slot(i - 1), "skipped_no_mapping"):
                         return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                     continue
             except Exception:
                 pass
-            dispatch_error: str | None = None
+            # Single typed outcome: dispatch+verify owned by ActionRunner.
+            # Confirmation (completed) is persisted only after verification;
+            # verify failures return failed and never advance as completed,
+            # so resume never skips an unverified Action.
+            before = snapshot_for_verify(self._driver, kind)
             try:
-                fn()
+                outcome, _url_rec = run_prepared_action(kind, self._driver, row.get("description", ""), action.target_url, before)
             except BaseException as e:  # crash between dispatch and confirmation
                 dispatch_error = str(e) or type(e).__name__
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
                     try:
                         self.memory.update_action_status(action_id, "outcome_unknown", "interrupted after dispatch before confirmation")
-                        self.memory.update_task_state(task_id, "failed")
-                        self.memory.update_task_checkpoint(task_id, plan_progress=i, active_duration_s=_cumulative_s(), failure_cause="interrupted_unknown", last_outcome="outcome_unknown")
+                        self.memory.update_task_terminal(task_id, "failed", plan_progress=confirmed_prefix, active_duration_s=_cumulative_s(), failure_cause="interrupted_unknown", last_outcome="outcome_unknown")
                         self.memory.record_error(str(uuid.uuid4()), task_id, "interrupted_unknown: action dispatched before confirmation; never retried automatically")
                     except Exception:
                         pass
@@ -1174,8 +1431,29 @@ class TaskLifecycle:
                 except Exception:
                     pass
                 errors.append({"message": f"action {kind} failed: {dispatch_error}"})
+                # Unconfirmed: the in-memory cursor moves on so the session
+                # terminates, but the persisted prefix does not advance — a
+                # later resume re-runs this slot after the last confirmed one.
                 i += 1
-                if not _checkpoint(i, f"failed:{kind}"):
+                if not _checkpoint(None, f"failed:{kind}"):
+                    return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
+                continue
+            if outcome.status != "completed":
+                # Dispatch error or verify failure: failed, never confirmed.
+                # The attempt itself is still history: record the issued query
+                # and visited URL so anti-repeat sees them, but never claim a
+                # finding from unverified work. The persisted prefix does not
+                # advance, so resume re-runs this slot after the last
+                # confirmed Action instead of skipping it.
+                _record_query_url_attempt(kind)
+                try:
+                    self.memory.update_action_status(action_id, "failed", outcome.error)
+                    self.memory.record_error(str(uuid.uuid4()), task_id, f"action {kind} failed: {outcome.error}")
+                except Exception:
+                    pass
+                errors.append({"message": f"action {kind} failed: {outcome.error}"})
+                i += 1
+                if not _checkpoint(None, f"failed:{kind}"):
                     return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
                 continue
             # A cooperative stop that arrives after a successful dispatch is
@@ -1183,38 +1461,22 @@ class TaskLifecycle:
             # `outcome_unknown` is reserved for true interruption between
             # dispatch and confirmation (crash path above, stale-lease
             # recovery): it is never inferred from a live latch here.
-            # Completion + progress advance persisted before the next Action.
+            # Confirmation + progress advance persisted before the next Action.
             try:
                 self.memory.update_action_status(action_id, "completed", None)
             except Exception:
                 return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
-            # Record queries/urls/findings.
+            # Record queries/urls for the verified attempt via the shared
+            # helper; findings only for verified completions.
+            _record_query_url_attempt(kind)
             try:
-                if kind == "search":
-                    qn = normalize_query(row.get("description", ""))
-                    qid = uuid.uuid4().hex
-                    self.memory.record_query(qid, task_id, row.get("description", ""), qn)
-                    queries.append({"id": qid, "query": row.get("description", ""), "normalized": qn})
-                    if action.target_url:
-                        fpu = url_fingerprint(action.target_url)
-                        nu = normalize_url(action.target_url)
-                        uid = uuid.uuid4().hex
-                        self.memory.record_url(uid, task_id, action.target_url, nu, fpu)
-                        urls.append({"id": uid, "url": action.target_url, "normalized": nu, "fingerprint": fpu})
-                elif kind in ("open_allowed_site", "open_link"):
-                    if action.target_url:
-                        fpu = url_fingerprint(action.target_url)
-                        nu = normalize_url(action.target_url)
-                        uid = uuid.uuid4().hex
-                        self.memory.record_url(uid, task_id, action.target_url, nu, fpu)
-                        urls.append({"id": uid, "url": action.target_url, "normalized": nu, "fingerprint": fpu})
-                        if kind == "open_link":
-                            fid = uuid.uuid4().hex
-                            title = f"Finding from {plan.target}: {row.get('description','')[:40]}"
-                            summary = f"Public info extracted from {action.target_url} for goal '{plan.goal}'"
-                            rel = f"Relevant to profile interests/projects for '{plan.goal}'"
-                            self.memory.record_finding(fid, task_id, title, action.target_url, summary, rel)
-                            findings.append({"id": fid, "title": title, "url": action.target_url, "summary": summary, "relevance": rel})
+                if kind == "open_link" and action.target_url:
+                    fid = uuid.uuid4().hex
+                    title = f"Finding from {plan.target}: {row.get('description','')[:40]}"
+                    summary = f"Public info extracted from {action.target_url} for goal '{plan.goal}'"
+                    rel = f"Relevant to profile interests/projects for '{plan.goal}'"
+                    self.memory.record_finding(fid, task_id, title, action.target_url, summary, rel)
+                    findings.append({"id": fid, "title": title, "url": action.target_url, "summary": summary, "relevance": rel})
                 elif kind in ("extract_public_info", "read_ui"):
                     if action.target_url:
                         fid = uuid.uuid4().hex
@@ -1226,15 +1488,8 @@ class TaskLifecycle:
                     findings.append({"id": fid, "title": f"Saved note: {row.get('description','')[:40]}", "url": f"https://{plan.target}", "summary": f"Local note saved: {row.get('description','')}", "relevance": f"Relevant to {plan.goal}"})
             except Exception:
                 pass
-            verr = verify_significant(self._driver, kind, action.target_url or plan.target, before)
-            if verr:
-                try:
-                    self.memory.record_error(str(uuid.uuid4()), task_id, f"verify failed for {kind}: {verr}")
-                except Exception:
-                    pass
-                errors.append({"message": f"verify failed for {kind}: {verr}"})
             i += 1
-            if not _checkpoint(i, f"completed:{kind}"):
+            if not _checkpoint(_confirm_slot(i - 1), f"completed:{kind}"):
                 return self._fail_outcome(task_id, plan, profile, queries, urls, findings, errors, skipped, "critical persistence failed before next action")
 
         # Terminal paths.
@@ -1248,22 +1503,25 @@ class TaskLifecycle:
         if stopped_terminal == "stopped":
             cause = f"emergency_stop:{stop_detail}" if stop_detail else "stopped"
             # If the stop arrived from the in-process latch, keep its distinct cause.
+            # ADR-0006 fail-closed + atomic: one statement commits state and
+            # checkpoint together; a failed write never reports stopped.
             try:
-                self.memory.update_task_state(task_id, "stopped")
-                self.memory.update_task_checkpoint(task_id, plan_progress=i, active_duration_s=_cumulative_s(), stop_cause=cause, last_outcome="stopped")
+                self.memory.update_task_terminal(task_id, "stopped", plan_progress=confirmed_prefix, active_duration_s=_cumulative_s(), stop_cause=cause, last_outcome="stopped")
             except Exception:
-                pass
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "running", "stop persistence failed", True)
             self._write_report_best_effort(task_id, row.get("description", ""), plan, queries, urls, findings, errors, skipped, profile)
             self._close_agent_tabs_best_effort(task_id, plan, n_completed_end)
             return LifecycleOutcome(OutcomeCategory.stopped, task_id, "stopped", cause, False)
         if stopped_terminal == "completed" and stop_detail and "limit reached" in stop_detail:
             md = self._write_report_best_effort(task_id, row.get("description", ""), plan, queries, urls, findings, errors, skipped, profile)
             if md is None:
-                self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {"active_duration_s": _cumulative_s(), "plan_progress": i})
-                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "report persistence failed; confirmed progress retained", False)
+                landed = self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {"active_duration_s": _cumulative_s(), "plan_progress": confirmed_prefix})
+                return self._fail_outcome_honest(task_id, landed, "report persistence failed; confirmed progress retained")
             try:
-                self.memory.update_task_state(task_id, "completed")
-                self.memory.update_task_checkpoint(task_id, plan_progress=i, active_duration_s=_cumulative_s(), last_outcome="completed_limit")
+                self.memory.update_task_terminal(task_id, "completed", plan_progress=confirmed_prefix, active_duration_s=_cumulative_s(), last_outcome="completed_limit")
+            except Exception:
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "running", "completion persistence failed", True)
+            try:
                 self.memory.record_plan_fingerprint(plan_fingerprint(plan), task_id)
             except Exception:
                 pass
@@ -1281,8 +1539,8 @@ class TaskLifecycle:
                 findings.append({"id": fid, "title": f"Visited {u.get('url','')}", "url": u.get("url", ""), "summary": f"Visited {u.get('url','')} for goal '{plan.goal}'", "relevance": f"Relevant to profile for '{plan.goal}'"})
         md = self._write_report_best_effort(task_id, row.get("description", ""), plan, queries, urls, findings, errors, skipped, profile)
         if md is None:
-            self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {"active_duration_s": _cumulative_s(), "plan_progress": i})
-            return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "report persistence failed; confirmed progress retained", False)
+            landed = self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {"active_duration_s": _cumulative_s(), "plan_progress": confirmed_prefix})
+            return self._fail_outcome_honest(task_id, landed, "report persistence failed; confirmed progress retained")
         # Success/failure by confirmed work (parity with executor graceful semantics).
         try:
             persisted_actions = self.memory.list_actions(task_id=task_id)
@@ -1290,15 +1548,17 @@ class TaskLifecycle:
         except Exception:
             n_completed = 0
         if errors and n_completed == 0 and not findings:
-            self._fail_task(task_id, "failed", "execution_failed", "; ".join(e.get("message", "") for e in errors[:3]) or "execution failed", {"active_duration_s": _cumulative_s(), "plan_progress": i})
+            landed = self._fail_task(task_id, "failed", "execution_failed", "; ".join(e.get("message", "") for e in errors[:3]) or "execution failed", {"active_duration_s": _cumulative_s(), "plan_progress": confirmed_prefix})
             self._close_agent_tabs_best_effort(task_id, plan, n_completed)
-            return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "execution failed; confirmed progress retained", False)
+            return self._fail_outcome_honest(task_id, landed, "execution failed; confirmed progress retained")
         try:
-            self.memory.update_task_state(task_id, "completed")
-            self.memory.update_task_checkpoint(task_id, plan_progress=i, active_duration_s=_cumulative_s(), last_outcome="completed")
-            self.memory.record_plan_fingerprint(plan_fingerprint(plan), task_id)
+            self.memory.update_task_terminal(task_id, "completed", plan_progress=confirmed_prefix, active_duration_s=_cumulative_s(), last_outcome="completed")
         except Exception:
             return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "running", "completion persistence failed", True)
+        try:
+            self.memory.record_plan_fingerprint(plan_fingerprint(plan), task_id)
+        except Exception:
+            pass
         self._close_agent_tabs_best_effort(task_id, plan, n_completed)
         return LifecycleOutcome(OutcomeCategory.ok, task_id, "completed", "completed", False)
 
@@ -1370,8 +1630,36 @@ class TaskLifecycle:
         except Exception:
             pass
         try:
-            n = len([a for a in self.memory.list_actions(task_id=task_id) if a.get("status") == "completed"])
-            cap = int(getattr(self.config, "max_actions", 200))
+            # The ceiling counts every external attempt — completed, failed,
+            # outcome_unknown, and in-flight started — so consecutive dispatch
+            # or verification failures cannot exceed the Plan budget. Definitive
+            # skips/blocks never touched the driver and do not consume it.
+            _ATTEMPT_STATUSES = frozenset({"completed", "failed", "outcome_unknown", "started"})
+            n = len([
+                a for a in self.memory.list_actions(task_id=task_id)
+                if str(a.get("status", "")) in _ATTEMPT_STATUSES
+                and not str(a.get("error") or "").startswith("cleanup:")
+            ])
+            caps: list[int] = []
+            try:
+                caps.append(int(getattr(self.config, "max_actions", 200)))
+            except Exception:
+                pass
+            # Plan budget is authoritative per-task: a Plan with max_actions=1
+            # stops after one confirmed Action even when Config allows more.
+            if plan is not None:
+                try:
+                    caps.append(int(plan.max_actions))
+                except Exception:
+                    pass
+            if profile is not None:
+                try:
+                    dl = getattr(getattr(profile, "autonomy_boundaries", None), "daily_action_limit", None)
+                    if dl:
+                        caps.append(int(dl))
+                except Exception:
+                    pass
+            cap = min(caps) if caps else int(getattr(self.config, "max_actions", 200))
             if n >= cap:
                 return f"limit reached: actions {n} >= cap {cap}"
         except Exception:
@@ -1387,28 +1675,62 @@ class TaskLifecycle:
             pass
         return None
 
-    def _fail_task(self, task_id: str, state: str, cause_kind: str, message: str, extra: dict) -> None:
+    def _fail_task(self, task_id: str, state: str, cause_kind: str, message: str, extra: dict) -> bool:
+        """Atomic terminal failure write. Returns True when the terminal
+        transition landed; callers must report an honest state when False
+        (see `_fail_outcome_honest`) instead of claiming terminal `failed`."""
+        stop_cause: str | None = None
+        failure_cause: str | None = None
+        if cause_kind in ("cancelled", "emergency_stop", "legacy_not_queued") or cause_kind.startswith("cancel") or cause_kind.startswith("emergency") or cause_kind.startswith("legacy"):
+            stop_cause = message
+        else:
+            failure_cause = message
         try:
-            self.memory.update_task_state(task_id, state)
-            kw: dict[str, Any] = {}
-            if cause_kind in ("cancelled", "emergency_stop", "legacy_not_queued") or cause_kind.startswith("cancel") or cause_kind.startswith("emergency") or cause_kind.startswith("legacy"):
-                kw["stop_cause"] = message
-            else:
-                kw["failure_cause"] = message
-            if "active_duration_s" in extra:
-                kw["active_duration_s"] = float(extra["active_duration_s"])
-            if "plan_progress" in extra:
-                kw["plan_progress"] = int(extra["plan_progress"])
-            kw["last_outcome"] = cause_kind
-            self.memory.update_task_checkpoint(task_id, **kw)  # type: ignore[arg-type]
+            plan_progress = extra.get("plan_progress")
+        except Exception:
+            plan_progress = None
+        try:
+            active_duration_s = extra.get("active_duration_s")
+        except Exception:
+            active_duration_s = None
+        try:
+            self.memory.update_task_terminal(
+                task_id, state,
+                plan_progress=int(plan_progress) if plan_progress is not None else None,
+                active_duration_s=float(active_duration_s) if active_duration_s is not None else None,
+                stop_cause=stop_cause, failure_cause=failure_cause, last_outcome=cause_kind,
+            )
+        except Exception:
+            return False
+        try:
             self.memory.record_error(str(uuid.uuid4()), task_id, message)
         except Exception:
             pass
+        return True
+
+    def _honest_fail_state(self, task_id: str) -> str | None:
+        """Current DB state for honest failure reporting (None when unreadable)."""
+        try:
+            cur = self.memory.get_task(task_id)
+            return cur.get("state") if cur else None
+        except Exception:
+            return None
+
+    def _fail_outcome_honest(self, task_id: str, landed: bool, message: str) -> LifecycleOutcome:
+        """Outcome for `_fail_task` paths: terminal `failed` only when the
+        write landed, otherwise the actual DB state (retryable) so callers
+        never report a Task as failed while it is still planning/running."""
+        if landed:
+            return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", message, False)
+        return LifecycleOutcome(
+            OutcomeCategory.execution_failed, task_id, self._honest_fail_state(task_id),
+            f"{message}; failure persistence failed", True,
+        )
 
     def _fail_outcome(self, task_id, plan, profile, queries, urls, findings, errors, skipped, message: str) -> LifecycleOutcome:
-        self._fail_task(task_id, "failed", "persistence_failed", message, {})
+        landed = self._fail_task(task_id, "failed", "persistence_failed", message, {})
         self._write_report_best_effort(task_id, "", plan, queries, urls, findings, errors + [{"message": message}], skipped, profile)
-        return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", message, False)
+        return self._fail_outcome_honest(task_id, landed, message)
 
     def _write_report_best_effort(self, task_id, goal, plan, queries, urls, findings, errors, skipped, profile) -> str | None:
         from .report import generate_markdown_report, save_report_to_file

@@ -123,15 +123,17 @@ def _fetch_history_filtered(idle_app: IdleCua, task_id: str | None, limit: int =
         urls = [u for u in idle_app.memory.list_urls(limit=limit) if u.get("task_id") == task_id]
         findings = idle_app.memory.list_findings(task_id=task_id)
         errors = idle_app.memory.list_errors(task_id=task_id)
-        tasks_all = idle_app.memory.list_tasks(limit=limit)
-        tasks = [t for t in tasks_all if t.get("id") == task_id]
+        # Lifecycle data via the Application API seam (ADR-0006); execution
+        # history (actions/queries/urls/findings/errors) stays on memory reads.
+        viewed = idle_app.get_task_view(task_id)
+        tasks = [viewed] if viewed else []
     else:
         actions = idle_app.memory.list_actions()
         queries = idle_app.memory.list_queries(limit=limit)
         urls = idle_app.memory.list_urls(limit=limit)
         findings = idle_app.memory.list_findings(limit=limit)
         errors = idle_app.memory.list_errors()
-        tasks = idle_app.memory.list_tasks(limit=limit)
+        tasks = idle_app.list_tasks_view(limit=limit)
     return {"actions": actions, "queries": queries, "urls": urls, "findings": findings, "errors": errors, "tasks": tasks}
 
 
@@ -584,7 +586,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.get("/api/v1/tasks")
     def api_list_tasks():
         idle_app = _get_idle_cua(resolved_data_dir)
-        tasks = idle_app.memory.list_tasks(limit=100)
+        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+        tasks = idle_app.list_tasks_view(limit=100)
         # Enrich with result counts
         enriched = []
         for t in tasks:
@@ -657,7 +660,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.get("/api/v1/tasks/{task_id}")
     def api_get_task(task_id: str):
         idle_app = _get_idle_cua(resolved_data_dir)
-        data = idle_app.memory.get_task(task_id)
+        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+        data = idle_app.get_task_view(task_id)
         if not data:
             raise HTTPException(status_code=404, detail="task not found")
         # Enrich with execution result
@@ -747,7 +751,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.post("/api/v1/tasks/{task_id}/plan")
     def api_plan_preview(task_id: str):
         idle_app = _get_idle_cua(resolved_data_dir)
-        data = idle_app.memory.get_task(task_id)
+        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+        data = idle_app.get_task_view(task_id)
         if not data:
             raise HTTPException(status_code=404, detail="task not found")
         goal = data.get("description", "")
@@ -1196,8 +1201,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         from ..accounting import get_today_count
 
         llm_today = get_today_count(data_dir)
-        # Tasks (shared enrichment: ui_state + result summary)
-        tasks = idle_app.memory.list_tasks(limit=20)
+        # Tasks via the lifecycle seam (ADR-0006: Application API → inspect()).
+        tasks = idle_app.list_tasks_view(limit=20)
         tasks_enriched = _enrich_tasks_with_results(idle_app, tasks)
         # Failure reason for Retry (failed tasks only)
         for t in tasks_enriched:
@@ -1317,7 +1322,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             return HTMLResponse("<html><body>Tasks</body></html>")
         data_dir = resolved_data_dir
         idle_app = _get_idle_cua(data_dir)
-        raw_tasks = idle_app.memory.list_tasks(limit=100)
+        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+        raw_tasks = idle_app.list_tasks_view(limit=100)
         # Reuse the dashboard enrichment so Result no longer duplicates State.
         tasks_enriched = _enrich_tasks_with_results(idle_app, raw_tasks)
         # Counts for the segmented state filter (over the unfiltered list).
@@ -1353,7 +1359,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         # Classify notices so routine notes are not rendered as red errors.
         for e in hist.get("errors", []):
             e["level"] = _notice_level(e.get("message", ""))
-        tasks = idle_app.memory.list_tasks(limit=100)
+        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+        tasks = idle_app.list_tasks_view(limit=100)
         return templates.TemplateResponse(
             request,
             "history.html",
@@ -1386,7 +1393,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         for r in reports:
             tid = r.get("task_id", "")
             try:
-                task = idle_app.memory.get_task(tid)
+                # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+                task = idle_app.get_task_view(tid)
                 r["title"] = (task.get("description") or "Untitled task") if task else "Untitled task"
                 raw_state = (task.get("state") or "unknown") if task else "unknown"
             except Exception:
@@ -1419,7 +1427,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 raise HTTPException(status_code=404, detail="report not found")
         md_text = rep.get("markdown", "")
         try:
-            task = idle_app.memory.get_task(task_id)
+            # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
+            task = idle_app.get_task_view(task_id)
             title = (task.get("description") or "Untitled task") if task else "Untitled task"
             raw_state = (task.get("state") or "unknown") if task else "unknown"
         except Exception:

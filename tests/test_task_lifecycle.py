@@ -189,12 +189,102 @@ def test_selection_paused_before_queued_fifo(tmp_path: Path):
     second = lc.handle(Enqueue(goal="queued second")).task_id
     third = lc.handle(Enqueue(goal="queued third")).task_id
     # Oldest paused resumes before any queued task starts (next idle window).
+    # Resume re-runs unverified slots after the last confirmed Action instead
+    # of skipping them, so one idle window may pause again before finishing:
+    # keep resuming at fresh idle windows until the first task completes.
     app.idle_detector.n = 0
     picked = lc.handle(Start(task_id=None, trigger="idle", mode="unattended"))
-    assert picked.task_id == first and picked.state == "completed"
+    assert picked.task_id == first
+    for _ in range(5):
+        if lc.inspect(GetTask(first)).state == "completed":
+            break
+        app.idle_detector.n = 0
+        picked = lc.handle(Start(task_id=None, trigger="idle", mode="unattended"))
+        assert picked.task_id == first
+    assert lc.inspect(GetTask(first)).state == "completed"
+    # An unverified slot is recorded as failed — never confirmed — and a
+    # later resume re-runs it instead of skipping it. Observable through the
+    # seam: failures are visible in the snapshot while the task still runs to
+    # completion with confirmed work and exactly one final Report.
+    done = lc.inspect(GetTask(first))
+    assert done is not None
+    assert int(done.cumulative.get("actions_failed", 0)) >= 1
+    assert int(done.cumulative.get("actions_completed", 0)) >= 1
+    assert len(done.completed_outcomes) >= 1
+    assert done.report_markdown
     picked2 = lc.handle(Start(task_id=None, trigger="idle", mode="unattended"))
     assert picked2.task_id == second
     assert lc.inspect(GetTask(third)).state == "waiting_for_idle"
+
+
+def test_v2_rows_keep_confirmed_prefix_after_migration(tmp_path: Path):
+    """Pre-v3 action rows without a slot keep their confirmed prefix.
+
+    Simulates a v2 database (no slot index): after migration the resume must
+    continue after the last confirmed Action, never replaying confirmed
+    Actions from slot 0. Asserted through handle/inspect only.
+    """
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+
+    from idlecua.planner import StubPlanner
+
+    class UniquePlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            from idlecua.models.plan import Plan, RiskLevel
+
+            return Plan(goal=desc, target="x.com", expected_actions=[
+                "open_allowed_site", "search", "read_ui", "scroll",
+                "extract_public_info", "save_note",
+            ], expected_result="t", max_duration_minutes=10, max_actions=50,
+                risk_level=RiskLevel.low, requires_confirmation=False)
+
+    class Flip(FakeIdleDetector):
+        def __init__(self):
+            super().__init__(idle_seconds=1000, locked=False)
+            self.n = 0
+
+        def seconds_since_last_input(self):
+            self.n += 1
+            return 1000.0 if self.n <= 3 else 0.0
+
+        def can_run(self, thr=600):
+            return (True, "idle") if self.n <= 3 else (False, "user returned")
+
+        def is_screen_locked(self):
+            return False
+
+    app = _app(td, planner=UniquePlanner(), idle_detector=Flip())
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="v2 migration replay check")).task_id
+    paused = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert paused.state == "paused_by_user"
+    mid = lc.inspect(GetTask(tid))
+    assert mid is not None and int(mid.cumulative.get("actions_completed", 0)) >= 1
+
+    # Simulate a v2 database file: strip the slot index the new code wrote
+    # and roll the schema version back so reopening runs the migration.
+    conn = sqlite3.connect(str(td / "memory.db"))
+    try:
+        conn.execute("UPDATE actions SET slot_index=NULL WHERE task_id=?", (tid,))
+        conn.execute("PRAGMA user_version=2")
+        conn.commit()
+    finally:
+        conn.close()
+
+    from idlecua.memory import MemoryStore
+
+    app2 = _app(td, planner=UniquePlanner())
+    app2._memory = MemoryStore(td)
+    resumed = app2.lifecycle.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert resumed.state == "completed"
+    # No confirmed Action ran twice: every completed kind is unique (the plan
+    # itself uses unique kinds), and confirmed work was never replanned.
+    final = app2.lifecycle.inspect(GetTask(tid))
+    assert final is not None and final.state == "completed"
+    kinds = [o.get("kind") for o in final.completed_outcomes]
+    assert len(kinds) == len(set(kinds)), kinds
+    assert final.report_markdown
 
 
 def test_pause_resume_keeps_plan_progress_and_cumulative_limits(tmp_path: Path):
