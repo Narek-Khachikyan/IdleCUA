@@ -1429,6 +1429,70 @@ class IdleCua:
             "report_path": str(res.report_path) if res.report_path else None,
         }
 
+    @staticmethod
+    def _snapshot_to_view(s) -> dict:
+        """Single snapshot→legacy-row serializer (no drift between callers).
+
+        Keeps the full legacy row shape — ``id``/``description``/``state``/
+        ``plan_json`` plus checkpoint columns (``plan_progress``,
+        ``active_duration_s``, ``skipped_types``, ``last_outcome``) and the
+        SEPARATE ``stop_cause``/``failure_cause`` columns, so cancellation and
+        emergency stop keep reading as stops, not failures.
+        """
+        import json as _json
+
+        return {
+            "id": s.task_id,
+            "description": s.goal,
+            "state": s.state,
+            "plan_json": _json.dumps(s.plan) if s.plan else None,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "plan_progress": int(getattr(s, "plan_progress", 0) or 0),
+            "active_duration_s": float(getattr(s, "active_duration_s", 0.0) or 0.0),
+            "skipped_types": _json.dumps(list(s.skipped_types or ())),
+            "stop_cause": getattr(s, "stop_cause", None),
+            "failure_cause": getattr(s, "failure_cause", None),
+            "last_outcome": s.last_outcome,
+        }
+
+    def list_tasks_view(self, limit: int = 100) -> list[dict]:
+        """Lifecycle-owned Task listing for HTTP API / Local UI (ADR-0006).
+
+        Built solely from ``TaskLifecycle.inspect(ListTasks)`` — adapters
+        never read lifecycle storage directly. Returned dicts keep the
+        legacy row shape so HTTP contracts and templates stay byte-identical.
+        """
+        from .task_lifecycle import ListTasks as _LT
+
+        try:
+            snaps = self.lifecycle.inspect(_LT(limit=int(limit)))
+        except Exception:
+            return []
+        out: list[dict] = []
+        for s in snaps or []:
+            try:
+                out.append(self._snapshot_to_view(s))
+            except Exception:
+                continue
+        return out
+
+    def get_task_view(self, task_id: str) -> dict | None:
+        """Lifecycle-owned single-Task view for HTTP API / Local UI (ADR-0006).
+
+        Built solely from ``TaskLifecycle.inspect(GetTask)``; ``None`` when
+        the Task does not exist. Same legacy row shape as ``list_tasks_view``.
+        """
+        from .task_lifecycle import GetTask as _GT
+
+        try:
+            s = self.lifecycle.inspect(_GT(task_id))
+        except Exception:
+            return None
+        if s is None:
+            return None
+        return self._snapshot_to_view(s)
+
     def run_idle_session(
         self,
         task_description: str,

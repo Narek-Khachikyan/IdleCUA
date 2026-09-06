@@ -43,19 +43,26 @@ class IdleScheduler:
 
     # -- idle primitive (polling only; lifecycle owns the gate decision) --
 
+    def _effective_threshold(self, threshold_override: int | None = None) -> int:
+        """Single helper for the effective idle threshold (ADR-0003).
+
+        Profile value when available, else Config fallback. One place so the
+        three call sites cannot drift.
+        """
+        if threshold_override is not None:
+            return int(threshold_override)
+        try:
+            from .profile.models import get_effective_idle_threshold_seconds
+            from .profile.store import load_profile as _lp
+
+            p = _lp(self.config.data_dir / "profile.json")
+            return int(get_effective_idle_threshold_seconds(p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600))))
+        except Exception:
+            return int(getattr(self.config, "idle_threshold_seconds", 600))
+
     def check_idle_gate(self, threshold_override: int | None = None) -> GateCheck:
         # ADR-0003: effective threshold from Profile if available, else Config — single source via profile helper
-        if threshold_override is not None:
-            thr = int(threshold_override)
-        else:
-            try:
-                from .profile.models import get_effective_idle_threshold_seconds
-                from .profile.store import load_profile as _lp
-
-                p = _lp(self.config.data_dir / "profile.json")
-                thr = get_effective_idle_threshold_seconds(p, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-            except Exception:
-                thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+        thr = self._effective_threshold(threshold_override)
         try:
             locked = self.idle.is_screen_locked()
             if locked:
@@ -86,17 +93,7 @@ class IdleScheduler:
 
         start = time.monotonic()
         tick = 0
-        if threshold_override is not None:
-            thr = int(threshold_override)
-        else:
-            try:
-                from .profile.models import get_effective_idle_threshold_seconds
-                from .profile.store import load_profile as _lp2
-
-                _p2 = _lp2(self.config.data_dir / "profile.json")
-                thr = get_effective_idle_threshold_seconds(_p2, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-            except Exception:
-                thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+        thr = self._effective_threshold(threshold_override)
         while True:
             if is_emergency_stop_requested():
                 return False
@@ -139,17 +136,7 @@ class IdleScheduler:
             raise ValueError("start_fn is required: the Watch loop only submits Starts")
         results: list[Any] = []
         sessions = 0
-        if idle_threshold_override is not None:
-            thr: int | None = int(idle_threshold_override)
-        else:
-            try:
-                from .profile.models import get_effective_idle_threshold_seconds
-                from .profile.store import load_profile as _lp3
-
-                _p3 = _lp3(self.config.data_dir / "profile.json")
-                thr = get_effective_idle_threshold_seconds(_p3, fallback=int(getattr(self.config, "idle_threshold_seconds", 600)))
-            except Exception:
-                thr = int(getattr(self.config, "idle_threshold_seconds", 600))
+        thr: int | None = self._effective_threshold(idle_threshold_override)
 
         while True:
             if is_emergency_stop_requested():

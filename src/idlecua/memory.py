@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS actions (
     status TEXT NOT NULL,
     error TEXT,
     created_at TEXT NOT NULL,
+    slot_index INTEGER,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 CREATE TABLE IF NOT EXISTS queries (
@@ -93,8 +94,9 @@ CREATE TABLE IF NOT EXISTS active_session (
 """
 
 # TaskLifecycle persistence version. v2 adds checkpoint columns + lease table
-# plus safety-preserving legacy-state conversion.
-LIFECYCLE_SCHEMA_VERSION = 2
+# plus safety-preserving legacy-state conversion. v3 adds the per-plan-slot
+# action index so resume re-runs unconfirmed slots instead of skipping them.
+LIFECYCLE_SCHEMA_VERSION = 3
 
 _TASK_CHECKPOINT_COLUMNS: dict[str, str] = {
     "plan_progress": "INTEGER NOT NULL DEFAULT 0",
@@ -104,6 +106,10 @@ _TASK_CHECKPOINT_COLUMNS: dict[str, str] = {
     "stop_cause": "TEXT",
     "failure_cause": "TEXT",
 }
+
+
+class LeaseBusyError(RuntimeError):
+    """Raised when another task holds the singleton active-Session lease."""
 
 
 class MemoryStore:
@@ -158,6 +164,40 @@ class MemoryStore:
             for name, ddl in _TASK_CHECKPOINT_COLUMNS.items():
                 if name not in cols:
                     conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+            # v3: per-plan-slot action index for confirmation-aware resume.
+            try:
+                action_cols = self._table_columns(conn, "actions")
+            except Exception:
+                action_cols = set()
+            if "slot_index" not in action_cols:
+                conn.execute("ALTER TABLE actions ADD COLUMN slot_index INTEGER")
+            # v3 backfill: pre-v3 rows advanced the cursor unconditionally, so
+            # the earliest non-cleanup action rows of each task map to plan
+            # slots 0..n in creation order. Without this, the first slotted
+            # write would make the resume scan miss the legacy confirmed
+            # prefix and replay confirmed Actions from slot 0.
+            if version < 3:
+                try:
+                    cur = conn.execute(
+                        "SELECT id, task_id FROM actions "
+                        "WHERE slot_index IS NULL AND (error IS NULL OR error NOT LIKE 'cleanup:%') "
+                        "ORDER BY task_id, created_at, rowid"
+                    )
+                    pending = [(str(r["id"]), str(r["task_id"])) for r in cur.fetchall()]
+                except Exception:
+                    pending = []
+                if pending:
+                    per_task = 0
+                    last_task: str | None = None
+                    for aid, atask in pending:
+                        if atask != last_task:
+                            last_task = atask
+                            per_task = 0
+                        try:
+                            conn.execute("UPDATE actions SET slot_index=? WHERE id=?", (per_task, aid))
+                        except Exception:
+                            continue
+                        per_task += 1
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS active_session (
                     task_id TEXT PRIMARY KEY,
@@ -274,6 +314,54 @@ class MemoryStore:
             finally:
                 conn.close()
 
+    def update_task_terminal(
+        self,
+        task_id: str,
+        state: str,
+        *,
+        plan_progress: int | None = None,
+        active_duration_s: float | None = None,
+        stop_cause: str | None = None,
+        failure_cause: str | None = None,
+        last_outcome: str | None = None,
+    ) -> None:
+        """Atomic single-statement state+checkpoint transition (ADR-0006).
+
+        One ``UPDATE`` sets the terminal (or paused) state together with its
+        checkpoint columns and commits once, so a failed write can never
+        leave a partially committed transition (e.g. ``completed`` state
+        without its checkpoint). Fail-closed: the caller must not report
+        the transition on error.
+        """
+        now = _now_iso()
+        sets: list[str] = ["state=?", "updated_at=?"]
+        vals: list[Any] = [state, now]
+        if plan_progress is not None:
+            sets.append("plan_progress=?")
+            vals.append(int(plan_progress))
+        if active_duration_s is not None:
+            sets.append("active_duration_s=?")
+            vals.append(float(active_duration_s))
+        if stop_cause is not None:
+            sets.append("stop_cause=?")
+            vals.append(str(stop_cause))
+        if failure_cause is not None:
+            sets.append("failure_cause=?")
+            vals.append(str(failure_cause))
+        if last_outcome is not None:
+            sets.append("last_outcome=?")
+            vals.append(str(last_outcome))
+        vals.append(task_id)
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
+                if cur.rowcount == 0:
+                    raise KeyError(f"task not found: {task_id}")
+                conn.commit()
+            finally:
+                conn.close()
+
     def set_task_plan_if_absent(self, task_id: str, plan_json: str) -> bool:
         """Persist the immutable Plan exactly once. Returns True if stored."""
         now = _now_iso()
@@ -308,16 +396,51 @@ class MemoryStore:
                 conn.close()
 
     def lease_acquire(self, task_id: str, pid: int) -> None:
+        """Atomic singleton claim: exactly one active Session per data directory.
+
+        The check-and-insert runs inside one ``BEGIN IMMEDIATE`` write
+        transaction so two concurrent ``Start`` commands cannot both succeed:
+        the loser observes the winner's row and gets :class:`LeaseBusyError`.
+        ANY existing lease row blocks a new claim — even for the same
+        ``task_id`` — because one ``task_id`` is not proof of call ownership:
+        two concurrent ``Start`` commands for the same Task must not both
+        dispatch its Actions. The caller recovers stale (dead-PID) leases
+        via ``_recover_stale_lease`` before acquiring, and retries once when
+        a dead lease lands concurrently.
+        """
         now = _now_iso()
         with self._lock:
             conn = self._connect()
             try:
-                conn.execute("DELETE FROM active_session")
-                conn.execute(
-                    "INSERT INTO active_session(task_id, pid, acquired_at) VALUES(?,?,?)",
-                    (task_id, int(pid), now),
-                )
-                conn.commit()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except Exception as e:
+                    # Another writer holds the DB lock — treat as busy, not corrupt.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise LeaseBusyError(f"another session is active ({e})") from e
+                try:
+                    cur = conn.execute("SELECT task_id FROM active_session LIMIT 1")
+                    row = cur.fetchone()
+                    if row is not None:
+                        conn.execute("ROLLBACK")
+                        raise LeaseBusyError(f"another session is active (task_id={row['task_id']})")
+                    conn.execute("DELETE FROM active_session")
+                    conn.execute(
+                        "INSERT INTO active_session(task_id, pid, acquired_at) VALUES(?,?,?)",
+                        (task_id, int(pid), now),
+                    )
+                    conn.commit()
+                except LeaseBusyError:
+                    raise
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
             finally:
                 conn.close()
 
@@ -379,14 +502,19 @@ class MemoryStore:
         verdict: str,
         status: str,
         error: str | None = None,
+        *,
+        slot_index: int | None = None,
     ) -> None:
+        """Persist one Action attempt. ``slot_index`` is the plan slot it
+        fills; confirmation-aware resume re-runs slots without a
+        completed/skipped/blocked row and never repeats confirmed ones."""
         now = _now_iso()
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT INTO actions(id, task_id, kind, target_url, verdict, status, error, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (action_id, task_id, kind, target_url, verdict, status, error, now),
+                    "INSERT INTO actions(id, task_id, kind, target_url, verdict, status, error, created_at, slot_index) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (action_id, task_id, kind, target_url, verdict, status, error, now, slot_index),
                 )
                 conn.commit()
             finally:
