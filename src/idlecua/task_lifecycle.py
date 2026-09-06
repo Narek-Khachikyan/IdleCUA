@@ -97,7 +97,7 @@ class TaskSnapshot:
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "stopped"})
-STARTABLE_STATES = frozenset({"waiting_for_idle", "paused_by_user"})
+STARTABLE_STATES = frozenset({"waiting_for_idle", "paused_by_user", "paused_for_approval"})
 CANCELLABLE_STATES = frozenset({"waiting_for_idle", "paused_by_user", "paused_for_approval"})
 
 
@@ -458,11 +458,14 @@ class TaskLifecycle:
         except Exception:
             return int(getattr(self.config, "idle_threshold_seconds", 600))
 
-    def _readiness(self) -> dict:
+    def _readiness(self, threshold_override: int | None = None) -> dict:
         """One decision path for explicit and idle-triggered Start.
 
         Owned here so every caller (CLI, HTTP API, Watch loop) shares one
         verdict. Scheduler only polls the HID primitive; it never decides.
+        A threshold override only changes the value used inside this path.
+        Structured gate reasons are safe static text: raw dependency
+        errors stay in diagnostic history, never in transport messages.
         """
         from .profile.store import load_profile as _lp
         from .profile.validate import validate_profile
@@ -472,6 +475,11 @@ class TaskLifecycle:
             threshold = self._effective_threshold(profile)
         except Exception:
             threshold = int(getattr(self.config, "idle_threshold_seconds", 600))
+        if threshold_override is not None:
+            try:
+                threshold = int(threshold_override)
+            except Exception:
+                pass
         ppath = Path(self.config.data_dir) / "profile.json"
         try:
             _p = _lp(ppath)
@@ -485,8 +493,8 @@ class TaskLifecycle:
                     profile_gate = {"ok": False, "reason": f"Profile at {ppath} is confirmed but invalid: {'; '.join(_errs)}. Run `idle-cua profile validate`.", "gate": "profile"}
                 else:
                     profile_gate = {"ok": True, "reason": "Profile is confirmed and valid.", "gate": "profile"}
-        except Exception as e:
-            profile_gate = {"ok": False, "reason": str(e), "gate": "profile"}
+        except Exception:
+            profile_gate = {"ok": False, "reason": "profile check failed", "gate": "profile"}
         try:
             if profile is None:
                 schedule_gate = {"ok": True, "reason": "No profile — allowed hours default 24/7", "gate": "schedule"}
@@ -501,16 +509,16 @@ class TaskLifecycle:
                     schedule_gate = {"ok": True, "reason": f"Schedule allows {allowed} (now {now})", "gate": "schedule"}
                 else:
                     schedule_gate = {"ok": False, "reason": f"Schedule blocks execution: allowed_hours {allowed} (now {now})", "gate": "schedule"}
-        except Exception as e:
-            schedule_gate = {"ok": True, "reason": f"schedule check skipped: {e}", "gate": "schedule"}
+        except Exception:
+            schedule_gate = {"ok": True, "reason": "schedule check skipped", "gate": "schedule"}
         try:
             if bool(self.idle_detector.is_screen_locked()):
                 idle_gate = {"ok": False, "reason": "Screen is locked — agent will not run until unlocked", "gate": "screen"}
             else:
                 ok_i, reason_i = self.idle_detector.can_run(int(threshold))
                 idle_gate = {"ok": bool(ok_i), "reason": str(reason_i), "gate": "idle"}
-        except Exception as e:
-            idle_gate = {"ok": False, "reason": f"idle check failed: {e}", "gate": "idle"}
+        except Exception:
+            idle_gate = {"ok": False, "reason": "idle check failed", "gate": "idle"}
         if not bool(getattr(self.config, "require_idle", True)):
             idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
         try:
@@ -664,7 +672,7 @@ class TaskLifecycle:
             return LifecycleOutcome(OutcomeCategory.already_active, task_id, state, "session already active", False)
         if state == "paused_for_approval" and cmd.mode == "unattended":
             return LifecycleOutcome(OutcomeCategory.invalid_transition, task_id, state, "approval-paused task requires interactive start", False)
-        if state not in STARTABLE_STATES and not (state == "paused_for_approval" and cmd.mode == "interactive"):
+        if state not in STARTABLE_STATES:
             return LifecycleOutcome(OutcomeCategory.invalid_transition, task_id, state, f"task cannot start from state={state}", False)
 
         # Active-Session concurrency: one live lease blocks regardless of elapsed time.
@@ -769,7 +777,9 @@ class TaskLifecycle:
         if is_resume:
             raw = row.get("plan_json")
             if not raw:
-                return self._fail_task(task_id, "failed", "interrupted_unknown", "resume without persisted plan", {})
+                self._fail_task(task_id, "failed", "interrupted_unknown", "resume without persisted plan", {})
+                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": "resume without persisted plan"}], [], profile)
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "resume without persisted plan", False)
             try:
                 pj = json.loads(raw)
                 plan = Plan(
@@ -782,8 +792,10 @@ class TaskLifecycle:
                     risk_level=_RL(pj.get("risk_level", "low")),
                     requires_confirmation=bool(pj.get("requires_confirmation", False)),
                 )
-            except Exception as e:
-                return self._fail_task(task_id, "failed", "interrupted_unknown", f"resume plan unreadable: {e}", {})
+            except Exception:
+                self._fail_task(task_id, "failed", "interrupted_unknown", "resume plan unreadable", {})
+                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": "resume plan unreadable"}], [], profile)
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "resume plan unreadable", False)
             # Resume passes the same gates (already checked) and continues after last confirmed Action.
             try:
                 self.memory.update_task_state(task_id, "running")
@@ -807,21 +819,25 @@ class TaskLifecycle:
                     except PlanRejectedError as pe:
                         plan_error = f"plan rejected (LLM output not convertible to typed actions, never executed as free text): {pe}"
                         plan = None
-                    except Exception as e:
-                        plan_error = f"planner error: {e}"
+                    except Exception:
+                        plan_error = "planner error: planning failed"
                         plan = None
                 else:
                     try:
                         plan = planner.plan(row.get("description", ""), profile=profile, history=history)  # type: ignore[call-arg]
                     except TypeError:
                         plan = planner.plan(row.get("description", ""))
-            except Exception as e:
-                plan_error = plan_error or str(e)
+            except Exception:
+                plan_error = plan_error or "planning failed"
                 plan = None
             if plan is None:
-                self._fail_task(task_id, "failed", "planning_failed", plan_error or "planning failed", {})
-                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": plan_error or "planning failed"}], [], profile)
-                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", plan_error or "planning failed", False)
+                detail = plan_error or "planning failed"
+                # Safe structured outcome: never leak raw provider output in the
+                # transport message; full detail stays in failure_cause/report.
+                safe = "plan rejected: LLM output not convertible to typed actions" if detail.startswith("plan rejected") else "planning failed"
+                self._fail_task(task_id, "failed", "planning_failed", detail, {})
+                self._write_report_best_effort(task_id, row.get("description", ""), None, [], [], [], [{"message": detail}], [], profile)
+                return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", safe, False)
             # Tighten caps from profile when stricter.
             try:
                 if profile is not None:
@@ -837,13 +853,23 @@ class TaskLifecycle:
             except Exception:
                 pass
             # Anti-repeat: identical plan within 7 days never re-executes.
+            # Report-before-completion (US33): the Report is persisted before
+            # the Task becomes completed; a report failure fails the Task.
             try:
                 fp = plan_fingerprint(plan)
                 if self.memory.has_plan_fingerprint_within_days(fp, days=7):
-                    self.memory.update_task_state(task_id, "completed")
-                    self.memory.update_task_checkpoint(task_id, last_outcome="skipped_repeat_plan")
-                    self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat plan {fp}")
                     md = self._write_report_best_effort(task_id, row.get("description", ""), plan, [], [], [], [{"message": f"skipped repeat plan {fp}"}], [{"type": "plan", "value": fp, "reason": "plan identical to recent session within 7 days — skipped repeat"}], profile)
+                    if md is None:
+                        # _cumulative_s is defined below; here only the stored
+                        # base has elapsed (planning just finished).
+                        self._fail_task(task_id, "failed", "report_failed", "report persistence failed", {"active_duration_s": float(cumulative_base), "plan_progress": progress})
+                        return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "failed", "report persistence failed; confirmed progress retained", False)
+                    try:
+                        self.memory.update_task_state(task_id, "completed")
+                        self.memory.update_task_checkpoint(task_id, last_outcome="skipped_repeat_plan")
+                        self.memory.record_error(str(uuid.uuid4()), task_id, f"skipped repeat plan {fp}")
+                    except Exception:
+                        return LifecycleOutcome(OutcomeCategory.execution_failed, task_id, "running", "completion persistence failed", True)
                     return LifecycleOutcome(OutcomeCategory.ok, task_id, "completed", f"skipped repeat plan {fp}", False)
             except Exception:
                 pass

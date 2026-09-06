@@ -221,7 +221,7 @@ class IdleCua:
         else:
             self._lifecycle.config = self.config
             try:
-                self._lifecycle._memory = self.memory
+                self._lifecycle.memory = self.memory
             except Exception:
                 pass
             self._lifecycle.driver = self.computer
@@ -414,25 +414,11 @@ class IdleCua:
         """One readiness path owned by the lifecycle seam (ADR-0006).
 
         Shape-preserving delegate: CLI/HTTP texts stay byte-identical.
+        The override only changes the threshold value used inside the one
+        lifecycle gate path; it never re-evaluates the gate elsewhere.
         """
-        r = self.lifecycle._readiness()
-        effective = int(threshold_override) if threshold_override is not None else int(r.get("threshold", 600))
-        # Re-evaluate idle text with override when provided (same gate, same path).
-        if threshold_override is not None:
-            try:
-                ig = self.get_scheduler().check_idle_gate(effective)
-                idle_gate = {"ok": bool(ig.ok), "reason": str(ig.reason), "gate": str(ig.gate)}
-                if not bool(getattr(self.config, "require_idle", True)):
-                    idle_gate = {"ok": True, "reason": "idle gate disabled (require_idle=False)", "gate": "idle"}
-                r = dict(r)
-                r["idle"] = idle_gate
-                r["threshold"] = effective
-                if not idle_gate["ok"]:
-                    r["can_start"] = False
-                    r["reason"] = f"idle gate blocked: {idle_gate['reason']}" if idle_gate["gate"] == "idle" else f"screen locked — {idle_gate['reason']}"
-                    r["failed_gate"] = idle_gate["gate"]
-            except Exception:
-                pass
+        r = self.lifecycle._readiness(threshold_override=threshold_override)
+        effective = int(r.get("threshold", 600))
         return {
             "effective_threshold": effective,
             "profile": r.get("profile", {}),

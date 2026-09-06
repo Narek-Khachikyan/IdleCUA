@@ -8,17 +8,7 @@ decisions stay in TaskLifecycle.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any, Callable
-
-
-@dataclass(frozen=True)
-class ActionOutcome:
-    kind: str
-    status: str  # completed | failed | skipped | blocked | outcome_unknown
-    error: str | None = None
-    target_url: str | None = None
-    verdict: str = "allowed"
 
 
 def dispatch_one(
