@@ -110,9 +110,8 @@ def test_user_return_direct_detector():
     det.hardware_input()
     assert det.seconds_since_last_input() == 0
     assert det.can_run(600)[0] is False
-    from idlecua.executor import TaskExecutor
-    from idlecua.policy import PolicyEngine
-
+    # Owner-return detection now lives behind the lifecycle seam: the same
+    # hardware signal pauses a running Session (covered end-to-end above).
     td = Path(tempfile.mkdtemp())
     import io
     from rich.console import Console
@@ -126,17 +125,13 @@ def test_user_return_direct_detector():
     prof, _, _ = run_interview(console=_c, input_func=_inp, confirm_func=_conf)
     save_confirmed_profile(prof, td + "/profile.json" if isinstance(td, str) else Path(td) / "profile.json", console=Console(file=io.StringIO()))
     cfg = IdleCuaConfig(data_dir=td)
-    executor = TaskExecutor(
-        config=cfg,
-        driver=FakeComputerDriver(),
-        model_provider=FakeModelProvider(),
-        memory=__import__("idlecua.memory", fromlist=["MemoryStore"]).MemoryStore(td),
-        policy=PolicyEngine(cfg),
-        idle_detector=det,
-    )
-    assert executor._check_user_return() is True
+    app = IdleCua(config=cfg, computer=FakeComputerDriver(), idle_detector=det)
+    # While hardware input is fresh (idle 0s), readiness refuses to start.
+    ok, reason = app.can_start()
+    assert not ok and "idle" in reason.lower()
     det.set_idle(1000)
-    assert executor._check_user_return() is False
+    ok2, _ = app.can_start()
+    assert ok2
 
 
 # 2. Emergency stop — LLM-independent
@@ -328,7 +323,7 @@ def test_e2e_create_task_run_task_programmatic(tmp_path: Path):
     # No CLI, direct API
     task = app.create_task("research recent AI papers on agents via e2e")
     assert task.description == "research recent AI papers on agents via e2e"
-    assert task.state == AgentState.disabled
+    assert task.state == AgentState.waiting_for_idle
     plan = app.dry_run(task.description)
     assert len(driver.calls) == 0, "dry_run must not touch driver"
     result = app.run_task(task, is_interactive=False)

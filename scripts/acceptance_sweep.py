@@ -334,25 +334,42 @@ def check_9_stop_on_return(tmp_base: Path) -> str:
         det = FakeIdleDetector(idle_seconds=1000, locked=False)
         driver = FakeComputerDriver()
         app = IdleCua(config=IdleCuaConfig(data_dir=td), computer=driver, idle_detector=det)
-        # Simulate user return detection via pause_task / executor check
+        # Simulate user return detection via the lifecycle seam
         task = app.create_task("research X")
         # Run a task, then immediately trigger hardware_input before next action
-        # For this check we just verify pause_task transitions to paused_by_user
-        import asyncio
+        # For this check we just verify a run pauses to paused_by_user on hardware return
 
         result = app.run_task(task, is_interactive=False)
-        # result may be completed; now test pause path separately
-        t2 = app.create_task("research Y")
-        # Manually transition to running then pause
-        from idlecua.models.state import AgentState
+        # result may be completed; now test pause path separately.
+        # Pause happens inside a run on hardware return — observe via the read seam.
+        from idlecua.idle import FakeIdleDetector as _FD
 
-        t2.transition_to(AgentState.waiting_for_idle)
-        t2.transition_to(AgentState.planning)
-        t2.transition_to(AgentState.running)
-        app.memory.upsert_task(t2.id, t2.description, t2.state.value, None)
-        paused = asyncio.run(app.pause_task(t2.id))
+        class _Flip(_FD):
+            def __init__(self):
+                super().__init__(idle_seconds=1000, locked=False)
+                self.n = 0
+
+            def seconds_since_last_input(self):
+                self.n += 1
+                return 1000.0 if self.n <= 3 else 0.0
+
+            def can_run(self, thr=600):
+                return (True, "idle") if self.n <= 3 else (False, "user returned")
+
+            def is_screen_locked(self):
+                return False
+
+        t2 = app.create_task("research Y")
+        app.idle_detector = _Flip()
+        from idlecua.models.state import AgentState as _AS
+
+        res2 = app.run_task(t2, is_interactive=False)
+        assert res2.state == _AS.paused_by_user
+        from idlecua.task_lifecycle import GetTask as _GetTask
+
+        paused = app.lifecycle.inspect(_GetTask(t2.id))
         assert paused is not None
-        assert paused.state == AgentState.paused_by_user
+        assert paused.state == _AS.paused_by_user.value
         # Check that resume refuses while locked/not idle
         det.set_locked(True)
         ok, _ = det.can_run(600)
@@ -480,7 +497,6 @@ def check_14_public_api(tmp_base: Path) -> str:
     import tempfile
     from idlecua import IdleCua, IdleCuaConfig
     from idlecua.contracts import FakeComputerDriver, FakeModelProvider
-    import asyncio
 
     with tempfile.TemporaryDirectory() as td2:
         td = Path(td2)
@@ -497,17 +513,13 @@ def check_14_public_api(tmp_base: Path) -> str:
         assert "agent_state" in st
         hist = app.get_history(limit=5)
         assert "queries" in hist
-        # async pause
+        # lifecycle read seam observation (pause happens on hardware return during a run)
         t2 = app.create_task("research Y")
-        from idlecua.models.state import AgentState
+        from idlecua.task_lifecycle import GetTask as _GetTask2
 
-        t2.transition_to(AgentState.waiting_for_idle)
-        t2.transition_to(AgentState.planning)
-        t2.transition_to(AgentState.running)
-        app.memory.upsert_task(t2.id, t2.description, t2.state.value, None)
-        paused = asyncio.run(app.pause_task(t2.id))
-        assert paused is not None
-        return "IdleCua/IdleCuaConfig + create_task/dry_run/run_task/pause_task/get_status/get_history/get_report all via Fake* contracts, no CLI required"
+        snap = app.lifecycle.inspect(_GetTask2(t2.id))
+        assert snap is not None
+        return "IdleCua/IdleCuaConfig + create_task/dry_run/run_task/get_status/get_history/get_report all via Fake* contracts, no CLI required"
 
 
 def check_15_writeblock() -> str:
@@ -609,7 +621,7 @@ def main():
     def _c9():
         return check_9_stop_on_return(tmp_base)
 
-    checks.append(_run_one("9. Stop on user return — halt input, paused_by_user, auto-resume next idle", _c9, 9, "FakeIdleDetector hardware_input + pause_task"))
+    checks.append(_run_one("9. Stop on user return — halt input, paused_by_user, auto-resume next idle", _c9, 9, "FakeIdleDetector hardware_input + lifecycle read seam"))
 
     def _c10():
         return check_10_emergency_stop()

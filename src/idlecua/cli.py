@@ -789,21 +789,9 @@ def kill(
     _resolved = _resolve_data_dir(data_dir)
     config = IdleCuaConfig(data_dir=_resolved)
     idle = IdleCua(config=config)
+    # Routed through the lifecycle owner (idempotent; distinct stop cause).
     idle.request_emergency_stop(reason or "CLI kill")
     console.print(f"[red]Emergency stop requested:[/red] {reason}")
-    # Also try to mark active task as stopped
-    st = idle.get_status()
-    active = st.get("active_task")
-    if active:
-        tid = active.get("id")
-        # Directly update state to stopped via memory (emergency path)
-        try:
-            idle.memory.update_task_state(tid, "stopped")
-            idle.memory.record_error(__import__("uuid").uuid4().hex, tid, f"emergency stop: {reason}")
-            idle.memory.kv_set("last_stop_reason", reason or "CLI kill")
-        except Exception:
-            pass
-        console.print(f"[dim]Task {tid[:8]} marked stopped[/dim]")
     console.print("[green]Input released, agent processes terminated (if any). Reason saved.[/green]")
 
 
@@ -953,10 +941,26 @@ def start(
         console.print(f"[bold]Idle watch:[/bold] waiting for idle ≥ {thr}s (poll {poll_interval}s) — synthetic never masks HID — Ctrl-C to stop")
         console.print(f"Task: {effective_task}")
         console.print(f"Screen locked check: hard gate — agent will not run while locked")
-        # Build scheduler wired to this app's memory/detector/config
+        # Enqueue once up front; every idle window submits a Start and the
+        # lifecycle owner resumes the oldest paused task before queued ones.
+        try:
+            idle.create_task(effective_task)
+        except Exception as e:
+            console.print(f"[red]Enqueue failed: {e}[/red]")
+            raise typer.Exit(1)
+        # An explicit Watch-loop start clears a latched Emergency stop.
+        try:
+            idle.clear_emergency_stop()
+        except Exception:
+            pass
+        # Build scheduler wired to this app's detector/config (polling only —
+        # selection, gating, and execution live behind the lifecycle seam).
         from .scheduler import IdleScheduler
 
         scheduler = IdleScheduler(config=config, idle_detector=idle.idle_detector, memory=idle.memory)
+
+        def _fire_start():
+            return idle.start_task_lifecycle(task_id=None, trigger="idle", mode="unattended")
 
         def _on_event(kind: str, payload) -> None:
             if kind == "waiting_for_idle":
@@ -967,23 +971,30 @@ def start(
                 if payload["tick"] % max(1, int(5 / max(0.5, poll_interval))) == 0:
                     console.print(f"[dim]idle poll {payload['tick']}: {gate.reason} ({gate.gate})[/dim]")
             elif kind == "idle_detected":
-                console.print("[green]Idle detected — all gates pass — starting session (plan → policy → driver → history → report)[/green]")
+                console.print("[green]Idle detected — submitting idle-triggered Start (plan → policy → driver → history → report)[/green]")
             elif kind == "schedule_blocked":
                 console.print(f"[yellow]Schedule blocked: {payload}[/yellow]")
             elif kind == "limits_reached":
                 console.print(f"[yellow]Limits reached: {payload} — stopping watch[/yellow]")
             elif kind == "session_completed":
-                r = payload
-                state = r.state.value if hasattr(r.state, "value") else str(r.state)
-                console.print(f"[green]Session completed:[/green] {state} — actions {r.actions_executed} — report {r.report_path}")
-                if r.skipped_repeats:
-                    console.print(f"[dim]Skipped repeats: {len(r.skipped_repeats)}[/dim]")
-                if r.report_markdown and not json_output:
+                o = payload
+                state = str(getattr(o, "state", "?"))
+                tid = getattr(o, "task_id", "") or ""
+                try:
+                    view = idle.get_task_result(tid) if tid else {}
+                except Exception:
+                    view = {}
+                console.print(f"[green]Session completed:[/green] {state} — actions {view.get('actions_executed', '?')} — report {view.get('report_path')}")
+                if view.get("errors"):
+                    console.print(f"[dim]Errors: {len(view['errors'])} (see report)[/dim]")
+                if not json_output and tid:
                     try:
-                        # Daily report preview
-                        console.print(Markdown(r.report_markdown[:3000]))
+                        rep = idle.get_report(tid)
+                        md = (rep.get("markdown", "") if rep else "")[:3000]
+                        if md:
+                            console.print(Markdown(md))
                     except Exception:
-                        console.print(r.report_markdown[:1500])
+                        pass
             elif kind == "paused_by_user":
                 console.print("[yellow]Paused by user (hardware return) — input halted, task paused_by_user, will auto-resume at next idle[/yellow]")
             elif kind == "session_error":
@@ -999,7 +1010,7 @@ def start(
         effective_once = once or (not watch and effective_task is not None)
         try:
             results = scheduler.run_loop(
-                effective_task,
+                start_fn=_fire_start,
                 poll_interval=poll_interval,
                 idle_threshold_override=thr,
                 max_sessions=1 if effective_once else None,
@@ -1030,12 +1041,22 @@ def start(
         # Emit JSON if requested
         if json_output and results:
             last = results[-1]
+            last_tid = getattr(last, "task_id", "") or ""
+            try:
+                last_view = idle.get_task_result(last_tid) if last_tid else {}
+            except Exception:
+                last_view = {}
+            try:
+                rep = idle.get_report(last_tid) if last_tid else None
+                last_md = (rep.get("markdown", "") if rep else "")[:8000]
+            except Exception:
+                last_md = ""
             payload = {
                 "sessions": len(results),
-                "last_task_id": last.task_id,
-                "last_state": last.state.value if hasattr(last.state, "value") else str(last.state),
-                "last_report": str(last.report_path) if last.report_path else None,
-                "last_report_markdown": last.report_markdown[:8000],
+                "last_task_id": last_tid,
+                "last_state": str(getattr(last, "state", "?")),
+                "last_report": last_view.get("report_path"),
+                "last_report_markdown": last_md,
             }
             console.print_json(json.dumps(payload))
         return
@@ -1083,61 +1104,6 @@ def start(
     else:
         console.print("[dim]Idle watch would run here in Watch loop mode (MVP: use `idle-cua start --watch \"task\"` or `idle-cua run-once`).[/dim]")
 
-
-@app.command()
-def pause(
-    data_dir: Annotated[
-        Optional[str],
-        typer.Option("--data-dir", help="Data directory"),
-    ] = None,
-) -> None:
-    """Pause active task (user-return simulation)."""
-    _resolved = _resolve_data_dir(data_dir)
-    config = IdleCuaConfig(data_dir=_resolved)
-    idle = IdleCua(config=config)
-    st = idle.get_status()
-    active = st.get("active_task")
-    if not active:
-        console.print("[yellow]No active task to pause[/yellow]")
-        raise typer.Exit(1)
-    tid = active["id"]
-    # Simulate user return: release input and transition to paused_by_user
-    try:
-        if hasattr(idle.computer, "release_all_inputs"):
-            idle.computer.release_all_inputs()
-    except Exception:
-        pass
-    idle.memory.update_task_state(tid, "paused_by_user")
-    idle.memory.record_error(__import__("uuid").uuid4().hex, tid, "paused_by_user: manual pause")
-    console.print(f"[yellow]Task {tid[:8]} paused (paused_by_user)[/yellow]")
-
-
-@app.command()
-def resume(
-    data_dir: Annotated[
-        Optional[str],
-        typer.Option("--data-dir", help="Data directory"),
-    ] = None,
-) -> None:
-    """Resume paused task at next idle period."""
-    _resolved = _resolve_data_dir(data_dir)
-    config = IdleCuaConfig(data_dir=_resolved)
-    idle = IdleCua(config=config)
-    st = idle.get_status()
-    active = st.get("active_task")
-    if not active:
-        console.print("[yellow]No task to resume[/yellow]")
-        raise typer.Exit(1)
-    if active.get("state") != "paused_by_user":
-        console.print(f"[yellow]Task {active.get('id','')[:8]} is not paused (state={active.get('state')})[/yellow]")
-        raise typer.Exit(1)
-    # Check readiness via the Application API (T1: decision inside, CLI only renders).
-    ok, reason = idle.can_start()
-    if not ok:
-        console.print(f"[yellow]Cannot resume yet: {reason}[/yellow]")
-        raise typer.Exit(1)
-    idle.memory.update_task_state(active["id"], "waiting_for_idle")
-    console.print(f"[green]Task {active['id'][:8]} resumed → waiting_for_idle[/green]")
 
 @app.command()
 def serve(

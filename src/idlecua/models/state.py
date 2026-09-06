@@ -14,7 +14,9 @@ class AgentState(str, Enum):
     stopped = "stopped"
 
 # Validated transition table — plain model, no library.
-# See CONTEXT.md and ADR-0001 for state semantics.
+# See CONTEXT.md and ADR-0006 for state semantics.
+# ADR-0006: terminal states are terminal (no reactivation); `disabled`
+# describes the Agent, not an individual Task.
 _VALID_TRANSITIONS: dict[AgentState, set[AgentState]] = {
     AgentState.disabled: {
         AgentState.waiting_for_idle,
@@ -22,14 +24,13 @@ _VALID_TRANSITIONS: dict[AgentState, set[AgentState]] = {
     },
     AgentState.waiting_for_idle: {
         AgentState.planning,
-        AgentState.disabled,
+        AgentState.running,
         AgentState.stopped,
     },
     AgentState.planning: {
         AgentState.running,
         AgentState.failed,
         AgentState.stopped,
-        AgentState.disabled,
     },
     AgentState.running: {
         AgentState.completed,
@@ -39,27 +40,17 @@ _VALID_TRANSITIONS: dict[AgentState, set[AgentState]] = {
         AgentState.stopped,
     },
     AgentState.paused_by_user: {
-        AgentState.waiting_for_idle,
+        AgentState.running,
+        AgentState.planning,
         AgentState.stopped,
-        AgentState.disabled,
     },
     AgentState.paused_for_approval: {
         AgentState.running,
         AgentState.stopped,
-        AgentState.disabled,
     },
-    AgentState.completed: {
-        AgentState.disabled,
-        AgentState.waiting_for_idle,
-    },
-    AgentState.failed: {
-        AgentState.disabled,
-        AgentState.waiting_for_idle,
-    },
-    AgentState.stopped: {
-        AgentState.disabled,
-        AgentState.waiting_for_idle,
-    },
+    AgentState.completed: set(),
+    AgentState.failed: set(),
+    AgentState.stopped: set(),
 }
 
 def is_valid_transition(from_state: AgentState, to_state: AgentState) -> bool:

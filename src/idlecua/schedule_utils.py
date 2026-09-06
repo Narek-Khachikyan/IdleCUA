@@ -1,6 +1,6 @@
 """Shared schedule helper — single source for allowed_hours parsing.
 
-Used by IdleScheduler and TaskExecutor to avoid duplicated HH:MM parsing.
+Used by TaskLifecycle and IdleScheduler to avoid duplicated HH:MM parsing.
 """
 from __future__ import annotations
 

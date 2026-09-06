@@ -1,46 +1,98 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Diagnostics — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="p-8 max-w-3xl mx-auto">
-<h1 class="text-2xl font-semibold">Diagnostics</h1>
-<p class="text-sm text-zinc-500">macOS permissions, driver probe, profile validity, secrets scan, scheduler lock — troubleshooting without CLI</p>
-<div class="mt-6 space-y-4">
-  <div class="border rounded-xl p-4">
-    <h2 class="font-semibold">macOS Permissions</h2>
-    <ul class="text-sm mt-2">
+{% extends "layout.html" %}
+{% set title = "Diagnostics" %}
+{% block content %}
+<div class="flex flex-wrap items-center gap-3">
+  <p class="text-sm text-zinc-500 mt-1">Permissions, driver, profile and scheduler — no terminal needed.</p>
+  <span class="ml-auto inline-flex items-center gap-1.5 text-xs font-medium bg-white border border-zinc-200 px-3 py-1.5 rounded-full" title="Checked {{ checked_at|fmt_dt }}">{{ diag_summary }}</span>
+</div>
+<div class="mt-5 space-y-4">
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold">macOS permissions</h2>
+    <ul class="mt-3 space-y-2.5 text-sm">
       {% for p in perms %}
-      <li>{{ p.name }} — {{ p.granted }} — {{ p.remediation }}</li>
+      <li class="flex items-start gap-2.5">
+        {% if p.granted is true %}
+        <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold">✓</span>
+        <span><span class="font-medium">{{ p.name }}</span> <span class="text-zinc-500">— granted</span></span>
+        {% elif p.granted is false %}
+        <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-red-100 text-red-800 text-xs font-bold">✗</span>
+        <span><span class="font-medium">{{ p.name }}</span> <span class="text-zinc-500">— not granted.</span><br><span class="text-zinc-600">{{ p.remediation }}</span></span>
+        {% else %}
+        <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-amber-100 text-amber-800 text-xs font-bold">?</span>
+        <span><span class="font-medium">{{ p.name }}</span> <span class="text-zinc-500">— could not check.</span><br><span class="text-zinc-600">{{ p.remediation }}</span></span>
+        {% endif %}
+      </li>
       {% endfor %}
     </ul>
   </div>
-  <div class="border rounded-xl p-4">
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
     <h2 class="font-semibold">Driver probe</h2>
-    {% if driver_ok %}
-    <div class="text-sm">Ready — {{ driver_message }}</div>
-    {% else %}
-    <div class="text-sm">Not ready — {{ driver_message }}</div>
-    {% endif %}
+    <div class="mt-2 text-sm flex items-start gap-2.5">
+      {% if driver_ok %}
+      <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold">✓</span>
+      <span class="text-zinc-600">cua-driver {{ driver_version or 'installed' }} · Accessibility {{ 'on' if driver_accessibility else 'off' if driver_accessibility is false else 'unknown' }} · Screen Recording {{ 'on' if driver_screen_recording else 'off' if driver_screen_recording is false else 'unknown' }} &middot; {{ driver_message }}</span>
+      {% else %}
+      <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-amber-100 text-amber-800 text-xs font-bold">⚠</span>
+      <span class="text-zinc-600">{{ driver_message }}</span>
+      {% endif %}
+    </div>
   </div>
-  <div class="border rounded-xl p-4">
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
     <h2 class="font-semibold">Profile</h2>
-    <div class="text-sm">Valid: {{ profile_valid }} — errors: {{ profile_errors | join(', ') }}</div>
+    <div class="mt-2 text-sm flex items-start gap-2.5">
+      {% if profile_valid %}
+      <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold">✓</span>
+      <span class="text-zinc-600">Confirmed and valid — the agent may run.</span>
+      {% else %}
+      <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full bg-red-100 text-red-800 text-xs font-bold">✗</span>
+      <span>
+        <span class="text-zinc-600">Needs attention:</span>
+        <ul class="list-disc ml-5 mt-1 text-zinc-700">
+          {% for e in profile_errors %}<li>{{ e }}</li>{% else %}<li>Profile is missing or unconfirmed — <a href="/settings" class="underline">open Settings</a>.</li>{% endfor %}
+        </ul>
+      </span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="bg-white border border-zinc-200 rounded-2xl p-4 sm:p-5">
+    <div class="flex flex-wrap items-center gap-3">
+      <h2 class="font-semibold">Idle watching</h2>
+      {% if not watch_loop.running %}
+      <button onclick="schedulerStart(this)" class="ml-auto text-xs bg-zinc-900 text-white px-3 py-1.5 rounded-full font-medium">Start</button>
+      {% endif %}
+    </div>
+    <div class="mt-2 text-sm flex items-start gap-2.5">
+      <span class="mt-0.5 w-5 h-5 shrink-0 grid place-items-center rounded-full {{ 'bg-emerald-100 text-emerald-800' if watch_loop.running else 'bg-zinc-200 text-zinc-600' }} text-xs font-bold">{{ '●' if watch_loop.running else '○' }}</span>
+      <span class="text-zinc-600">
+        {{ 'On' if watch_loop.running else 'Off' }} — queued tasks start after {{ effective_idle_threshold|fmt_dur }} idle.
+        {% if lock %}<br><span class="text-xs text-zinc-400">Server process {{ lock.pid }}{% if lock.started_at %}, started {{ lock.started_at|fmt_dt }}{% endif %}</span>{% endif %}
+      </span>
+    </div>
   </div>
   <div class="border rounded-xl p-4">
     <h2 class="font-semibold">Secrets scan</h2>
     {% if secrets_ok %}
-    <div class="text-sm">Secrets scan PASSED — no secrets found.</div>
+    <div class="text-sm">Secrets scan PASSED &mdash; no secrets found.</div>
     {% else %}
-    <div class="text-sm">Secrets scan FAILED — check these files (patterns only, values never shown):</div>
+    <div class="text-sm">Secrets scan FAILED &mdash; check these files (patterns only, values never shown):</div>
     <ul class="text-sm mt-2">
       {% for f in secrets_findings %}
-      <li>{{ f.source }} — looks like {{ f.pattern }}</li>
+      <li>{{ f.source }} &mdash; looks like {{ f.pattern }}</li>
       {% endfor %}
     </ul>
     {% endif %}
   </div>
-  <div class="border rounded-xl p-4">
-    <h2 class="font-semibold">Scheduler lock</h2>
-    <div class="text-sm">Locked: {{ lock.pid if lock else 'not locked' }} — watch_loop running: {{ watch_loop.running }}</div>
+  {% if not secrets_ok %}
+  <div class="bg-amber-50 border border-amber-200 rounded-2xl p-4 sm:p-5">
+    <h2 class="font-semibold text-amber-900">⚠ Possible secrets in local files</h2>
+    <ul class="mt-2 text-sm text-amber-900 list-disc ml-5">
+      {% for f in secrets_findings %}<li><span class="mono text-[13px]">{{ f.source }}</span> — looks like {{ f.pattern|replace('_',' ') }}</li>{% endfor %}
+    </ul>
+    <details class="mt-2 text-sm text-amber-800">
+      <summary class="cursor-pointer underline">What should I do?</summary>
+      <p class="mt-1">Test files often match by accident — open the file and check before deleting anything. If it is a real key, revoke it where it was issued, delete it from the file, and store it in the system keychain via Settings → Provider instead. Then run <span class="mono text-[13px]">idle-cua secrets-scan</span> to re-check.</p>
+    </details>
   </div>
+  {% endif %}
 </div>
-<a href="/" class="underline text-blue-600 mt-6 inline-block">← Dashboard</a>
-</body></html>
+{% endblock %}

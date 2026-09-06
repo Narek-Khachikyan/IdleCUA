@@ -10,7 +10,7 @@ from .state import AgentState, validate_transition
 class Task:
     description: str
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    state: AgentState = AgentState.disabled
+    state: AgentState = AgentState.waiting_for_idle
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:

@@ -1,10 +1,26 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Report {{ task_id }} — IdleCUA</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="p-8 max-w-3xl mx-auto">
-<h1 class="text-2xl font-semibold">Report — {{ task_id[:8] }}</h1>
-<div class="mt-4 border rounded-xl p-4 bg-white">
-<pre class="whitespace-pre-wrap text-sm">{{ markdown }}</pre>
+{% extends "layout.html" %}
+{% set title = title %}
+{% block crumb %}<a href="/reports" class="text-zinc-500 hover:text-zinc-900">Reports</a> <span class="text-zinc-300">/</span> {{ title }}{% endblock %}
+{% block header_action %}
+<a href="/history?task_id={{ task_id }}" class="text-sm text-zinc-600 hover:text-zinc-900 border border-zinc-200 bg-white px-3 py-1.5 rounded-full">History</a>
+<a href="/?inspect={{ task_id }}" class="text-sm text-zinc-600 hover:text-zinc-900 border border-zinc-200 bg-white px-3 py-1.5 rounded-full">Task</a>
+<button onclick="copyReport()" class="text-sm bg-zinc-900 text-white px-3 py-1.5 rounded-full font-medium">Copy</button>
+{% endblock %}
+{% block content %}
+<div class="flex flex-wrap items-center gap-x-3">
+  <h1 class="text-xl font-semibold">{{ title }}</h1>
+  <span class="inline-flex items-center px-2.5 py-1 rounded-full border text-xs font-medium {{ 'bg-zinc-100 border-zinc-200 text-zinc-600' if ui_state=='skipped' else 'bg-emerald-50 border-emerald-200 text-emerald-800' }}">{{ ui_state }}</span>
+  <span class="text-sm text-zinc-500 tabular-nums" title="{{ created_at }}">{{ created_at|fmt_dt }}</span>
 </div>
-<a href="/reports" class="underline text-blue-600 mt-6 inline-block">← Reports</a>
-<a href="/" class="underline text-blue-600 mt-6 ml-4 inline-block">Dashboard</a>
-</body></html>
+<div id="report-body" class="mt-4 bg-white border border-zinc-200 rounded-2xl p-4 sm:p-6 text-zinc-800">
+  {{ markdown_html|safe }}
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script>
+function copyReport(){
+  const text=document.getElementById('report-body').innerText;
+  navigator.clipboard.writeText(text).then(()=>alert('Report copied')).catch(()=>alert('Copy failed'));
+}
+</script>
+{% endblock %}
