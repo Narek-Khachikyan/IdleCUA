@@ -588,6 +588,9 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         idle_app = _get_idle_cua(resolved_data_dir)
         # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
         tasks = idle_app.list_tasks_view(limit=100)
+        # Task status already derives from the one lifecycle snapshot (ADR-0006/US37)
+        # via list_tasks_view; snapshots overlay kept empty so the v1 shape never breaks.
+        snapshots: dict = {}
         # Enrich with result counts
         enriched = []
         for t in tasks:
@@ -607,7 +610,8 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 task_urls = []
                 errors = []
             # Map internal states to the one UI vocabulary (queued / skipped / …).
-            state = t.get("state", "unknown")
+            # The state itself comes from the lifecycle snapshot when available.
+            state = snapshots[tid].state if tid in snapshots else t.get("state", "unknown")
             ui_state = _ui_state_for_task(idle_app, state, tid)
             enriched.append({
                 **t,
@@ -664,11 +668,22 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         data = idle_app.get_task_view(task_id)
         if not data:
             raise HTTPException(status_code=404, detail="task not found")
+        # Task identity/state/plan derive from the one lifecycle snapshot
+        # (ADR-0006/US37); findings/urls/actions/errors stay memory-derived
+        # diagnostic history. Fall back to the stored row on any failure.
+        try:
+            from ..task_lifecycle import GetTask as _GetTask
+
+            _snap = idle_app.lifecycle.inspect(_GetTask(task_id))
+        except Exception:
+            _snap = None
         # Enrich with execution result
         # Get plan_json, findings etc.
         plan = None
         try:
-            if data.get("plan_json"):
+            if _snap is not None and _snap.plan is not None:
+                plan = _snap.plan
+            elif data.get("plan_json"):
                 plan = json.loads(data["plan_json"])
         except Exception:
             plan = None
@@ -703,7 +718,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         except Exception:
             pass
         # Map state
-        state = data.get("state", "unknown")
+        state = _snap.state if _snap is not None else data.get("state", "unknown")
         ui_state = state
         if state == "waiting_for_idle":
             ui_state = "queued"
