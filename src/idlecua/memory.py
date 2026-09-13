@@ -96,12 +96,13 @@ CREATE TABLE IF NOT EXISTS active_session (
 # TaskLifecycle persistence version. v2 adds checkpoint columns + lease table
 # plus safety-preserving legacy-state conversion. v3 adds the per-plan-slot
 # action index so resume re-runs unconfirmed slots instead of skipping them.
-LIFECYCLE_SCHEMA_VERSION = 3
+LIFECYCLE_SCHEMA_VERSION = 4
 
 _TASK_CHECKPOINT_COLUMNS: dict[str, str] = {
     "plan_progress": "INTEGER NOT NULL DEFAULT 0",
     "active_duration_s": "REAL NOT NULL DEFAULT 0",
     "skipped_types": "TEXT NOT NULL DEFAULT '[]'",
+    "skipped_outcomes_json": "TEXT NOT NULL DEFAULT '[]'",
     "last_outcome": "TEXT",
     "stop_cause": "TEXT",
     "failure_cause": "TEXT",
@@ -273,6 +274,7 @@ class MemoryStore:
         plan_progress: int | None = None,
         active_duration_s: float | None = None,
         skipped_types: list[str] | None = None,
+        skipped_outcomes: list[dict] | None = None,
         last_outcome: str | None = None,
         stop_cause: str | None = None,
         failure_cause: str | None = None,
@@ -291,6 +293,9 @@ class MemoryStore:
         if skipped_types is not None:
             sets.append("skipped_types=?")
             vals.append(json.dumps(sorted(set(skipped_types))))
+        if skipped_outcomes is not None:
+            sets.append("skipped_outcomes_json=?")
+            vals.append(json.dumps([dict(x) for x in skipped_outcomes]))
         if last_outcome is not None:
             sets.append("last_outcome=?")
             vals.append(str(last_outcome))
