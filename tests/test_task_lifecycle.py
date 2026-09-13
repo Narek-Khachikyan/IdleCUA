@@ -526,3 +526,129 @@ def test_list_counts_use_constant_queries(tmp_path: Path):
         if s.task_id in ids:
             assert isinstance(s.counts, dict)
             assert s.counts["findings"] >= 0
+
+
+def test_v3_migration_adds_skipped_outcomes_json(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="legacy before migration")).task_id
+    run = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert run.state == "completed"
+    conn = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_before = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" in cols_before
+        conn.execute("ALTER TABLE tasks DROP COLUMN skipped_outcomes_json")
+        conn.execute("PRAGMA user_version=3")
+        conn.commit()
+    finally:
+        conn.close()
+    conn_check = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_mid = {r[1] for r in conn_check.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" not in cols_mid
+        assert conn_check.execute("PRAGMA user_version").fetchone()[0] == 3
+    finally:
+        conn_check.close()
+    from idlecua.memory import MemoryStore
+
+    mem2 = MemoryStore(td)
+    conn2 = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_after = {r[1] for r in conn2.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" in cols_after
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 4
+        row = conn2.execute("SELECT skipped_outcomes_json FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row is not None and json.loads(row[0]) == []
+    finally:
+        conn2.close()
+    app2 = _app(td)
+    app2._memory = mem2
+    snap = app2.lifecycle.inspect(GetTask(tid))
+    assert snap is not None and snap.skipped_outcomes == ()
+
+
+def test_skipped_outcomes_persist_through_inspect_and_reopen(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.memory import MemoryStore
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class PostPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal=desc,
+                target="x.com",
+                expected_actions=["open_allowed_site", "post", "save_note"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.medium,
+                requires_confirmation=True,
+            )
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=PostPlanner())
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="skip post persist", skip_action_types=("post",))).task_id
+    out = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert out.state == "completed"
+    snap = lc.inspect(GetTask(tid))
+    assert snap is not None
+    assert any(s.get("type") == "queue_skip" and s.get("value") == "post" for s in snap.skipped_outcomes)
+    for e in snap.skipped_outcomes:
+        assert set(e.keys()) == {"type", "value", "reason"}
+        assert e["type"] in ("plan", "query", "url", "queue_skip", "llm_cap", "action")
+    mem2 = MemoryStore(td)
+    app2 = _app(td, planner=PostPlanner())
+    app2._memory = mem2
+    snap2 = app2.lifecycle.inspect(GetTask(tid))
+    assert snap2 is not None
+    assert snap2.skipped_outcomes == snap.skipped_outcomes
+    assert any(s.get("type") == "queue_skip" for s in snap2.skipped_outcomes)
+
+
+def test_plan_repeat_persists_skipped_outcomes_after_restart(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.memory import MemoryStore
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class FixedPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal="same goal",
+                target="x.com",
+                expected_actions=["search"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.low,
+                requires_confirmation=False,
+            )
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=FixedPlanner())
+    lc = app.lifecycle
+    first = lc.handle(Enqueue(goal="same goal")).task_id
+    out1 = lc.handle(Start(task_id=first, trigger="explicit", mode="unattended"))
+    assert out1.state == "completed"
+    snap1 = lc.inspect(GetTask(first))
+    assert snap1.skipped_outcomes == ()
+    second = lc.handle(Enqueue(goal="same goal")).task_id
+    out2 = lc.handle(Start(task_id=second, trigger="explicit", mode="unattended"))
+    assert out2.state == "completed"
+    snap2 = lc.inspect(GetTask(second))
+    assert snap2.last_outcome == "skipped_repeat_plan"
+    assert any(s.get("type") == "plan" for s in snap2.skipped_outcomes)
+    for e in snap2.skipped_outcomes:
+        assert set(e.keys()) == {"type", "value", "reason"}
+    mem2 = MemoryStore(td)
+    app2 = _app(td, planner=FixedPlanner())
+    app2._memory = mem2
+    snap2_restart = app2.lifecycle.inspect(GetTask(second))
+    assert snap2_restart.last_outcome == "skipped_repeat_plan"
+    assert snap2_restart.skipped_outcomes == snap2.skipped_outcomes
+    assert any(s.get("type") == "plan" for s in snap2_restart.skipped_outcomes)
