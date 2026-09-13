@@ -96,12 +96,13 @@ CREATE TABLE IF NOT EXISTS active_session (
 # TaskLifecycle persistence version. v2 adds checkpoint columns + lease table
 # plus safety-preserving legacy-state conversion. v3 adds the per-plan-slot
 # action index so resume re-runs unconfirmed slots instead of skipping them.
-LIFECYCLE_SCHEMA_VERSION = 3
+LIFECYCLE_SCHEMA_VERSION = 4
 
 _TASK_CHECKPOINT_COLUMNS: dict[str, str] = {
     "plan_progress": "INTEGER NOT NULL DEFAULT 0",
     "active_duration_s": "REAL NOT NULL DEFAULT 0",
     "skipped_types": "TEXT NOT NULL DEFAULT '[]'",
+    "skipped_outcomes_json": "TEXT NOT NULL DEFAULT '[]'",
     "last_outcome": "TEXT",
     "stop_cause": "TEXT",
     "failure_cause": "TEXT",
@@ -273,6 +274,7 @@ class MemoryStore:
         plan_progress: int | None = None,
         active_duration_s: float | None = None,
         skipped_types: list[str] | None = None,
+        skipped_outcomes: list[dict] | None = None,
         last_outcome: str | None = None,
         stop_cause: str | None = None,
         failure_cause: str | None = None,
@@ -291,6 +293,9 @@ class MemoryStore:
         if skipped_types is not None:
             sets.append("skipped_types=?")
             vals.append(json.dumps(sorted(set(skipped_types))))
+        if skipped_outcomes is not None:
+            sets.append("skipped_outcomes_json=?")
+            vals.append(json.dumps([dict(x) for x in skipped_outcomes]))
         if last_outcome is not None:
             sets.append("last_outcome=?")
             vals.append(str(last_outcome))
@@ -698,6 +703,49 @@ class MemoryStore:
                 return [dict(r) for r in cur.fetchall()]
             finally:
                 conn.close()
+
+    def get_artifact_counts(self, task_ids: list[str]) -> dict[str, dict[str, int]]:
+        """Constant-query counts for a list of tasks (GROUP BY task_id).
+
+        Returns mapping task_id -> {"findings": int, "urls": int, "errors": int}
+        with zeros for tasks that have no rows. One call does GROUP BY over
+        findings, urls, and errors — used by TaskLifecycle inspect for list views
+        so a page is a constant number of queries, not N+1.
+        """
+        if not task_ids:
+            return {}
+        placeholders = ",".join("?" for _ in task_ids)
+        result: dict[str, dict[str, int]] = {tid: {"findings": 0, "urls": 0, "errors": 0} for tid in task_ids}
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM findings WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["findings"] = int(r["c"])
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM urls WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["urls"] = int(r["c"])
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM errors WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["errors"] = int(r["c"])
+            finally:
+                conn.close()
+        return result
 
     # -- reports --
 

@@ -341,20 +341,34 @@ def test_plan_skip_renders_as_skipped_not_completed(tmp_path: Path):
     data_dir = tmp_path / "data8"
     data_dir.mkdir()
     _confirmed_profile(data_dir)
+    from idlecua import IdleCua, IdleCuaConfig
+    from idlecua.contracts import FakeComputerDriver
+    from idlecua.idle import FakeIdleDetector
+    from idlecua.task_lifecycle import GetTask, Start
+
+    idle_app = IdleCua(
+        config=IdleCuaConfig(data_dir=data_dir),
+        computer=FakeComputerDriver(),
+        idle_detector=FakeIdleDetector(idle_seconds=1000, locked=False),
+    )
+    goal = "duplicate goal lifecycle skip test unique 51"
+    t1 = idle_app.create_task(goal)
+    out1 = idle_app.lifecycle.handle(Start(task_id=t1.id, trigger="explicit", mode="unattended"))
+    assert out1.state == "completed"
+    snap1 = idle_app.lifecycle.inspect(GetTask(t1.id))
+    assert snap1 is not None and snap1.last_outcome == "completed"
+    assert snap1.counts.get("errors", 0) >= 0
+
+    t2 = idle_app.create_task(goal)
+    out2 = idle_app.lifecycle.handle(Start(task_id=t2.id, trigger="explicit", mode="unattended"))
+    assert out2.state == "completed"
+    snap2 = idle_app.lifecycle.inspect(GetTask(t2.id))
+    assert snap2 is not None and snap2.last_outcome == "skipped_repeat_plan"
+    assert int(snap2.cumulative.get("actions_completed", 0)) == 0
+    assert snap2.counts.get("findings", 0) == 0 and snap2.counts.get("urls", 0) == 0
+
     app = create_app(data_dir=data_dir, test_mode=True)
     client = TestClient(app)
-
-    r = client.post("/api/v1/tasks", json={"goal": "duplicate goal"})
-    assert r.status_code == 200, r.text
-    tid = r.json()["task"]["id"]
-
-    # Simulate an anti-repeat plan skip: completed state, zero actions,
-    # plan-level skip notice recorded as an error.
-    from idlecua.memory import MemoryStore
-
-    mem = MemoryStore(data_dir)
-    mem.update_task_state(tid, "completed")
-    mem.record_error("err-skip-1", tid, "skipped repeat plan abc123")
 
     ui = client.get("/tasks")
     assert ui.status_code == 200
@@ -363,7 +377,54 @@ def test_plan_skip_renders_as_skipped_not_completed(tmp_path: Path):
     api = client.get("/api/v1/tasks")
     assert api.status_code == 200
     states = {t["id"]: t["ui_state"] for t in api.json()["tasks"]}
-    assert states[tid] == "skipped"
+    assert states[t2.id] == "skipped"
+
+    api_one = client.get(f"/api/v1/tasks/{t2.id}")
+    assert api_one.status_code == 200
+    assert api_one.json()["task"]["ui_state"] == "skipped"
+
+
+def test_task_api_contract_includes_counts(tmp_path: Path):
+    data_dir = tmp_path / "contract"
+    data_dir.mkdir()
+    _confirmed_profile(data_dir)
+    from idlecua import IdleCua, IdleCuaConfig
+    from idlecua.contracts import FakeComputerDriver
+    from idlecua.idle import FakeIdleDetector
+    from idlecua.task_lifecycle import Start
+
+    lc_app = IdleCua(
+        config=IdleCuaConfig(data_dir=data_dir),
+        computer=FakeComputerDriver(),
+        idle_detector=FakeIdleDetector(idle_seconds=1000, locked=False),
+    )
+    t = lc_app.create_task("contract counts check")
+    lc_app.lifecycle.handle(Start(task_id=t.id, trigger="explicit", mode="unattended"))
+
+    app = create_app(data_dir=data_dir, test_mode=True)
+    client = TestClient(app)
+    legacy_keys = {"id", "description", "state", "plan_json", "created_at", "updated_at", "plan_progress", "active_duration_s", "skipped_types", "stop_cause", "failure_cause", "last_outcome"}
+    new_keys = {"findings_count", "urls_count", "errors_count"}
+    resp = client.get("/api/v1/tasks")
+    assert resp.status_code == 200
+    tasks = resp.json()["tasks"]
+    assert tasks
+    for task in tasks:
+        for k in legacy_keys:
+            assert k in task, f"legacy key {k} missing in /api/v1/tasks"
+        for k in new_keys:
+            assert k in task, f"new key {k} missing in /api/v1/tasks"
+        assert isinstance(task["findings_count"], int)
+        assert isinstance(task["urls_count"], int)
+        assert isinstance(task["errors_count"], int)
+
+    single = client.get(f"/api/v1/tasks/{t.id}")
+    assert single.status_code == 200
+    task_detail = single.json()["task"]
+    for k in legacy_keys:
+        assert k in task_detail, f"legacy key {k} missing in /api/v1/tasks/{{id}}"
+    for k in new_keys:
+        assert k in task_detail, f"new key {k} missing in /api/v1/tasks/{{id}}"
 
 
 def test_human_filters_and_durations():

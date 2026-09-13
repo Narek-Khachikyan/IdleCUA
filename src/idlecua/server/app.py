@@ -369,30 +369,17 @@ def _enrich_plan_verdicts(idle_app: IdleCua, plan) -> list[dict]:
     return verdicts
 
 
-def _is_plan_skipped(idle_app: IdleCua, task_id: str) -> bool:
-    """A plan-level anti-repeat skip looks completed but ran zero actions.
+def _ui_state_for_task(raw_state: str, last_outcome: str | None = None) -> str:
+    """Map internal AgentState to the one UI vocabulary (queued/running/…/skipped).
 
-    Showing it as green `completed` misleads; the UI maps it to `skipped`.
+    Skipped derives from semantic last_outcome == "skipped_repeat_plan", not
+    from substring matching of error messages.
     """
-    try:
-        errors = idle_app.memory.list_errors(task_id=task_id)
-    except Exception:
-        return False
-    if not any("skipped repeat plan" in (e.get("message") or "") for e in errors):
-        return False
-    try:
-        return len(idle_app.memory.list_actions(task_id=task_id)) == 0
-    except Exception:
-        return False
-
-
-def _ui_state_for_task(idle_app: IdleCua, raw_state: str, task_id: str) -> str:
-    """Map internal AgentState to the one UI vocabulary (queued/running/…/skipped)."""
     if raw_state == "waiting_for_idle":
         return "queued"
     if raw_state == "disabled":
         return "queued"
-    if raw_state == "completed" and _is_plan_skipped(idle_app, task_id):
+    if raw_state == "completed" and last_outcome == "skipped_repeat_plan":
         return "skipped"
     return raw_state
 
@@ -401,29 +388,16 @@ def _enrich_tasks_with_results(idle_app: IdleCua, tasks: list[dict]) -> list[dic
     """Shared task enrichment for the Local UI (dashboard + /tasks).
 
     Adds `ui_state` (waiting_for_idle/disabled → queued) and `result_str`
-    (findings/urls counts, reused per #32) plus the raw counts. Urls are
-    fetched once and partitioned per task instead of scanned per task.
+    (findings/urls counts, reused per #32) plus the raw counts. Counts come
+    from the one Task view (constant queries) — no per-task storage reads.
     """
-    try:
-        all_urls = idle_app.memory.list_urls(limit=1000)
-    except Exception:
-        all_urls = []
-    urls_by_task: dict[str, int] = {}
-    for u in all_urls:
-        tid = u.get("task_id")
-        if tid:
-            urls_by_task[tid] = urls_by_task.get(tid, 0) + 1
     enriched = []
     for t in tasks:
-        tid = t.get("id", "")
-        try:
-            findings = idle_app.memory.list_findings(task_id=tid)
-        except Exception:
-            findings = []
-        n_findings = len(findings) if findings else 0
-        n_urls = urls_by_task.get(tid, 0)
         state = t.get("state", "unknown")
-        ui_state = _ui_state_for_task(idle_app, state, tid)
+        last_outcome = t.get("last_outcome")
+        ui_state = _ui_state_for_task(state, last_outcome)
+        n_findings = int(t.get("findings_count", 0) or 0)
+        n_urls = int(t.get("urls_count", 0) or 0)
         if ui_state == "skipped":
             result_str = "skipped — duplicate"
         elif state in ("waiting_for_idle", "disabled", "queued"):
@@ -435,6 +409,7 @@ def _enrich_tasks_with_results(idle_app: IdleCua, tasks: list[dict]) -> list[dic
             "ui_state": ui_state,
             "findings_count": n_findings,
             "urls_count": n_urls,
+            "errors_count": int(t.get("errors_count", 0) or 0),
             "result_str": result_str,
         })
     return enriched
@@ -586,40 +561,19 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.get("/api/v1/tasks")
     def api_list_tasks():
         idle_app = _get_idle_cua(resolved_data_dir)
-        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
         tasks = idle_app.list_tasks_view(limit=100)
-        # Task status already derives from the one lifecycle snapshot (ADR-0006/US37)
-        # via list_tasks_view; snapshots overlay kept empty so the v1 shape never breaks.
-        snapshots: dict = {}
-        # Enrich with result counts
         enriched = []
         for t in tasks:
-            tid = t["id"]
-            # counts
-            try:
-                findings = idle_app.memory.list_findings(task_id=tid)
-                urls = idle_app.memory.list_urls(limit=1000)
-                # filter by task_id if needed? urls table has task_id
-                task_urls = [u for u in urls if u.get("task_id") == tid] if urls and isinstance(urls[0], dict) and "task_id" in urls[0] else []
-                # fallback: use memory.list only with task filter? memory.list_urls doesn't filter by task, but we can list all and filter
-                # For findings we already filtered
-                # errors
-                errors = idle_app.memory.list_errors(task_id=tid)
-            except Exception:
-                findings = []
-                task_urls = []
-                errors = []
-            # Map internal states to the one UI vocabulary (queued / skipped / …).
-            # The state itself comes from the lifecycle snapshot when available.
-            state = snapshots[tid].state if tid in snapshots else t.get("state", "unknown")
-            ui_state = _ui_state_for_task(idle_app, state, tid)
+            state = t.get("state", "unknown")
+            last_outcome = t.get("last_outcome")
+            ui_state = _ui_state_for_task(state, last_outcome)
             enriched.append({
                 **t,
                 "state": state,
                 "ui_state": ui_state,
-                "findings_count": len(findings) if findings else 0,
-                "urls_count": len(task_urls) if task_urls else 0,
-                "errors_count": len(errors) if errors else 0,
+                "findings_count": int(t.get("findings_count", 0) or 0),
+                "urls_count": int(t.get("urls_count", 0) or 0),
+                "errors_count": int(t.get("errors_count", 0) or 0),
             })
         return {"tasks": enriched}
 
@@ -664,21 +618,15 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
     @app.get("/api/v1/tasks/{task_id}")
     def api_get_task(task_id: str):
         idle_app = _get_idle_cua(resolved_data_dir)
-        # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
         data = idle_app.get_task_view(task_id)
         if not data:
             raise HTTPException(status_code=404, detail="task not found")
-        # Task identity/state/plan derive from the one lifecycle snapshot
-        # (ADR-0006/US37); findings/urls/actions/errors stay memory-derived
-        # diagnostic history. Fall back to the stored row on any failure.
         try:
             from ..task_lifecycle import GetTask as _GetTask
 
             _snap = idle_app.lifecycle.inspect(_GetTask(task_id))
         except Exception:
             _snap = None
-        # Enrich with execution result
-        # Get plan_json, findings etc.
         plan = None
         try:
             if _snap is not None and _snap.plan is not None:
@@ -689,7 +637,6 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             plan = None
         findings = idle_app.memory.list_findings(task_id=task_id)
         urls = []
-        # urls filter
         try:
             all_urls = idle_app.memory.list_urls(limit=1000)
             urls = [u for u in all_urls if u.get("task_id") == task_id]
@@ -698,11 +645,9 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
         actions = idle_app.memory.list_actions(task_id=task_id)
         errors = idle_app.memory.list_errors(task_id=task_id)
         report = idle_app.memory.get_report(task_id)
-        # Also get verdicts if plan available
         verdicts = []
         try:
             if plan:
-                # reconstruct Plan-like dict for verdicts: need expected_actions
                 expected = plan.get("expected_actions", [])
                 for kind in expected:
                     from ..policy import TypedAction
@@ -717,11 +662,15 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                     })
         except Exception:
             pass
-        # Map state
         state = _snap.state if _snap is not None else data.get("state", "unknown")
-        ui_state = state
-        if state == "waiting_for_idle":
-            ui_state = "queued"
+        last_outcome = _snap.last_outcome if _snap is not None else data.get("last_outcome")
+        if last_outcome is None:
+            last_outcome = data.get("last_outcome")
+        ui_state = _ui_state_for_task(state, last_outcome)
+        result_counts = {
+            "findings": int(data.get("findings_count", len(findings)) or 0),
+            "urls": int(data.get("urls_count", len(urls)) or 0),
+        }
         return {
             "task": {**data, "ui_state": ui_state},
             "plan": plan,
@@ -731,7 +680,7 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             "errors": errors,
             "report": report,
             "verdicts": verdicts,
-            "result_counts": {"findings": len(findings), "urls": len(urls)},
+            "result_counts": result_counts,
         }
 
     @app.post("/api/v1/plans/preview")
@@ -1394,33 +1343,23 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
             return HTMLResponse("<html><body>Reports</body></html>")
         idle_app = _get_idle_cua(resolved_data_dir)
         reports = idle_app.list_reports(limit=20)
-        # Show the task goal instead of a bare hex id so reports are findable,
-        # plus a one-line summary (state · findings · pages) for the list.
-        try:
-            all_urls = idle_app.memory.list_urls(limit=1000)
-        except Exception:
-            all_urls = []
-        urls_by_task: dict[str, int] = {}
-        for u in all_urls:
-            tid = u.get("task_id")
-            if tid:
-                urls_by_task[tid] = urls_by_task.get(tid, 0) + 1
         for r in reports:
             tid = r.get("task_id", "")
             try:
-                # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
                 task = idle_app.get_task_view(tid)
                 r["title"] = (task.get("description") or "Untitled task") if task else "Untitled task"
                 raw_state = (task.get("state") or "unknown") if task else "unknown"
+                last_outcome = task.get("last_outcome") if task else None
+                n_findings = int(task.get("findings_count", 0) or 0) if task else 0
+                n_urls = int(task.get("urls_count", 0) or 0) if task else 0
             except Exception:
                 r["title"] = "Untitled task"
                 raw_state = "unknown"
-            r["ui_state"] = _ui_state_for_task(idle_app, raw_state, tid)
-            try:
-                n_findings = len(idle_app.memory.list_findings(task_id=tid))
-            except Exception:
+                last_outcome = None
                 n_findings = 0
-            r["summary"] = f"{n_findings} findings · {urls_by_task.get(tid, 0)} pages"
+                n_urls = 0
+            r["ui_state"] = _ui_state_for_task(raw_state, last_outcome)
+            r["summary"] = f"{n_findings} findings · {n_urls} pages"
         return templates.TemplateResponse(
             request,
             "reports.html",
@@ -1442,14 +1381,15 @@ def create_app(data_dir: Path | str | None = None, test_mode: bool = False) -> F
                 raise HTTPException(status_code=404, detail="report not found")
         md_text = rep.get("markdown", "")
         try:
-            # ADR-0006: lifecycle data via Application API → TaskLifecycle.inspect().
             task = idle_app.get_task_view(task_id)
             title = (task.get("description") or "Untitled task") if task else "Untitled task"
             raw_state = (task.get("state") or "unknown") if task else "unknown"
+            last_outcome = task.get("last_outcome") if task else None
         except Exception:
             title = "Untitled task"
             raw_state = "unknown"
-        ui_state = _ui_state_for_task(idle_app, raw_state, task_id)
+            last_outcome = None
+        ui_state = _ui_state_for_task(raw_state, last_outcome)
         # The stored report repeats its own H1 and a raw-ISO Generated line —
         # the page header already shows the goal and a human date.
         import re as _re

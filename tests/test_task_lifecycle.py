@@ -469,3 +469,262 @@ def test_migration_preserves_history_and_converts_legacy_states(tmp_path: Path):
     assert mem2.get_task("t-queued")["state"] == "waiting_for_idle"
     assert mem2.get_task("t-done")["state"] == "completed"
     assert mem2.get_report("t-done") is not None
+
+
+def test_inspect_counts_and_report_markdown(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    out = lc.handle(Enqueue(goal="counts check goal"))
+    tid = out.task_id
+    run = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert run.category == OutcomeCategory.ok and run.state == "completed"
+
+    snap_one = lc.inspect(GetTask(tid))
+    assert snap_one is not None
+    assert hasattr(snap_one, "counts") and isinstance(snap_one.counts, dict)
+    assert "findings" in snap_one.counts and "urls" in snap_one.counts and "errors" in snap_one.counts
+    assert isinstance(snap_one.counts["findings"], int)
+    assert isinstance(snap_one.counts["urls"], int)
+    assert isinstance(snap_one.counts["errors"], int)
+    assert snap_one.counts["findings"] >= 1
+    assert snap_one.counts["urls"] >= 1
+    assert "actions_completed" in snap_one.cumulative
+    assert snap_one.report_markdown is not None and "# IdleCUA" in snap_one.report_markdown
+    assert hasattr(snap_one, "skipped_outcomes")
+    assert isinstance(snap_one.skipped_outcomes, tuple)
+
+    listed = lc.inspect(ListTasks(limit=10))
+    assert listed
+    for s in listed:
+        assert s.report_markdown is None
+        assert isinstance(s.counts, dict)
+        assert "findings" in s.counts and "urls" in s.counts and "errors" in s.counts
+
+    active = lc.inspect(GetActive())
+    if active is not None:
+        assert active.report_markdown is None
+
+
+def test_list_counts_use_constant_queries(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    ids = []
+    for i in range(3):
+        out = lc.handle(Enqueue(goal=f"constant query goal {i}"))
+        ids.append(out.task_id)
+        lc.handle(Start(task_id=out.task_id, trigger="explicit", mode="unattended"))
+
+    snaps = lc.inspect(ListTasks(limit=10))
+    assert len(snaps) >= 3
+    for s in snaps:
+        if s.task_id in ids:
+            assert isinstance(s.counts, dict)
+            assert s.counts["findings"] >= 0
+
+
+def test_list_counts_fallback_when_aggregate_missing(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    out = lc.handle(Enqueue(goal="fallback counts goal"))
+    assert lc.handle(Start(task_id=out.task_id, trigger="explicit", mode="unattended")).state == "completed"
+    one = lc.inspect(GetTask(out.task_id))
+    assert one is not None and one.counts["findings"] >= 1
+
+    class _NoAggregateMemory:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            if name == "get_artifact_counts":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    lc.memory = _NoAggregateMemory(app.memory)
+    listed = {s.task_id: s for s in lc.inspect(ListTasks(limit=10))}
+    assert out.task_id in listed
+    assert listed[out.task_id].counts == one.counts
+
+
+def test_v3_migration_adds_skipped_outcomes_json(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="legacy before migration")).task_id
+    run = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert run.state == "completed"
+    conn = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_before = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" in cols_before
+        conn.execute("ALTER TABLE tasks DROP COLUMN skipped_outcomes_json")
+        conn.execute("PRAGMA user_version=3")
+        conn.commit()
+    finally:
+        conn.close()
+    conn_check = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_mid = {r[1] for r in conn_check.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" not in cols_mid
+        assert conn_check.execute("PRAGMA user_version").fetchone()[0] == 3
+    finally:
+        conn_check.close()
+    from idlecua.memory import MemoryStore
+
+    mem2 = MemoryStore(td)
+    conn2 = sqlite3.connect(str(td / "memory.db"))
+    try:
+        cols_after = {r[1] for r in conn2.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "skipped_outcomes_json" in cols_after
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 4
+        row = conn2.execute("SELECT skipped_outcomes_json FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row is not None and json.loads(row[0]) == []
+    finally:
+        conn2.close()
+    app2 = _app(td)
+    app2._memory = mem2
+    snap = app2.lifecycle.inspect(GetTask(tid))
+    assert snap is not None and snap.skipped_outcomes == ()
+
+
+def test_skipped_outcomes_persist_through_inspect_and_reopen(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.memory import MemoryStore
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class PostPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal=desc,
+                target="x.com",
+                expected_actions=["open_allowed_site", "post", "save_note"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.medium,
+                requires_confirmation=True,
+            )
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=PostPlanner())
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="skip post persist", skip_action_types=("post",))).task_id
+    out = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert out.state == "completed"
+    snap = lc.inspect(GetTask(tid))
+    assert snap is not None
+    assert any(s.get("type") == "queue_skip" and s.get("value") == "post" for s in snap.skipped_outcomes)
+    for e in snap.skipped_outcomes:
+        assert set(e.keys()) == {"type", "value", "reason"}
+        assert e["type"] in ("plan", "query", "url", "queue_skip", "llm_cap", "action")
+    mem2 = MemoryStore(td)
+    app2 = _app(td, planner=PostPlanner())
+    app2._memory = mem2
+    snap2 = app2.lifecycle.inspect(GetTask(tid))
+    assert snap2 is not None
+    assert snap2.skipped_outcomes == snap.skipped_outcomes
+    assert any(s.get("type") == "queue_skip" for s in snap2.skipped_outcomes)
+
+
+def test_cancel_paused_task_preserves_persisted_skips(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class PostPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal=desc,
+                target="x.com",
+                expected_actions=["open_allowed_site", "post", "read_ui", "scroll", "save_note"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.low,
+                requires_confirmation=False,
+            )
+
+    class Flip(FakeIdleDetector):
+        def __init__(self):
+            super().__init__(idle_seconds=1000, locked=False)
+            self.n = 0
+
+        def seconds_since_last_input(self):
+            self.n += 1
+            return 1000.0 if self.n <= 3 else 0.0
+
+        def can_run(self, thr=600):
+            return (True, "idle") if self.n <= 3 else (False, "user returned")
+
+        def is_screen_locked(self):
+            return False
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=PostPlanner(), idle_detector=Flip())
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="skip then pause", skip_action_types=("post",))).task_id
+    paused = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert paused.state == "paused_by_user"
+    before = lc.inspect(GetTask(tid))
+    assert before is not None
+    assert any(e.get("type") == "queue_skip" and e.get("value") == "post" for e in before.skipped_outcomes)
+
+    cancelled = lc.handle(Cancel(task_id=tid, reason="owner done"))
+    assert cancelled.category == OutcomeCategory.stopped
+    after = lc.inspect(GetTask(tid))
+    assert after is not None
+    assert after.skipped_outcomes == before.skipped_outcomes
+
+
+def test_plan_repeat_persists_skipped_outcomes_after_restart(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.memory import MemoryStore
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class FixedPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal="same goal",
+                target="x.com",
+                expected_actions=["search"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.low,
+                requires_confirmation=False,
+            )
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=FixedPlanner())
+    lc = app.lifecycle
+    first = lc.handle(Enqueue(goal="same goal")).task_id
+    out1 = lc.handle(Start(task_id=first, trigger="explicit", mode="unattended"))
+    assert out1.state == "completed"
+    snap1 = lc.inspect(GetTask(first))
+    assert snap1.skipped_outcomes == ()
+    second = lc.handle(Enqueue(goal="same goal")).task_id
+    out2 = lc.handle(Start(task_id=second, trigger="explicit", mode="unattended"))
+    assert out2.state == "completed"
+    snap2 = lc.inspect(GetTask(second))
+    assert snap2.last_outcome == "skipped_repeat_plan"
+    assert any(s.get("type") == "plan" for s in snap2.skipped_outcomes)
+    for e in snap2.skipped_outcomes:
+        assert set(e.keys()) == {"type", "value", "reason"}
+    mem2 = MemoryStore(td)
+    app2 = _app(td, planner=FixedPlanner())
+    app2._memory = mem2
+    snap2_restart = app2.lifecycle.inspect(GetTask(second))
+    assert snap2_restart.last_outcome == "skipped_repeat_plan"
+    assert snap2_restart.skipped_outcomes == snap2.skipped_outcomes
+    assert any(s.get("type") == "plan" for s in snap2_restart.skipped_outcomes)

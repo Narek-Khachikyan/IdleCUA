@@ -547,44 +547,58 @@ class IdleCua:
         from .models.plan import Plan
         from .models.plan import RiskLevel as _RL
         from .models.state import AgentState as _AS
+        from .task_lifecycle import GetTask
 
-        row = self.memory.get_task(task_id) or {}
-        state_v = str(row.get("state", "failed"))
+        snapshot = None
         try:
-            state = _AS(state_v)
+            snapshot = self.lifecycle.inspect(GetTask(task_id))
         except Exception:
-            state = _AS.failed
-        plan = None
-        try:
-            if row.get("plan_json"):
-                pj = json.loads(row["plan_json"])
-                plan = Plan(
-                    goal=pj.get("goal", row.get("description", "")),
-                    target=pj.get("target", "google.com"),
-                    expected_actions=list(pj.get("expected_actions", ["search"])),
-                    expected_result=pj.get("expected_result", ""),
-                    max_duration_minutes=int(pj.get("max_duration_minutes", 45)),
-                    max_actions=int(pj.get("max_actions", 50)),
-                    risk_level=_RL(pj.get("risk_level", "low")),
-                    requires_confirmation=bool(pj.get("requires_confirmation", False)),
-                )
-        except Exception:
+            snapshot = None
+        if snapshot is not None:
+            state_v = str(getattr(snapshot, "state", "failed"))
+            try:
+                state = _AS(state_v)
+            except Exception:
+                state = _AS.failed
             plan = None
+            try:
+                if snapshot.plan:
+                    pj = snapshot.plan
+                    plan = Plan(
+                        goal=pj.get("goal", snapshot.goal),
+                        target=pj.get("target", "google.com"),
+                        expected_actions=list(pj.get("expected_actions", ["search"])),
+                        expected_result=pj.get("expected_result", ""),
+                        max_duration_minutes=int(pj.get("max_duration_minutes", 45)),
+                        max_actions=int(pj.get("max_actions", 50)),
+                        risk_level=_RL(pj.get("risk_level", "low")),
+                        requires_confirmation=bool(pj.get("requires_confirmation", False)),
+                    )
+            except Exception:
+                plan = None
+            n_completed = int((snapshot.cumulative or {}).get("actions_completed", 0) or 0)
+            skipped_view = list(snapshot.skipped_outcomes or [])
+            md = snapshot.report_markdown or ""
+            goal = snapshot.goal or "task"
+        else:
+            state = _AS.failed
+            plan = None
+            n_completed = 0
+            skipped_view = []
+            md = ""
+            goal = "task"
         if plan is None:
             try:
-                plan = self.dry_run(row.get("description", "task"))
+                plan = self.dry_run(goal)
             except Exception:
-                plan = Plan(goal=row.get("description", "task"), target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
-        try:
-            actions = self.memory.list_actions(task_id=task_id)
-        except Exception:
-            actions = []
-        # Cleanup closes ("cleanup: ...") are tab discipline, not plan work.
-        n_completed = sum(
-            1
-            for a in actions
-            if a.get("status") == "completed" and not str(a.get("error") or "").startswith("cleanup:")
-        )
+                plan = Plan(goal=goal, target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
+        if not md:
+            try:
+                rp = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
+                if rp.exists():
+                    md = rp.read_text(encoding="utf-8")
+            except Exception:
+                md = ""
         try:
             queries = [q for q in self.memory.list_queries(limit=1000) if q.get("task_id") == task_id]
         except Exception:
@@ -601,36 +615,6 @@ class IdleCua:
             errs = self.memory.list_errors(task_id=task_id)
         except Exception:
             errs = []
-        try:
-            rep = self.memory.get_report(task_id)
-            md = rep.get("markdown", "") if rep else ""
-        except Exception:
-            md = ""
-        if not md:
-            try:
-                rp = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
-                if rp.exists():
-                    md = rp.read_text(encoding="utf-8")
-            except Exception:
-                md = ""
-        # Rebuild skipped_repeats view from persisted skips/blocks for CLI parity.
-        # The lifecycle persists every skip as an action row (blocked/skipped)
-        # and/or an error row; surface both so approval/queue-skip/no-mapping
-        # and plan-repeat decisions stay visible through the legacy shape.
-        skipped_view: list[dict] = []
-        for a in actions:
-            st = str(a.get("status", ""))
-            if st in ("blocked", "skipped"):
-                err = str(a.get("error", "") or "")
-                skipped_view.append({"type": "action", "value": str(a.get("kind", "")), "reason": err or st})
-        for e in errs:
-            m = str(e.get("message", ""))
-            low = m.lower()
-            if "skipped repeat plan" in low:
-                skipped_view.append({"type": "plan", "value": m.split()[-1] if m.split() else "", "reason": m})
-            elif "skipped repeat" in low or "skipped confirmation" in low or "queue-time skip" in low or "no typed driver mapping" in low or "owner declined" in low or "llm cap" in low:
-                if not any(s.get("reason") == m for s in skipped_view):
-                    skipped_view.append({"type": "action", "value": task_id[:8], "reason": m})
         report_path = None
         try:
             cand = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
@@ -1441,6 +1425,7 @@ class IdleCua:
         """
         import json as _json
 
+        counts = getattr(s, "counts", None) or {}
         return {
             "id": s.task_id,
             "description": s.goal,
@@ -1454,6 +1439,9 @@ class IdleCua:
             "stop_cause": getattr(s, "stop_cause", None),
             "failure_cause": getattr(s, "failure_cause", None),
             "last_outcome": s.last_outcome,
+            "findings_count": int(counts.get("findings", 0) or 0),
+            "urls_count": int(counts.get("urls", 0) or 0),
+            "errors_count": int(counts.get("errors", 0) or 0),
         }
 
     def list_tasks_view(self, limit: int = 100) -> list[dict]:
