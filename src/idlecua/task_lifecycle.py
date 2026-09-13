@@ -1178,6 +1178,26 @@ class TaskLifecycle:
                 errors = self.memory.list_errors(task_id=task_id)
             except Exception:
                 pass
+            try:
+                raw_so = row.get("skipped_outcomes_json")
+                if raw_so:
+                    persisted = json.loads(raw_so)
+                    if isinstance(persisted, list):
+                        seen = set()
+                        for e in skipped:
+                            try:
+                                seen.add((e.get("type"), e.get("value"), e.get("reason")))
+                            except Exception:  # noqa: BLE001, S112
+                                continue
+                        for e in persisted:
+                            if not isinstance(e, dict):
+                                continue
+                            key = (e.get("type"), e.get("value"), e.get("reason"))
+                            if key not in seen:
+                                skipped.append(dict(e))
+                                seen.add(key)
+            except Exception:  # noqa: BLE001, S110
+                pass
         if cap_note:
             errors.append({"message": f"LLM cap reached at planning — {cap_note} (graceful fallback to stub, state saved)"})
             try:
@@ -1225,9 +1245,9 @@ class TaskLifecycle:
             confirmed slots (progress_v=None keeps the persisted prefix)."""
             try:
                 if progress_v is None:
-                    self.memory.update_task_checkpoint(task_id, active_duration_s=_cumulative_s(), last_outcome=outcome)
+                    self.memory.update_task_checkpoint(task_id, active_duration_s=_cumulative_s(), last_outcome=outcome, skipped_outcomes=list(skipped))
                 else:
-                    self.memory.update_task_checkpoint(task_id, plan_progress=progress_v, active_duration_s=_cumulative_s(), last_outcome=outcome)
+                    self.memory.update_task_checkpoint(task_id, plan_progress=progress_v, active_duration_s=_cumulative_s(), last_outcome=outcome, skipped_outcomes=list(skipped))
                 return True
             except Exception:
                 return False
@@ -1837,6 +1857,10 @@ class TaskLifecycle:
             try:
                 self.memory.save_report(task_id, md)
             except Exception:
+                return None
+            try:
+                self.memory.update_task_checkpoint(task_id, skipped_outcomes=list(skipped or []))
+            except Exception:  # noqa: BLE001
                 return None
             return md
         except Exception:
