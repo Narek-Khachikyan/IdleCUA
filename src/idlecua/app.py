@@ -1441,6 +1441,7 @@ class IdleCua:
         """
         import json as _json
 
+        counts = getattr(s, "counts", None) or {}
         return {
             "id": s.task_id,
             "description": s.goal,
@@ -1454,6 +1455,9 @@ class IdleCua:
             "stop_cause": getattr(s, "stop_cause", None),
             "failure_cause": getattr(s, "failure_cause", None),
             "last_outcome": s.last_outcome,
+            "findings_count": int(counts.get("findings", 0) or 0),
+            "urls_count": int(counts.get("urls", 0) or 0),
+            "errors_count": int(counts.get("errors", 0) or 0),
         }
 
     def list_tasks_view(self, limit: int = 100) -> list[dict]:

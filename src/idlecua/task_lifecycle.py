@@ -97,6 +97,8 @@ class TaskSnapshot:
     plan_progress: int = 0
     active_duration_s: float = 0.0
     last_outcome: str | None = None
+    counts: dict = field(default_factory=dict)
+    skipped_outcomes: tuple[dict, ...] = ()
     report_markdown: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -222,7 +224,7 @@ class TaskLifecycle:
 
     # -- inspection --
 
-    def _snapshot_from_row(self, row: dict) -> TaskSnapshot:
+    def _snapshot_from_row(self, row: dict, *, include_report: bool = True, _counts: dict | None = None) -> TaskSnapshot:
         plan = None
         try:
             if row.get("plan_json"):
@@ -250,6 +252,18 @@ class TaskLifecycle:
             skipped = tuple(json.loads(row.get("skipped_types") or "[]"))
         except Exception:
             skipped = ()
+        try:
+            raw_so = row.get("skipped_outcomes_json")
+            if raw_so:
+                parsed = json.loads(raw_so)
+                if isinstance(parsed, list):
+                    skipped_outcomes = tuple(dict(x) for x in parsed if isinstance(x, dict))
+                else:
+                    skipped_outcomes = ()
+            else:
+                skipped_outcomes = ()
+        except Exception:
+            skipped_outcomes = ()
         cause = row.get("stop_cause") or row.get("failure_cause")
         try:
             snap_progress = int(row.get("plan_progress") or 0)
@@ -265,10 +279,35 @@ class TaskLifecycle:
             "actions_completed": len(completed),
             "actions_failed": n_failed,
         }
-        try:
-            rep = self.memory.get_report(row["id"])
-            md = rep.get("markdown") if rep else None
-        except Exception:
+        if _counts is None:
+            try:
+                if hasattr(self.memory, "get_artifact_counts"):
+                    m = self.memory.get_artifact_counts([row["id"]])
+                    _counts = m.get(row["id"], {"findings": 0, "urls": 0, "errors": 0})
+                else:
+                    n_findings = len(self.memory.list_findings(task_id=row["id"]))
+                    try:
+                        all_urls = self.memory.list_urls(limit=1000)
+                        n_urls = sum(1 for u in all_urls if u.get("task_id") == row["id"])
+                    except Exception:
+                        n_urls = 0
+                    n_errors = len(self.memory.list_errors(task_id=row["id"]))
+                    _counts = {"findings": n_findings, "urls": n_urls, "errors": n_errors}
+            except Exception:
+                _counts = {"findings": 0, "urls": 0, "errors": 0}
+        else:
+            _counts = {
+                "findings": int(_counts.get("findings", 0) or 0),
+                "urls": int(_counts.get("urls", 0) or 0),
+                "errors": int(_counts.get("errors", 0) or 0),
+            }
+        if include_report:
+            try:
+                rep = self.memory.get_report(row["id"])
+                md = rep.get("markdown") if rep else None
+            except Exception:
+                md = None
+        else:
             md = None
         return TaskSnapshot(
             task_id=row["id"],
@@ -284,6 +323,8 @@ class TaskLifecycle:
             plan_progress=snap_progress,
             active_duration_s=snap_duration,
             last_outcome=row.get("last_outcome"),
+            counts=_counts,
+            skipped_outcomes=skipped_outcomes,
             report_markdown=md,
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
@@ -296,23 +337,31 @@ class TaskLifecycle:
             return None
         if not row:
             return None
-        return self._snapshot_from_row(row)
+        return self._snapshot_from_row(row, include_report=True)
 
     def _inspect_list(self, query: ListTasks) -> list[TaskSnapshot]:
         try:
             if query.states:
                 rows = self.memory.list_tasks_fifo(list(query.states), limit=query.limit)
-                # FIFO is oldest-first; keep that order for selection parity.
                 ordered = rows
             else:
                 rows = self.memory.list_tasks(limit=query.limit)
                 ordered = rows
         except Exception:
             return []
+        try:
+            task_ids = [r["id"] for r in ordered]
+            if task_ids and hasattr(self.memory, "get_artifact_counts"):
+                counts_map = self.memory.get_artifact_counts(task_ids)
+            else:
+                counts_map = {}
+        except Exception:
+            counts_map = {}
         out = []
         for r in ordered:
             try:
-                out.append(self._snapshot_from_row(r))
+                cnt = counts_map.get(r["id"], {"findings": 0, "urls": 0, "errors": 0}) if isinstance(counts_map, dict) else {"findings": 0, "urls": 0, "errors": 0}
+                out.append(self._snapshot_from_row(r, include_report=False, _counts=cnt))
             except Exception:
                 continue
         return out
@@ -323,14 +372,17 @@ class TaskLifecycle:
         except Exception:
             lease = None
         if lease and lease.get("task_id"):
-            snap = self._inspect_one(str(lease["task_id"]))
-            if snap is not None:
-                return snap
+            try:
+                row = self.memory.get_task(str(lease["task_id"]))
+            except Exception:
+                row = None
+            if row:
+                return self._snapshot_from_row(row, include_report=False)
         # Fallback: newest running/planning row (no lease detail exposed).
         try:
             for r in self.memory.list_tasks(limit=20):
                 if r.get("state") in ("running", "planning"):
-                    return self._snapshot_from_row(r)
+                    return self._snapshot_from_row(r, include_report=False)
         except Exception:
             pass
         return None
