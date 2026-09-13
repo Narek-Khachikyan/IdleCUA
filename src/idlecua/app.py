@@ -576,24 +576,22 @@ class IdleCua:
                     )
             except Exception:
                 plan = None
-            if plan is None:
-                try:
-                    plan = self.dry_run(snapshot.goal or "task")
-                except Exception:
-                    plan = Plan(goal=snapshot.goal or "task", target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
             n_completed = int((snapshot.cumulative or {}).get("actions_completed", 0) or 0)
             skipped_view = list(snapshot.skipped_outcomes or [])
             md = snapshot.report_markdown or ""
+            goal = snapshot.goal or "task"
         else:
             state = _AS.failed
             plan = None
-            try:
-                plan = self.dry_run("task")
-            except Exception:
-                plan = Plan(goal="task", target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
             n_completed = 0
             skipped_view = []
             md = ""
+            goal = "task"
+        if plan is None:
+            try:
+                plan = self.dry_run(goal)
+            except Exception:
+                plan = Plan(goal=goal, target="google.com", expected_actions=["search"], expected_result="", max_duration_minutes=10, max_actions=10, risk_level=_RL.low, requires_confirmation=False)
         if not md:
             try:
                 rp = _P(self.config.data_dir) / "reports" / f"{task_id}.md"
