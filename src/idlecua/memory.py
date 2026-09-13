@@ -699,6 +699,49 @@ class MemoryStore:
             finally:
                 conn.close()
 
+    def get_artifact_counts(self, task_ids: list[str]) -> dict[str, dict[str, int]]:
+        """Constant-query counts for a list of tasks (GROUP BY task_id).
+
+        Returns mapping task_id -> {"findings": int, "urls": int, "errors": int}
+        with zeros for tasks that have no rows. One call does GROUP BY over
+        findings, urls, and errors — used by TaskLifecycle inspect for list views
+        so a page is a constant number of queries, not N+1.
+        """
+        if not task_ids:
+            return {}
+        placeholders = ",".join("?" for _ in task_ids)
+        result: dict[str, dict[str, int]] = {tid: {"findings": 0, "urls": 0, "errors": 0} for tid in task_ids}
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM findings WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["findings"] = int(r["c"])
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM urls WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["urls"] = int(r["c"])
+                cur = conn.execute(
+                    f"SELECT task_id, COUNT(*) as c FROM errors WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    task_ids,
+                )
+                for r in cur.fetchall():
+                    tid = str(r["task_id"])
+                    if tid in result:
+                        result[tid]["errors"] = int(r["c"])
+            finally:
+                conn.close()
+        return result
+
     # -- reports --
 
     def save_report(self, task_id: str, markdown: str) -> None:

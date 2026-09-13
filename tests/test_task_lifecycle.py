@@ -469,3 +469,60 @@ def test_migration_preserves_history_and_converts_legacy_states(tmp_path: Path):
     assert mem2.get_task("t-queued")["state"] == "waiting_for_idle"
     assert mem2.get_task("t-done")["state"] == "completed"
     assert mem2.get_report("t-done") is not None
+
+
+def test_inspect_counts_and_report_markdown(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    out = lc.handle(Enqueue(goal="counts check goal"))
+    tid = out.task_id
+    run = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert run.category == OutcomeCategory.ok and run.state == "completed"
+
+    snap_one = lc.inspect(GetTask(tid))
+    assert snap_one is not None
+    assert hasattr(snap_one, "counts") and isinstance(snap_one.counts, dict)
+    assert "findings" in snap_one.counts and "urls" in snap_one.counts and "errors" in snap_one.counts
+    assert isinstance(snap_one.counts["findings"], int)
+    assert isinstance(snap_one.counts["urls"], int)
+    assert isinstance(snap_one.counts["errors"], int)
+    assert snap_one.counts["findings"] >= 1
+    assert snap_one.counts["urls"] >= 1
+    assert "actions_completed" in snap_one.cumulative
+    assert snap_one.report_markdown is not None and "# IdleCUA" in snap_one.report_markdown
+    assert hasattr(snap_one, "skipped_outcomes")
+    assert isinstance(snap_one.skipped_outcomes, tuple)
+
+    listed = lc.inspect(ListTasks(limit=10))
+    assert listed
+    for s in listed:
+        assert s.report_markdown is None
+        assert isinstance(s.counts, dict)
+        assert "findings" in s.counts and "urls" in s.counts and "errors" in s.counts
+
+    active = lc.inspect(GetActive())
+    if active is not None:
+        assert active.report_markdown is None
+
+
+def test_list_counts_use_constant_queries(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    ids = []
+    for i in range(3):
+        out = lc.handle(Enqueue(goal=f"constant query goal {i}"))
+        ids.append(out.task_id)
+        lc.handle(Start(task_id=out.task_id, trigger="explicit", mode="unattended"))
+
+    snaps = lc.inspect(ListTasks(limit=10))
+    assert len(snaps) >= 3
+    for s in snaps:
+        if s.task_id in ids:
+            assert isinstance(s.counts, dict)
+            assert s.counts["findings"] >= 0
