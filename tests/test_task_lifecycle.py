@@ -528,6 +528,32 @@ def test_list_counts_use_constant_queries(tmp_path: Path):
             assert s.counts["findings"] >= 0
 
 
+def test_list_counts_fallback_when_aggregate_missing(tmp_path: Path):
+    clear_emergency_stop()
+    td = _confirmed_dir(tmp_path)
+    app = _app(td)
+    lc = app.lifecycle
+
+    out = lc.handle(Enqueue(goal="fallback counts goal"))
+    assert lc.handle(Start(task_id=out.task_id, trigger="explicit", mode="unattended")).state == "completed"
+    one = lc.inspect(GetTask(out.task_id))
+    assert one is not None and one.counts["findings"] >= 1
+
+    class _NoAggregateMemory:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            if name == "get_artifact_counts":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    lc.memory = _NoAggregateMemory(app.memory)
+    listed = {s.task_id: s for s in lc.inspect(ListTasks(limit=10))}
+    assert out.task_id in listed
+    assert listed[out.task_id].counts == one.counts
+
+
 def test_v3_migration_adds_skipped_outcomes_json(tmp_path: Path):
     clear_emergency_stop()
     td = _confirmed_dir(tmp_path)
@@ -608,6 +634,56 @@ def test_skipped_outcomes_persist_through_inspect_and_reopen(tmp_path: Path):
     assert snap2 is not None
     assert snap2.skipped_outcomes == snap.skipped_outcomes
     assert any(s.get("type") == "queue_skip" for s in snap2.skipped_outcomes)
+
+
+def test_cancel_paused_task_preserves_persisted_skips(tmp_path: Path):
+    clear_emergency_stop()
+    from idlecua.models.plan import Plan, RiskLevel
+    from idlecua.planner import StubPlanner
+
+    class PostPlanner(StubPlanner):
+        def plan(self, desc, profile=None, history=None):
+            return Plan(
+                goal=desc,
+                target="x.com",
+                expected_actions=["open_allowed_site", "post", "read_ui", "scroll", "save_note"],
+                expected_result="t",
+                max_duration_minutes=10,
+                max_actions=10,
+                risk_level=RiskLevel.low,
+                requires_confirmation=False,
+            )
+
+    class Flip(FakeIdleDetector):
+        def __init__(self):
+            super().__init__(idle_seconds=1000, locked=False)
+            self.n = 0
+
+        def seconds_since_last_input(self):
+            self.n += 1
+            return 1000.0 if self.n <= 3 else 0.0
+
+        def can_run(self, thr=600):
+            return (True, "idle") if self.n <= 3 else (False, "user returned")
+
+        def is_screen_locked(self):
+            return False
+
+    td = _confirmed_dir(tmp_path)
+    app = _app(td, planner=PostPlanner(), idle_detector=Flip())
+    lc = app.lifecycle
+    tid = lc.handle(Enqueue(goal="skip then pause", skip_action_types=("post",))).task_id
+    paused = lc.handle(Start(task_id=tid, trigger="explicit", mode="unattended"))
+    assert paused.state == "paused_by_user"
+    before = lc.inspect(GetTask(tid))
+    assert before is not None
+    assert any(e.get("type") == "queue_skip" and e.get("value") == "post" for e in before.skipped_outcomes)
+
+    cancelled = lc.handle(Cancel(task_id=tid, reason="owner done"))
+    assert cancelled.category == OutcomeCategory.stopped
+    after = lc.inspect(GetTask(tid))
+    assert after is not None
+    assert after.skipped_outcomes == before.skipped_outcomes
 
 
 def test_plan_repeat_persists_skipped_outcomes_after_restart(tmp_path: Path):

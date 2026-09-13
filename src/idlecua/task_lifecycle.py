@@ -349,19 +349,26 @@ class TaskLifecycle:
                 ordered = rows
         except Exception:
             return []
+        counts_map: dict | None = None
         try:
             task_ids = [r["id"] for r in ordered]
-            if task_ids and hasattr(self.memory, "get_artifact_counts"):
+        except Exception:  # noqa: BLE001
+            task_ids = []
+        if task_ids and hasattr(self.memory, "get_artifact_counts"):
+            try:
                 counts_map = self.memory.get_artifact_counts(task_ids)
-            else:
+                if not isinstance(counts_map, dict):
+                    counts_map = {}
+            except Exception:  # noqa: BLE001
                 counts_map = {}
-        except Exception:
-            counts_map = {}
         out = []
         for r in ordered:
             try:
-                cnt = counts_map.get(r["id"], {"findings": 0, "urls": 0, "errors": 0}) if isinstance(counts_map, dict) else {"findings": 0, "urls": 0, "errors": 0}
-                out.append(self._snapshot_from_row(r, include_report=False, _counts=cnt))
+                if counts_map is None:
+                    out.append(self._snapshot_from_row(r, include_report=False))
+                else:
+                    cnt = counts_map.get(r["id"], {"findings": 0, "urls": 0, "errors": 0})
+                    out.append(self._snapshot_from_row(r, include_report=False, _counts=cnt))
             except Exception:
                 continue
         return out
@@ -1837,7 +1844,28 @@ class TaskLifecycle:
                 row = self.memory.get_task(task_id)
                 state_v = (row.get("state", "failed") if row else "failed")
             except Exception:
+                row = None
                 state_v = "failed"
+            try:
+                if row and row.get("skipped_outcomes_json"):
+                    persisted_skips = json.loads(row.get("skipped_outcomes_json") or "[]")
+                    if isinstance(persisted_skips, list):
+                        merged = list(skipped or [])
+                        seen = {
+                            (e.get("type"), e.get("value"), e.get("reason"))
+                            for e in merged
+                            if isinstance(e, dict)
+                        }
+                        for e in persisted_skips:
+                            if not isinstance(e, dict):
+                                continue
+                            key = (e.get("type"), e.get("value"), e.get("reason"))
+                            if key not in seen:
+                                merged.append(dict(e))
+                                seen.add(key)
+                        skipped = merged
+            except Exception:  # noqa: BLE001, S110
+                pass
             try:
                 from .accounting import get_today_count as _cnt
 
